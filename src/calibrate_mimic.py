@@ -100,6 +100,71 @@ def calibrate(patients, noise_sd=3.5, seed=0):
                n_patients=len(patients), n_obs=int(n_obs),
                chi2_per_n=float(chi2_n), rmse_mL_min=rmse)
 
+def diagnose_cohort(patients, noise_sd=3.5):
+    """
+    Cheap, per-patient diagnostics computed from trajectories ALREADY in
+    memory (no need to re-read labevents.csv.gz). Flags whether the cohort
+    looks like smooth chronic decline (what the mechanistic model assumes)
+    or acute, fluctuating trajectories (common in a hospital/critical-care
+    cohort like MIMIC-IV) -- the latter will make a global population fit
+    converge to a boundary/degenerate q with a huge chi2/n, even though
+    nothing is wrong with the code.
+    """
+    net_decline = 0
+    volatilities = []
+    for pat in patients:
+        t, e = pat["t"], pat["e"]
+        if len(t) < 3:
+            continue
+        # net trend: simple linear fit slope
+        slope = np.polyfit(t, e, 1)[0]
+        if slope < 0:
+            net_decline += 1
+        # volatility: residual std around a linear trend, vs assumed noise_sd
+        resid = e - np.polyval(np.polyfit(t, e, 1), t)
+        volatilities.append(np.std(resid))
+    n = len(patients)
+    frac_declining = net_decline / n if n else 0.0
+    median_volatility = float(np.median(volatilities)) if volatilities else float("nan")
+    print(f"\n[diagnostics] Patients with net-declining eGFR trend: "
+          f"{net_decline}/{n} ({100*frac_declining:.0f}%)")
+    print(f"[diagnostics] Median within-patient volatility (residual std around "
+          f"a straight line): {median_volatility:.1f} mL/min/1.73m² "
+          f"(assumed measurement noise: {noise_sd})")
+    if median_volatility > 3 * noise_sd:
+        print("[diagnostics] WARNING: within-patient volatility is much larger than the "
+              "assumed measurement noise -- trajectories look ACUTE/fluctuating rather "
+              "than smooth chronic decline. A single global fit will likely converge to a "
+              "degenerate q (e.g. stuck at the lower bound) with a very high chi2/n. "
+              "Consider --chronic-only, or use the hierarchical model instead of a flat fit.")
+    if frac_declining < 0.6:
+        print(f"[diagnostics] WARNING: only {100*frac_declining:.0f}% of patients show a net "
+              "declining trend -- the mechanistic model (monotonic decline only) structurally "
+              "cannot represent the rest. Consider --chronic-only to fit on the subset it can "
+              "represent.")
+    return dict(n_patients=n, frac_net_declining=round(frac_declining, 3),
+               median_volatility_mL_min=round(median_volatility, 2) if volatilities else None)
+
+def filter_chronic_like(patients, max_volatility_ratio=2.5, noise_sd=3.5):
+    """
+    Optional stricter cohort: keep only patients with a net-declining trend
+    AND within-patient volatility not too far above measurement noise --
+    i.e. trajectories the monotonic mechanistic model can plausibly represent.
+    This is a subset, not a fix: it trades cohort size for a fit the model
+    can actually explain, useful for a first honest proof-of-concept.
+    """
+    kept = []
+    for pat in patients:
+        t, e = pat["t"], pat["e"]
+        if len(t) < 3:
+            continue
+        slope = np.polyfit(t, e, 1)[0]
+        resid = e - np.polyval(np.polyfit(t, e, 1), t)
+        vol = np.std(resid)
+        if slope < 0 and vol <= max_volatility_ratio * noise_sd:
+            kept.append(pat)
+    return kept
+
 def main():
     ap = argparse.ArgumentParser(description="Calibrates the twin with your LOCAL MIMIC-IV copy.")
     ap.add_argument("--mimic-dir", required=True, help="Path to the hosp/ folder of your local MIMIC-IV copy")
@@ -107,6 +172,11 @@ def main():
     ap.add_argument("--mimic-version", default="3.1")
     ap.add_argument("--min-span-days", type=int, default=180)
     ap.add_argument("--min-points", type=int, default=4)
+    ap.add_argument("--chronic-only", action="store_true",
+                    help="Keep only patients with a net-declining, low-volatility "
+                         "trajectory (a subset the monotonic mechanistic model can "
+                         "plausibly represent). Use if diagnostics flag an acute/"
+                         "fluctuating cohort.")
     a = ap.parse_args()
 
     tmp_csv = os.path.join(HERE, "..", "data", "_mimic_tmp.csv")
@@ -121,7 +191,22 @@ def main():
         print(f"Only {len(patients)} patients with a usable trajectory -- insufficient, aborting.")
         os.remove(tmp_csv)
         return
+
+    diagnostics = diagnose_cohort(patients)
+
+    if a.chronic_only:
+        before = len(patients)
+        patients = filter_chronic_like(patients)
+        print(f"[diagnostics] --chronic-only: kept {len(patients)}/{before} patients "
+             f"with a net-declining, lower-volatility trajectory.")
+        if len(patients) < 5:
+            print("Too few patients remain after --chronic-only filtering -- aborting.")
+            os.remove(tmp_csv)
+            return
+
     result = calibrate(patients)
+    result["diagnostics"] = diagnostics
+    result["chronic_only_filter"] = bool(a.chronic_only)
 
     result["source"] = "MIMIC-IV (calibrated locally, not redistributed -- see docs/MIMIC_COMPLIANCE.md)"
     result["mimic_version"] = a.mimic_version
@@ -142,6 +227,18 @@ def main():
     print(f"\n[3/3] Saved: {out_path}")
     print(f"       q={result['q']:.2f}  k_hf={result['k_hf']:.4f}  "
          f"n_patients={result['n_patients']}  chi2/n={result['chi2_per_n']:.2f}")
+
+    if result["q"] <= LO[0] + 1e-6 or result["q"] >= HI[0] - 1e-6:
+        print(f"\nWARNING: q converged AT its bound ({LO[0]}-{HI[0]}). This usually means "
+             "the model could not find an interior optimum -- treat this fit as unreliable, "
+             "not a physical result. See the [diagnostics] messages above.")
+    if result["chi2_per_n"] > 5:
+        print(f"WARNING: chi2/n = {result['chi2_per_n']:.1f} is far above the ~1 expected for "
+             "a good fit (rmse={:.1f} mL/min vs assumed noise={:.1f}). Do NOT treat this as a "
+             "trustworthy calibration for the app/demo without further investigation "
+             "(try --chronic-only, or use the hierarchical model).".format(
+                 result["rmse_mL_min"], 3.5))
+
     print("\nThis JSON is NOT pushed to git (see .gitignore). It is the file that:")
     print("  - the web app uses automatically as the research/demo calibration.")
     print("  - you can share 'upon reasonable request' in the publication.")
