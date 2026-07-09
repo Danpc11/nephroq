@@ -1,222 +1,273 @@
-"""
-================================================================================
-MIMIC-IV LOADER  ·  builds longitudinal eGFR trajectories
-================================================================================
-Converts raw MIMIC-IV files (hosp module) into the schema expected by the
-pipeline:  patient_id, time_years, egfr, hba1c, uacr, sbp
+<h1>
+  <img src="assets/nephroq_logo.png" alt="NephroQ logo" width="40">
+  NephroQ
+</h1>
 
-REQUIREMENTS (download from physionet.org/content/mimiciv, hosp module --
-tested with v3.1, compatible with v2.2+):
-    hosp/patients.csv.gz
-    hosp/admissions.csv.gz
-    hosp/labevents.csv.gz      (large, several GB -- filter by itemid on read)
-    hosp/d_labitems.csv.gz
-    hosp/diagnoses_icd.csv.gz
-    hosp/omr.csv.gz            (NEW in v3.0+: outpatient vital signs,
-                                 including real blood pressure -- optional,
-                                 falls back to a population placeholder if missing)
+### A mechanistic digital twin for Type 2 Diabetes → Chronic Kidney Disease
 
-STRATEGY (to approximate CHRONIC progression, not just one acute episode):
-  1) Filter patients with a type 2 diabetes diagnosis (ICD-9 250.x0/250.x2,
-     ICD-10 E11.x).
-  2) Take ALL of their creatinine measurements in labevents (labs from the
-     whole hospitalization AND outpatient labs, across ALL their encounters,
-     potentially years) -> approximate longitudinal trajectory.
-  3) Keep only patients with measurements spread over >180 days (filters out
-     single-admission acute episodes; keeps those with real follow-up over
-     time).
-  4) Compute eGFR with CKD-EPI 2021 (egfr_measurement.py) using age
-     (anchor_age) and sex.
-  5) HbA1c: search labevents for it dynamically (labeled from d_labitems, not
-     a fixed itemid, for robustness across versions).
-  6) UACR and systolic blood pressure: MIMIC rarely records these outside the
-     ICU. Left as optional columns -- if not found, they are filled with the
-     population median (explicit imputation, flagged in the output CSV with
-     a *_imputed column).
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![NumPy](https://img.shields.io/badge/NumPy-supported-blue)
+![SciPy](https://img.shields.io/badge/SciPy-supported-blue)
+![Streamlit](https://img.shields.io/badge/Streamlit-app-FF4B4B?logo=streamlit&logoColor=white)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Danpc11/nephroq/blob/main/risk_notebook.ipynb)
 
-LICENSE COMPLIANCE (PhysioNet Credentialed Health Data License 1.5.0):
-  - The output CSV (data/*.csv) must NEVER be pushed to git, to the deployed
-    web app, or to any cloud service -- already excluded in .gitignore. Only
-    the calibrated (aggregate) PARAMETERS may be published.
-  - Do not send this data to third-party APIs (LLMs, cloud services).
-  - See docs/MIMIC_COMPLIANCE.md for full detail and the citation required
-    in publications.
+A calibratable, nonlinear mechanistic model to predict renal function
+(eGFR) progression in type 2 diabetic patients and estimate time to
+dialysis, with hierarchical Bayesian inference and validation against
+published data.
 
-HONEST LIMITATION: MIMIC-IV is a hospital/critical-care cohort, biased toward
-sicker patients, with selection bias and acute comorbidity. Useful to test
-the method with real noise; does not replace a chronic outpatient cohort
-(CRIC, HCHS/SOL) for the final clinical validation.
+**Why "NephroQ":** the model's central, physically meaningful parameter is
+`q` — the hyperfiltration feedback exponent that quantifies how abrupt the
+terminal collapse of renal function is. It is estimated from clinical
+trajectories, not just fitted as a black box.
+---
 
-Usage:
-    python mimic_loader.py --mimic-dir /path/to/mimic-iv/hosp --out ../data/mimic_ckd.csv
-================================================================================
-"""
-import argparse, gzip, sys
-import numpy as np
-import pandas as pd
+## What this is
 
-sys.path.insert(0, ".")
-from egfr_measurement import egfr_cr, egfr_cr_cys, egfr_cys  # noqa
+A low-dimensional dynamical system describing renal function decline
+(`N` = functional nephron mass fraction) through two physical mechanisms:
 
-# --------------------------------------------------------------------------
-# Keywords to find itemids WITHOUT relying on the exact number matching
-# between MIMIC versions (more robust than hardcoding the itemid).
-# --------------------------------------------------------------------------
-LABEL_KEYWORDS = {
-    "creatinine": ["creatinine"],
-    "hba1c":      ["hemoglobin a1c", "% hemoglobin a1c", "a1c"],
-    "cystatin":   ["cystatin"],
-    "uacr":       ["albumin/creatinine", "microalbumin", "albumin, urine"],
-}
-DM_ICD9_PREFIXES  = ("250",)                 # 250.x0/x2 = type 2 (approximate)
-DM_ICD10_PREFIXES = ("E11",)                 # type 2 diabetes
+- **Hyperfiltration** — positive feedback: as nephrons are lost, the
+  remaining ones become overloaded and are damaged faster (power law,
+  exponent `q`).
+- **Compensation** — observed eGFR is buffered while there is functional
+  reserve and collapses at the end (weak power law, exponent `α`).
 
-def find_itemids(d_labitems, keywords, exclude=()):
-    lab = d_labitems["label"].str.lower().fillna("")
-    mask = np.zeros(len(d_labitems), dtype=bool)
-    for kw in keywords:
-        mask |= lab.str.contains(kw, na=False)
-    for ex in exclude:
-        mask &= ~lab.str.contains(ex, na=False)
-    return d_labitems.loc[mask, "itemid"].tolist()
+```
+dN/dt = −N · [ k0 + k_hf·(1/N)^q + I(HbA1c, UACR, blood pressure) ]
+eGFR  = G_max · N^α
+```
 
-def load_diabetic_patient_ids(mimic_dir):
-    dx = pd.read_csv(f"{mimic_dir}/diagnoses_icd.csv.gz",
-                     usecols=["subject_id", "icd_code", "icd_version"],
-                     dtype=str)
-    is_dm9  = (dx.icd_version == "9")  & dx.icd_code.str.startswith(DM_ICD9_PREFIXES)
-    is_dm10 = (dx.icd_version == "10") & dx.icd_code.str.startswith(DM_ICD10_PREFIXES)
-    ids = set(dx.loc[is_dm9 | is_dm10, "subject_id"].unique())
-    print(f"[1/5] Patients with a type 2 diabetes diagnosis (approx.): {len(ids)}")
-    return ids
+The central parameter, `q` (the feedback / "how abrupt is the terminal
+collapse" exponent), is estimated from clinical trajectories using three
+inference methods depending on data availability: per-patient fitting, an
+amortized AI estimator (for scarce data), and a full hierarchical Bayesian
+model (for cohorts with uneven follow-up).
 
-def load_lab_series(mimic_dir, itemids, subject_ids, chunksize=2_000_000):
-    """Reads labevents.csv.gz IN CHUNKS (it's large) filtering by itemid and patient."""
-    if not itemids:
-        return pd.DataFrame(columns=["subject_id", "charttime", "valuenum"])
-    cols = ["subject_id", "itemid", "charttime", "valuenum"]
-    out = []
-    reader = pd.read_csv(f"{mimic_dir}/labevents.csv.gz", usecols=cols,
-                         dtype={"subject_id": str, "itemid": "Int64"},
-                         parse_dates=["charttime"], chunksize=chunksize)
-    for chunk in reader:
-        m = chunk.itemid.isin(itemids) & chunk.subject_id.isin(subject_ids) & chunk.valuenum.notna()
-        if m.any():
-            out.append(chunk.loc[m, ["subject_id", "charttime", "valuenum"]])
-    return pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=cols[:1]+cols[2:])
+Full documentation: [`docs/MODEL_DOCUMENTATION.md`](docs/MODEL_DOCUMENTATION.md).
 
-def load_sbp_from_omr(mimic_dir, subject_ids):
-    """
-    NEW in MIMIC-IV v3.0+: hosp/omr.csv.gz (Online Medical Record) carries
-    real OUTPATIENT vital signs, including blood pressure -- something that
-    previously did not exist outside the ICU. Typical format:
-    result_name='Blood Pressure', result_value='128/76'. If the file doesn't
-    exist (MIMIC-IV <3.0), falls back to the population placeholder.
-    """
-    path = f"{mimic_dir}/omr.csv.gz"
-    import os as _os
-    if not _os.path.exists(path):
-        print("      omr.csv.gz not found (MIMIC-IV <3.0?) -> SBP will be imputed.")
-        return pd.DataFrame(columns=["subject_id", "chartdate", "sbp"])
-    rows = []
-    reader = pd.read_csv(path, dtype={"subject_id": str}, chunksize=1_000_000)
-    for chunk in reader:
-        m = (chunk.result_name == "Blood Pressure") & chunk.subject_id.isin(subject_ids)
-        sub = chunk.loc[m, ["subject_id", "chartdate", "result_value"]].dropna()
-        if len(sub):
-            sbp = sub.result_value.str.split("/").str[0]
-            sbp = pd.to_numeric(sbp, errors="coerce")
-            rows.append(pd.DataFrame({"subject_id": sub.subject_id, "chartdate": sub.chartdate, "sbp": sbp}))
-    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["subject_id", "chartdate", "sbp"])
+---
 
-def main(mimic_dir, out_path, min_span_days=180, min_points=4):
-    patients = pd.read_csv(f"{mimic_dir}/patients.csv.gz",
-                           usecols=["subject_id", "gender", "anchor_age", "anchor_year"],
-                           dtype={"subject_id": str})
-    d_labitems = pd.read_csv(f"{mimic_dir}/d_labitems.csv.gz", dtype={"itemid": "Int64"})
+## Repository structure
 
-    dm_ids = load_diabetic_patient_ids(mimic_dir)
+```
+├── src/                          # All the code, ready to run
+│   ├── mechanistic_twin.py       # Nonlinear core (hyperfiltration + compensation)
+│   ├── hybrid_twin.py            # Matrix variant: state-space + absorbing Markov + Kalman
+│   ├── egfr_measurement.py       # CKD-EPI 2021 equations (creatinine / cystatin / combined)
+│   ├── inverse_fit.py            # Inverse problem: parameter recovery (synthetic data)
+│   ├── noise_identifiability.py  # Effect of the lab assay on the identifiability of q
+│   ├── amortized_ai.py           # Amortized AI estimator (network ensemble) for scarce data
+│   ├── hierarchical_model.py     # Mixed effects with partial pooling (EM)
+│   ├── bayesian_model.py         # Full hierarchical Bayesian inference (adaptive Metropolis)
+│   ├── forecast_comparison.py    # Compares forecasting with biased vs Bayesian q
+│   ├── real_data_validity.py     # Face validity against real profiles (Al-Shamsi 2018)
+│   ├── mimic_loader.py           # MIMIC-IV (PhysioNet) loader -> pipeline schema
+│   ├── calibrate_mimic.py        # Local calibration with MIMIC-IV -> calibration/mimic_calibration.json
+│   └── mvp_calibration.py        # MVP: calibrates and validates with real or synthetic data
+├── docs/                         # Documentation and protocol
+│   ├── MODEL_DOCUMENTATION.md               # Mathematical spec + implementation guide + publication analysis
+│   ├── digital_twin_protocol.md
+│   ├── validation_report_example.md
+│   ├── WEB_DEPLOYMENT.md
+│   └── MIMIC_COMPLIANCE.md                  # Summary: MIMIC-IV license compliance
+├── results/                      # Figures generated by each script
+├── calibration/                  # mimic_calibration.json (NOT in git) + README.md (handling policy)
+├── data/                         # Place your real data here (not versioned, see .gitignore)
+├── tests/                        # Unit tests
+├── app_web.py                    # Streamlit web interface
+├── requirements.txt
+└── README.md
+```
 
-    id_creat = find_itemids(d_labitems, LABEL_KEYWORDS["creatinine"],
-                            exclude=["urine", "albumin", "ratio", "clearance"])
-    id_a1c   = find_itemids(d_labitems, LABEL_KEYWORDS["hba1c"])
-    id_cys   = find_itemids(d_labitems, LABEL_KEYWORDS["cystatin"])
-    id_uacr  = find_itemids(d_labitems, LABEL_KEYWORDS["uacr"])
-    print(f"[2/5] itemids -> creatinine:{id_creat}  hba1c:{id_a1c}  cystatin:{id_cys}  uacr:{id_uacr}")
+---
 
-    print("[3/5] Reading labevents.csv.gz in chunks (may take several minutes)...")
-    creat = load_lab_series(mimic_dir, id_creat, dm_ids)
-    a1c   = load_lab_series(mimic_dir, id_a1c,   dm_ids)
-    cys   = load_lab_series(mimic_dir, id_cys,   dm_ids)
-    uacr  = load_lab_series(mimic_dir, id_uacr,  dm_ids)
-    print(f"      creatinine: {len(creat)} measurements  |  hba1c: {len(a1c)}  |  "
-          f"cystatin: {len(cys)}  |  uacr: {len(uacr)}")
+## Maturity status: TRL 4
 
-    if creat.empty:
-        print("No creatinine measurements found. Check the MIMIC-IV path.")
-        return
+The system is integrated, with automated tests and auditable evidence per
+run. Each `system_twin.py` run produces a `manifest.json` recording what
+ran, how long it took, and whether the system passed or failed overall.
 
-    creat = creat.merge(patients, on="subject_id", how="left")
-    creat["sex"] = np.where(creat.gender == "F", "F", "M")
+```bash
+cd src
+python system_twin.py --skip-slow --skip-bayes   # fast full-system run (~1 min)
+cd .. && python -m pytest tests/ -v                # 10 unit tests
+```
 
-    rows = []
-    n_ok = 0
-    for pid, g in creat.groupby("subject_id"):
-        g = g.sort_values("charttime")
-        span_days = (g.charttime.max() - g.charttime.min()).days
-        if span_days < min_span_days or len(g) < min_points:
-            continue                                    # discard single acute episodes
-        t0 = g.charttime.min()
-        age = float(g.anchor_age.iloc[0]); sex = g.sex.iloc[0]
-        # eGFR by creatinine (age approximated at the time of the lab; MIMIC
-        # only gives anchor_age at anchor_year -> corrected by elapsed years)
-        anchor_year = g.anchor_year.iloc[0]
-        for _, r in g.iterrows():
-            years_since_anchor = (r.charttime.year - anchor_year)
-            age_at_lab = age + years_since_anchor
-            eg = egfr_cr(r.valuenum, age_at_lab, sex)
-            t_years = (r.charttime - t0).days / 365.25
-            rows.append(dict(patient_id=pid, time_years=t_years, egfr=eg,
-                             hba1c=np.nan, uacr=np.nan, sbp=np.nan))
-        n_ok += 1
-    df = pd.DataFrame(rows)
-    print(f"[4/5] Patients with a usable trajectory (>= {min_points} measurements, "
-          f">= {min_span_days} days of follow-up): {n_ok}")
+Each `system_twin.py` run generates `results/system_run_<timestamp>/` with
+a log per stage and a `manifest.json` recording what ran, how long it took,
+and whether the system passed or failed overall.
 
-    # Attach the closest HbA1c in time (if present) per patient
-    if not a1c.empty:
-        a1c_med = a1c.groupby("subject_id").valuenum.median()
-        df["hba1c"] = df.patient_id.map(a1c_med)
-    # UACR: almost certainly sparse/absent -> impute with global median if missing
-    if not uacr.empty:
-        uacr_med = uacr.groupby("subject_id").valuenum.median()
-        df["uacr"] = df.patient_id.map(uacr_med)
+---
 
-    print("      Looking for real blood pressure in omr.csv.gz (v3.0+)...")
-    omr_sbp = load_sbp_from_omr(mimic_dir, dm_ids)
-    if not omr_sbp.empty:
-        sbp_med = omr_sbp.groupby("subject_id").sbp.median()
-        df["sbp"] = df.patient_id.map(sbp_med)
-        print(f"      Real SBP found for {sbp_med.notna().sum()} patients.")
+## Calibrate with your local copy of MIMIC-IV
 
-    # Explicit, flagged imputation (only what is truly missing)
-    df["hba1c_imputed"] = df["hba1c"].isna()
-    df["uacr_imputed"]  = df["uacr"].isna()
-    df["sbp_imputed"]   = df["sbp"].isna()
-    df["hba1c"] = df["hba1c"].fillna(df["hba1c"].median() if df["hba1c"].notna().any() else 7.5)
-    df["uacr"]  = df["uacr"].fillna(df["uacr"].median() if df["uacr"].notna().any() else 30.0)
-    df["sbp"]   = df["sbp"].fillna(df["sbp"].median() if df["sbp"].notna().any() else 135.0)
+```bash
+cd src
+python calibrate_mimic.py --mimic-dir /path/to/your/mimic-iv/hosp
+```
 
-    df.to_csv(out_path, index=False)
-    print(f"[5/5] Saved: {out_path}  ({df.patient_id.nunique()} patients, {len(df)} rows)")
-    print("\nNOTE: *_imputed columns flag values that were not measured and were filled "
-          "with the population median. Review before final calibration.")
+Runs 100% on your machine — uploads nothing. Generates
+`calibration/mimic_calibration.json` (excluded from git) with the
+calibrated aggregate parameters; the intermediate per-patient CSV is
+deleted automatically. See [`calibration/README.md`](calibration/README.md)
+for the handling policy of this file (shareable "upon reasonable request"
+in the publication) and
+[`docs/MIMIC_COMPLIANCE.md`](docs/MIMIC_COMPLIANCE.md) for license detail.
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--mimic-dir", required=True, help="Path to the hosp/ folder of your MIMIC-IV copy")
-    ap.add_argument("--out", default="../data/mimic_ckd.csv")
-    ap.add_argument("--min-span-days", type=int, default=180)
-    ap.add_argument("--min-points", type=int, default=4)
-    a = ap.parse_args()
-    main(a.mimic_dir, a.out, a.min_span_days, a.min_points)
+## Reproducible environment (Docker)
+
+```bash
+docker build -f docker/Dockerfile -t nephroq .
+docker run --rm nephroq
+```
+
+The build only succeeds if the unit tests pass (quality gate). Build context
+is the repository root — the `-f` flag just points to the Dockerfile's
+location, `.` at the end keeps the context correct.
+
+## Web interface
+
+`app_web.py` — an interactive (Streamlit) app to enter a patient's markers
+and see the risk projection, designed to share with physicians.
+
+```bash
+streamlit run app_web.py
+```
+
+The active calibration is resolved automatically across three tiers
+(highest to lowest priority):
+1. **Private** (`st.secrets`) — for a future real clinical cohort, not yet active.
+2. **Local MIMIC-IV** (`calibration/mimic_calibration.json`) — this
+   repository's research calibration, if you've already generated it.
+3. **Public fallback** (synthetic + Al-Shamsi 2018 validation) — so the
+   demo works even if someone clones the repo without having run
+   `calibrate_mimic.py`.
+
+Deploys for free and automatically from this same GitHub repo (Streamlit
+Community Cloud or Hugging Face Spaces) — see
+[`docs/WEB_DEPLOYMENT.md`](docs/WEB_DEPLOYMENT.md) for the step-by-step
+guide and the evolution path toward a backend/frontend architecture once
+the project matures beyond TRL5.
+
+---
+
+## Installation
+
+```bash
+git clone https://github.com/<your-username>/nephroq.git
+cd nephroq
+python -m venv venv && source venv/bin/activate    # optional but recommended
+pip install -r requirements.txt
+```
+
+Requires Python ≥ 3.10.
+
+---
+
+## How to run it — guided path
+
+Each script is self-contained, runs in seconds/minutes, and prints its own
+numerical verification results. Run from `src/`:
+
+```bash
+cd src
+
+# 1. Nonlinear mechanistic core
+python mechanistic_twin.py
+
+# 2. (Optional) Analytic matrix variant: state-space + Markov + exact Kalman
+python hybrid_twin.py
+
+# 3. eGFR measurement model (CKD-EPI 2021)
+python egfr_measurement.py
+
+# 4. Inverse problem: verify parameter recovery on synthetic data
+python inverse_fit.py
+
+# 5. Identifiability of q depending on the lab assay used
+python noise_identifiability.py
+
+# 6. Amortized AI estimator (for patients with few visits)
+python amortized_ai.py
+
+# 7. Hierarchical model with partial pooling
+python hierarchical_model.py
+
+# 8. Full hierarchical Bayesian inference (corrects the bias in q)
+python bayesian_model.py
+
+# 9. Compares forecasting with biased q (EM) vs Bayesian q
+python forecast_comparison.py
+
+# 10. Face validity against real published profiles (Al-Shamsi 2018)
+python real_data_validity.py
+
+# 11. MVP: full calibration + validation (real or synthetic data)
+python mvp_calibration.py
+```
+
+**Key checkpoint at step 4:** chi²/n at `theta_true` must be ≈ 1. If not,
+there is a numerical issue to fix before touching real data.
+
+### With real data
+
+`mvp_calibration.py` accepts a CSV with columns
+`patient_id, time_years, egfr, hba1c, uacr, sbp`:
+
+```bash
+CKD_CSV=../data/my_data.csv python mvp_calibration.py
+```
+
+Generates `results/mvp_validation.png` and `results/validation_report.md`
+— the one-page report designed to share with physicians/clinical
+collaborators.
+
+Real-data sources evaluated for future calibration: HCHS/SOL, CRIC, AASK
+(via NIDDK Central Repository, request-based access), Synthea (open
+synthetic data), and MIMIC-IV (PhysioNet, see
+[`docs/MIMIC_COMPLIANCE.md`](docs/MIMIC_COMPLIANCE.md)).
+
+---
+
+This repository incorporates fixes from a detailed code review — see
+[`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) for what was fixed
+(including one critical parameterization bug affecting the app's
+projections) and what remains deferred.
+
+## Main results (synthetic data, verified)
+
+| Validation | Result |
+|---|---|
+| Parameter recovery (synthetic) | chi²/n ≈ 1.0; `q` recovered within ±1σ |
+| Identifiability of `q` by assay | creatinine only: ±0.15 → creatinine+cystatin: **±0.03** |
+| Amortized AI vs per-patient fit (3-4 visits) | AI is more stable and does not diverge |
+| Hierarchical model (partial pooling), patients with 3-5 visits | error in η_i ~2.7× lower than without pooling |
+| Hierarchical Bayesian, bias in `q` | EM: q=1.06 (biased) → Bayesian: **q=1.52 [1.45,1.60]** (truth 1.6) |
+| Forecast improvement from correcting `q` | RMSE −6% overall, −7% in progressors |
+| Face validity (real profiles, Al-Shamsi 2018) | progressors: 4.0 years to stage 3; non-progressors: 13.4 years |
+
+---
+
+## Project status and what's needed for publication
+
+See section 6 of [`docs/MODEL_DOCUMENTATION.md`](docs/MODEL_DOCUMENTATION.md)
+for the full analysis. In summary: the model is verified on synthetic data
+and has a first face-validity check against real published data
+(Al-Shamsi et al. 2018, PLOS One, S1 Dataset, CC BY 4.0). Missing:
+calibration and external validation with a real longitudinal cohort (eGFR
+repeated per visit), in-silico replication of at least one clinical trial
+(DAPA-CKD/CREDENCE/FLOW), and comparison against the standard risk equation
+(KFRE).
+
+## License and data
+
+Code under the MIT license (see `LICENSE`). This repository does **not**
+include patient data. The `data/` folder is only a local mount point for
+personal use (excluded from git); any real data used with this code must
+be handled per its own data use agreement and ethics approval.
+
+## How to cite
+
+If this code is useful in your work, please cite the repository. See
+`CITATION.cff`.
