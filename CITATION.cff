@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it."
+title: "NephroQ: A Mechanistic Digital Twin for Type 2 Diabetes -> Chronic Kidney Disease"
+authors:
+  - family-names: "Pérez-Calixto"
+    given-names: "Daniel"
+    affiliation: "INMEGEN / UNAM, Facultad de Ciencias"
+date-released: 2026-07-09
+license: MIT
+repository-code: "https://github.com/<your-username>/nephroq"
+keywords:
+  - digital twin
+  - chronic kidney disease
+  - diabetes mellitus type 2
+  - mechanistic modeling
+  - Bayesian inference
+  - nephrology
