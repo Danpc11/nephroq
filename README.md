@@ -3,7 +3,7 @@
   NephroQ
 </h1>
 
-### A mechanistic digital twin for Type 2 Diabetes → Chronic Kidney Disease
+## A mechanistic digital twin for Type 2 Diabetes → Chronic Kidney Disease
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![NumPy](https://img.shields.io/badge/NumPy-supported-blue)
