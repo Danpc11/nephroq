@@ -1,0 +1,32 @@
+# Patient data — NEVER version
+data/*
+!data/.gitkeep
+!data/README.md
+*.csv
+
+# Private calibration — NEVER version (only the .example template is public)
+.streamlit/secrets.toml
+private_calibration.*
+
+# Local calibration with MIMIC-IV — NEVER version (only README.md is public)
+calibration/*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Local run artifacts
+results/*.npy
+results/system_run_*
+.ipynb_checkpoints/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,7 @@
+.git
+data/*.csv
+calibration/*.json
+results/system_run_*
+__pycache__
+*.pyc
+.pytest_cache
