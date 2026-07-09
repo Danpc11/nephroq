@@ -233,6 +233,11 @@ synthetic data), and MIMIC-IV (PhysioNet, see
 
 ---
 
+This repository incorporates fixes from a detailed code review — see
+[`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) for what was fixed
+(including one critical parameterization bug affecting the app's
+projections) and what remains deferred.
+
 ## Main results (synthetic data, verified)
 
 | Validation | Result |
@@ -269,4 +274,3 @@ be handled per its own data use agreement and ethics approval.
 
 If this code is useful in your work, please cite the repository. See
 `CITATION.cff`.
-
