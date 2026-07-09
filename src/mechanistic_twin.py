@@ -38,8 +38,13 @@ from scipy.integrate import solve_ivp
 G_MAX = 120.0      # eGFR with intact kidney (N=1)
 ALPHA = 0.80       # compensation exponent (<1 => buffering)
 
+N_FLOOR = 1e-4
+
 def egfr_of_N(N):          return G_MAX * np.power(np.clip(N, 1e-9, None), ALPHA)
-def N_of_egfr(egfr):       return np.power(np.clip(egfr, 1e-6, None) / G_MAX, 1.0 / ALPHA)
+def N_of_egfr(egfr):
+    """Maps eGFR -> N, clipped to (0,1] as documented (N(t) in (0,1])."""
+    N = np.power(np.clip(egfr, 1e-6, None) / G_MAX, 1.0 / ALPHA)
+    return np.clip(N, N_FLOOR, 1.0)
 
 DIALYSIS_eGFR = 15.0
 N_DIALYSIS = N_of_egfr(DIALYSIS_eGFR)     # N threshold equivalent to dialysis
@@ -62,12 +67,42 @@ def metabolic_insult(a1c, uacr, sbp):
 class MechanisticRenalModel:
     def __init__(self, a1c, sbp, uacr, u=0.0,
                  k0=0.0030, k_hf=0.0120, q=1.6, N_ref=0.60, k_met=0.0360,
-                 eff_met=0.45, eff_hf=0.35):
+                 eff_met=0.45, eff_hf=0.35,
+                 w_a1c=None, w_uacr=None, w_sbp=None):
+        """
+        w_a1c, w_uacr, w_sbp: OPTIONAL explicit, already-scaled insult weights
+        (e.g. from a calibration: q, k_hf, w_a1c, w_uacr, w_sbp with N_ref=1,
+        k_met=1 implicitly folded into the weights). When provided, N_ref and
+        k_met are forced to 1.0 so the hazard matches EXACTLY the
+        parameterization the weights were calibrated under:
+
+            hazard = k0 + k_hf*(1/N)^q + (w_a1c*... + w_uacr*... + w_sbp*...)
+
+        This replaces the old pattern of monkeypatching the module-level
+        metabolic_insult() function (fragile, and was silently causing a
+        double-scaling bug when combined with the default k_met=0.036 and
+        N_ref=0.60 -- see docs/KNOWN_ISSUES.md).
+
+        When w_* are None (default), the model falls back to the original
+        physiological parameterization: N_ref=0.60, k_met=0.036 applied to
+        the fixed literature weights (0.40, 0.50, 0.30) in metabolic_insult().
+        """
         self.a1c, self.sbp, self.uacr, self.u = a1c, sbp, uacr, u
-        self.k0, self.q, self.N_ref = k0, q, N_ref
+        self.k0, self.q = k0, q
         self.k_hf = k_hf * (1 - eff_hf * u)      # SGLT2i reduces hyperfiltration
-        I = metabolic_insult(a1c, uacr, sbp)
-        self.k_met_I = k_met * I * (1 - eff_met * u)
+
+        if w_a1c is not None or w_uacr is not None or w_sbp is not None:
+            if not (w_a1c is not None and w_uacr is not None and w_sbp is not None):
+                raise ValueError("w_a1c, w_uacr, w_sbp must be given together, or not at all.")
+            self.N_ref = 1.0
+            I = (w_a1c * max(a1c - 6.5, 0.0)
+                 + w_uacr * np.log1p(uacr / 30.0)
+                 + w_sbp * max(sbp - 130.0, 0.0) / 10.0)
+            self.k_met_I = I * (1 - eff_met * u)     # weights already fully scaled
+        else:
+            self.N_ref = N_ref
+            I = metabolic_insult(a1c, uacr, sbp)
+            self.k_met_I = k_met * I * (1 - eff_met * u)
 
     def hazard(self, N):
         """Hazard per nephron (1/year). Grows as N falls (hyperfiltration)."""
