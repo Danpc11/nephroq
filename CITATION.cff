@@ -5,6 +5,12 @@ authors:
   - family-names: "Pérez-Calixto"
     given-names: "Daniel"
     affiliation: "INMEGEN / UNAM, Facultad de Ciencias"
+  - family-names: "Vázquez-Victorio"
+    given-names: "Genaro"
+    affiliation: "UNAM, Facultad de Ciencias"
+  - family-names: "Tovar-Romero"
+    given-names: "Hugo Antonio"
+    affiliation: "INMEGEN / UNAM, Facultad de Ciencias"
 date-released: 2026-07-09
 license: MIT
 repository-code: "https://github.com/<your-username>/nephroq"
