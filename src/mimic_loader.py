@@ -216,6 +216,37 @@ def main(mimic_dir, out_path, min_span_days=180, min_points=4):
         print("No creatinine measurements found. Check the MIMIC-IV path.")
         return
 
+    # Physiological plausibility filter -- lab data occasionally contains
+    # zeros, near-zeros, or extreme outliers (capture errors, placeholder
+    # values). These are NOT valid measurements and must be dropped before
+    # reaching CKD-EPI (a value of 0 causes a math domain error; a value of
+    # 0.01 would silently produce a nonsensical eGFR in the thousands).
+    PLAUSIBLE_RANGES = {
+        "creatinine": (0.1, 25.0),   # mg/dL
+        "cystatin":   (0.1, 15.0),   # mg/L
+        "hba1c":      (3.0, 20.0),   # %
+        "uacr":       (0.0, 30000.0),  # mg/g
+    }
+    def filter_plausible(df, name):
+        if df.empty:
+            return df
+        lo, hi = PLAUSIBLE_RANGES[name]
+        ok = df.valuenum.between(lo, hi)
+        n_bad = int((~ok).sum())
+        if n_bad:
+            print(f"      WARNING: {n_bad} '{name}' measurements outside the "
+                  f"physiologically plausible range [{lo},{hi}] dropped.")
+        return df.loc[ok]
+
+    creat = filter_plausible(creat, "creatinine")
+    a1c   = filter_plausible(a1c,   "hba1c")
+    cys   = filter_plausible(cys,   "cystatin")
+    uacr  = filter_plausible(uacr,  "uacr")
+
+    if creat.empty:
+        print("No creatinine measurements remain after the plausibility filter.")
+        return
+
     creat = creat.merge(patients, on="subject_id", how="left")
     creat["sex"] = np.where(creat.gender == "F", "F", "M")
 
