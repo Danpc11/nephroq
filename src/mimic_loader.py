@@ -352,6 +352,41 @@ def main(mimic_dir, out_path, min_span_days=180, min_points=4):
         nearest = merged.sort_values("abs_delta").groupby("subject_id").first()
         return nearest[value_col].to_dict()
 
+    def get_strict_baseline(series_df, max_lookback_days=180):
+        """
+        STRICT prospective baseline match for KFRE-comparable use: the value
+        of the measurement AT OR BEFORE the patient's index date (never
+        after -- no forward tolerance at all), within max_lookback_days.
+        This is stricter than attach_baseline() above (which allows a small
+        forward grace period, defensible for RETROSPECTIVE reconstruction
+        but not for a genuine prospective baseline forecast) -- see
+        docs/KNOWN_ISSUES.md "three evaluation modes".
+
+        Returns (observed_flag_dict, value_dict) -- both patient_id -> value.
+        The VALUE (not just the flag) matters: evaluate_baseline_forecast in
+        calibrate_mimic.py must use this strict value, not the more
+        permissive dynamic/baseline-window value, or the "prospective"
+        forecast would still leak a small amount of future information
+        through the value itself even while correctly gating on the flag.
+
+        Vectorized via merge_asof's by= grouping (matches efficiently
+        without a per-patient Python loop, unlike the dynamic/baseline
+        helpers above).
+        """
+        if series_df.empty or not index_dates:
+            return {}, {}
+        idx_df = pd.DataFrame({"subject_id": list(index_dates.keys()),
+                               "charttime": list(index_dates.values())}).sort_values("charttime")
+        s_sorted = series_df[["subject_id", "charttime", "value"]].sort_values("charttime").copy()
+        s_sorted["matched_charttime"] = s_sorted["charttime"]   # detectable after the merge
+        merged = pd.merge_asof(idx_df, s_sorted, on="charttime", by="subject_id",
+                               direction="backward",
+                               tolerance=pd.Timedelta(days=max_lookback_days))
+        merged = merged.set_index("subject_id")
+        observed = merged["matched_charttime"].notna().to_dict()
+        value = merged["value"].to_dict()
+        return observed, value
+
     def attach_covariate(df, series_df, window_dynamic, window_baseline, label):
         """series_df must already have columns [subject_id, charttime, value]."""
         # tier 1: per-visit dynamic
@@ -377,6 +412,34 @@ def main(mimic_dir, out_path, min_span_days=180, min_points=4):
     if not omr_sbp.empty:
         omr_sbp = omr_sbp.rename(columns={"chartdate": "charttime", "sbp": "value"})
         df["sbp"] = attach_covariate(df, omr_sbp, DYNAMIC_WINDOW, BASELINE_WINDOW["sbp"], "SBP")
+
+    # STRICT baseline-observed flags (backward-only, no forward tolerance at
+    # all) -- for prospective/KFRE-comparable use (calibrate_mimic.py's
+    # filter_kfre_comparable + evaluate_baseline_forecast). Distinct from
+    # the more permissive attach_baseline() tier used above for retrospective
+    # dynamic reconstruction. See docs/KNOWN_ISSUES.md "three evaluation modes".
+    hba1c_obs_map, hba1c_strict_map = get_strict_baseline(a1c.rename(columns={"valuenum": "value"}))
+    uacr_obs_map, uacr_strict_map = get_strict_baseline(uacr.rename(columns={"valuenum": "value"}))
+    df["hba1c_baseline_observed"] = df["patient_id"].map(hba1c_obs_map).fillna(False)
+    df["uacr_baseline_observed"]  = df["patient_id"].map(uacr_obs_map).fillna(False)
+    # STRICT baseline values (backward-only) -- what evaluate_baseline_forecast
+    # in calibrate_mimic.py must use, NOT hba1c_series[0]/uacr_series[0]
+    # (those come from the more permissive dynamic/baseline-window tiers and
+    # could still contain a small amount of forward-looking information).
+    df["hba1c_baseline_strict"] = df["patient_id"].map(hba1c_strict_map)
+    df["uacr_baseline_strict"]  = df["patient_id"].map(uacr_strict_map)
+    if not omr_sbp.empty:
+        sbp_obs_map, sbp_strict_map = get_strict_baseline(omr_sbp)
+        df["sbp_baseline_observed"] = df["patient_id"].map(sbp_obs_map).fillna(False)
+        df["sbp_baseline_strict"] = df["patient_id"].map(sbp_strict_map)
+    else:
+        df["sbp_baseline_observed"] = False
+        df["sbp_baseline_strict"] = np.nan
+    n_kfre_like = int((df.groupby("patient_id")["hba1c_baseline_observed"].first()
+                       & df.groupby("patient_id")["uacr_baseline_observed"].first()).sum())
+    print(f"      Baseline-observed (strict, backward-only, for KFRE-comparable use): "
+         f"{n_kfre_like}/{n_ok} patients have BOTH HbA1c and UACR truly observed "
+         f"at or before their index date.")
 
     # Explicit, flagged imputation (only what is truly missing after tiers 1+2)
     df["hba1c_imputed"] = df["hba1c"].isna()
