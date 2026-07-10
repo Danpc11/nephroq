@@ -11,10 +11,28 @@ the mechanistic model, and writes A SINGLE FILE:
 That JSON contains only AGGREGATE PARAMETERS (q, k_hf, weights) -- never
 patient data. It is not pushed to git (see .gitignore). It is the file that:
   - the web app (app_web.py) uses automatically if present, as the
-    research/demo calibration.
+    research/demo calibration -- but ONLY if quality_status == "pass"
+    (see docs/KNOWN_ISSUES.md for what that means and why).
   - you can share "upon reasonable request" in the publication, consistent
     with the MIMIC-IV license (see docs/MIMIC_COMPLIANCE.md) -- the
     aggregate parameters are not PHI, but you control who receives them.
+
+METHODOLOGY NOTES (see docs/KNOWN_ISSUES.md for full detail):
+  - Uses the SAME model_core simulator as the app (no more duplicated,
+    silently-diverging integrators).
+  - Covariates (HbA1c/UACR/SBP) are still a per-patient scalar (median),
+    NOT a proper baseline-at-index-date or time-varying covariate. This is
+    a known simplification -- see docs/KNOWN_ISSUES.md item on temporal
+    covariate handling.
+  - Observations are weighted so that no single heavily-monitored patient
+    dominates the fit (each patient contributes ~equal total weight,
+    regardless of how many creatinine measurements they have).
+  - A held-out test split (by patient) is evaluated but NOT used to choose
+    q ranges, filters, or weights -- see the "holdout_*" fields.
+  - --chronic-only is an outcome-selected subset (conditions on observed
+    future decline) and must NOT be used as the primary validation cohort
+    for comparisons like NephroQ-vs-KFRE. It is a secondary, mechanistic
+    sanity check only.
 
 USAGE:
     python calibrate_mimic.py --mimic-dir /path/to/your/mimic-iv/hosp
@@ -22,7 +40,7 @@ USAGE:
 Requires: numpy, pandas, scipy (already in requirements.txt). No network needed.
 ================================================================================
 """
-import argparse, json, os, subprocess, sys, datetime
+import argparse, json, os, subprocess, sys, datetime, time
 import numpy as np
 import pandas as pd
 from scipy.optimize import least_squares
@@ -30,42 +48,57 @@ from scipy.optimize import least_squares
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from mimic_loader import main as build_mimic_csv  # reuses the already-tested loader
+import model_core as core
 
-# ---- same mechanistic core and identifiable parameterization as amortized_ai.py / bayesian_model.py ----
-G_MAX, ALPHA, N_FLOOR, K0_FIX = 120.0, 0.80, 0.05, 0.0030
-
-def N_of_egfr(e): return np.power(np.clip(e, 1e-6, None) / G_MAX, 1 / ALPHA)
-def egfr_of_N(N): return G_MAX * np.power(np.clip(N, 1e-9, None), ALPHA)
+# ---- SINGLE canonical model implementation -- see docs/KNOWN_ISSUES.md for why
+# this used to be a second, independent simulator that silently diverged from
+# the app's (mechanistic_twin.py) by up to ~11 mL/min/1.73m2 near collapse.
+G_MAX, ALPHA, N_FLOOR, K0_FIX = core.G_MAX, core.ALPHA, core.N_FLOOR, core.K0_DEFAULT
+N_of_egfr = core.N_of_egfr
+egfr_of_N = core.egfr_of_N
 
 def insult(cov, w):
     a1c, uacr, sbp = cov
-    return w[0]*max(a1c-6.5, 0) + w[1]*np.log1p(uacr/30) + w[2]*max(sbp-130, 0)/10
-
-def simulate(q, khf, cov, w, t_max, egfr0, dt=0.05):
-    I = insult(cov, w); N = N_of_egfr(egfr0)
-    n = int(t_max/dt) + 1; ts = np.linspace(0, t_max, n); Ns = np.empty(n); Ns[0] = N
-    for k in range(1, n):
-        Nc = min(max(Ns[k-1], N_FLOOR), 1.0)
-        h = min(K0_FIX + khf*(1.0/Nc)**q + I, 50.0)
-        Ns[k] = min(max(Ns[k-1] - dt*Ns[k-1]*h, N_FLOOR), 1.0)
-    return ts, Ns
+    return core.metabolic_hazard(a1c, uacr, sbp, w[0], w[1], w[2])
 
 def predict_egfr(q, khf, cov, w, t_query, egfr0):
-    ts, Ns = simulate(q, khf, cov, w, float(np.max(t_query)) + 0.1, egfr0)
-    return np.clip(egfr_of_N(np.interp(t_query, ts, Ns)), 0, G_MAX)
+    """Delegates to model_core.predict_egfr_at -- the SAME solve_ivp-based
+    integrator MechanisticRenalModel.simulate() uses in the app."""
+    N0 = N_of_egfr(egfr0)
+    return core.predict_egfr_at(K0_FIX, khf, q, 1.0, insult(cov, w), N0, t_query)
+
 
 def load_cohort(csv_path):
+    """
+    Returns (patients, missingness) where missingness is the fraction of
+    patients whose HbA1c/UACR/SBP were fully imputed (never actually
+    measured) rather than observed -- important context for how much to
+    trust w_uacr etc. (see docs/KNOWN_ISSUES.md).
+    """
     df = pd.read_csv(csv_path)
+    has_flags = {"hba1c_imputed", "uacr_imputed", "sbp_imputed"}.issubset(df.columns)
     patients = []
+    n_imputed = dict(hba1c=0, uacr=0, sbp=0)
     for pid, g in df.groupby("patient_id"):
         g = g.sort_values("time_years")
         if len(g) < 3:
             continue
         cov = (float(g["hba1c"].median()), float(g["uacr"].median()), float(g["sbp"].median()))
-        patients.append(dict(cov=cov, egfr0=float(g["egfr"].iloc[0]),
-                             t=g["time_years"].values.astype(float),
-                             e=g["egfr"].values.astype(float)))
-    return patients
+        pat = dict(cov=cov, egfr0=float(g["egfr"].iloc[0]),
+                  t=g["time_years"].values.astype(float),
+                  e=g["egfr"].values.astype(float), patient_id=str(pid))
+        if has_flags:
+            pat["hba1c_imputed"] = bool(g["hba1c_imputed"].iloc[0])
+            pat["uacr_imputed"]  = bool(g["uacr_imputed"].iloc[0])
+            pat["sbp_imputed"]   = bool(g["sbp_imputed"].iloc[0])
+            for k in ("hba1c", "uacr", "sbp"):
+                if pat[f"{k}_imputed"]:
+                    n_imputed[k] += 1
+        patients.append(pat)
+    n = len(patients)
+    missingness = {k: round(n_imputed[k]/n, 3) for k in n_imputed} if (has_flags and n) else None
+    return patients, missingness
+
 
 LO = np.array([0.5, 1e-4, 1e-4, 1e-4, 1e-4])
 HI = np.array([3.0, 0.06, 0.06, 0.06, 0.06])
@@ -74,12 +107,68 @@ def pack(th):
     z = np.clip((th - LO) / (HI - LO), 1e-4, 1 - 1e-4)
     return np.log(z / (1 - z))
 
-def calibrate(patients, noise_sd=3.5, seed=0):
+
+def split_train_test(patients, test_frac=0.3, seed=42):
+    """Splits by PATIENT (never by row) so no patient's data leaks across
+    the split. The test set is not used anywhere in fitting or model
+    selection -- only for the held-out metrics reported at the end."""
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(len(patients))
+    n_test = int(round(test_frac * len(patients)))
+    test_idx, train_idx = set(idx[:n_test].tolist()), set(idx[n_test:].tolist())
+    train = [patients[i] for i in sorted(train_idx)]
+    test  = [patients[i] for i in sorted(test_idx)]
+    return train, test
+
+
+def evaluate_holdout(params, patients, noise_sd=3.5):
+    """Unweighted RMSE/chi2 of the ALREADY-FITTED params on a patient set
+    that was not used for fitting. No parameters are adjusted here."""
+    q, khf, w = params["q"], params["k_hf"], np.array([params["w_a1c"], params["w_uacr"], params["w_sbp"]])
+    res = []
+    for pac in patients:
+        pred = predict_egfr(q, khf, pac["cov"], w, pac["t"], pac["egfr0"])
+        res.append((pred - pac["e"]) / noise_sd)
+    if not res:
+        return None
+    r = np.concatenate(res)
+    r = r[np.isfinite(r)]
+    n_obs = len(r)
+    chi2_n = float(np.mean(r**2))
+    rmse = float(np.sqrt(chi2_n) * noise_sd)
+    return dict(n_patients=len(patients), n_obs=n_obs, chi2_per_n=chi2_n, rmse_mL_min=rmse)
+
+
+def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True):
+    """
+    max_patients: if set, randomly subsample the cohort (fixed seed, for
+    reproducibility) before fitting. 5 parameters need nowhere near tens of
+    thousands of patients to be well identified -- subsampling to a few
+    thousand gives essentially the same precision at a fraction of the
+    per-iteration cost.
+
+    Observations are weighted by 1/sqrt(n_i) PER PATIENT (in addition to
+    1/noise_sd) so that a patient with 100 creatinine measurements does not
+    dominate the objective over one with 4 -- both are one person. This
+    matters a lot in MIMIC-IV, where critically ill patients can have labs
+    drawn many times a day (see docs/KNOWN_ISSUES.md).
+    """
+    if max_patients and len(patients) > max_patients:
+        rng_sub = np.random.default_rng(seed)
+        idx = rng_sub.choice(len(patients), size=max_patients, replace=False)
+        patients = [patients[i] for i in idx]
+        if verbose:
+            print(f"      Subsampled to {max_patients} patients for fitting "
+                 f"(seed={seed}, for speed -- statistically sufficient for 5 parameters).")
+
     def residuals(p):
         q, khf, wa, wu, wb = unpack(p)
         w = np.array([wa, wu, wb])
-        r = [(predict_egfr(q, khf, pac["cov"], w, pac["t"], pac["egfr0"]) - pac["e"]) / noise_sd
-            for pac in patients]
+        r = []
+        for pac in patients:
+            n_i = max(len(pac["t"]), 1)
+            per_patient_scale = noise_sd * np.sqrt(n_i)   # equalizes total per-patient weight
+            r.append((predict_egfr(q, khf, pac["cov"], w, pac["t"], pac["egfr0"]) - pac["e"]) / per_patient_scale)
         r = np.concatenate(r)
         return np.where(np.isfinite(r), r, 100.0)
 
@@ -87,18 +176,30 @@ def calibrate(patients, noise_sd=3.5, seed=0):
     base = np.array([1.5, 0.012, 0.014, 0.018, 0.011])
     best = None
     for s in range(5):
+        t0 = time.time()
         p_init = pack(base) if s == 0 else pack(np.clip(base*rng.uniform(0.5, 1.8, 5), LO*1.01, HI*0.99))
         sol = least_squares(residuals, p_init, method="trf", max_nfev=3000)
+        dt = time.time() - t0
+        if verbose:
+            q_s, khf_s, *_ = unpack(sol.x)
+            print(f"      [fit {s+1}/5] {dt:5.1f}s  cost={sol.cost:.1f}  "
+                 f"nfev={sol.nfev}  q={q_s:.2f}  k_hf={khf_s:.4f}"
+                 f"{'  <- best so far' if best is None or sol.cost < best.cost else ''}")
         if best is None or sol.cost < best.cost:
             best = sol
 
     q, khf, wa, wu, wb = unpack(best.x)
-    n_obs = sum(len(pac["t"]) for pac in patients)
-    chi2_n = 2 * best.cost / n_obs
-    rmse = float(np.sqrt(chi2_n) * noise_sd)
-    return dict(q=float(q), k_hf=float(khf), w_a1c=float(wa), w_uacr=float(wu), w_sbp=float(wb),
-               n_patients=len(patients), n_obs=int(n_obs),
-               chi2_per_n=float(chi2_n), rmse_mL_min=rmse)
+    params = dict(q=float(q), k_hf=float(khf), w_a1c=float(wa), w_uacr=float(wu), w_sbp=float(wb))
+
+    # Report UNWEIGHTED rmse/chi2 (on the fitting set) for an interpretable
+    # number in the original units -- the weighting above only affects which
+    # parameters get chosen, not how the fit is subsequently described.
+    fit_eval = evaluate_holdout(params, patients, noise_sd=noise_sd)
+    result = dict(params)
+    result.update(n_patients=fit_eval["n_patients"], n_obs=fit_eval["n_obs"],
+                  chi2_per_n=fit_eval["chi2_per_n"], rmse_mL_min=fit_eval["rmse_mL_min"])
+    return result
+
 
 def diagnose_cohort(patients, noise_sd=3.5):
     """
@@ -112,25 +213,29 @@ def diagnose_cohort(patients, noise_sd=3.5):
     """
     net_decline = 0
     volatilities = []
+    obs_counts = []
     for pat in patients:
         t, e = pat["t"], pat["e"]
         if len(t) < 3:
             continue
-        # net trend: simple linear fit slope
+        obs_counts.append(len(t))
         slope = np.polyfit(t, e, 1)[0]
         if slope < 0:
             net_decline += 1
-        # volatility: residual std around a linear trend, vs assumed noise_sd
         resid = e - np.polyval(np.polyfit(t, e, 1), t)
         volatilities.append(np.std(resid))
     n = len(patients)
     frac_declining = net_decline / n if n else 0.0
     median_volatility = float(np.median(volatilities)) if volatilities else float("nan")
+    max_obs = int(np.max(obs_counts)) if obs_counts else 0
+    median_obs = float(np.median(obs_counts)) if obs_counts else 0.0
     print(f"\n[diagnostics] Patients with net-declining eGFR trend: "
           f"{net_decline}/{n} ({100*frac_declining:.0f}%)")
     print(f"[diagnostics] Median within-patient volatility (residual std around "
           f"a straight line): {median_volatility:.1f} mL/min/1.73m² "
           f"(assumed measurement noise: {noise_sd})")
+    print(f"[diagnostics] Observations per patient: median={median_obs:.0f}, max={max_obs} "
+          f"(per-patient weighting is applied during fitting -- see docs/KNOWN_ISSUES.md)")
     if median_volatility > 3 * noise_sd:
         print("[diagnostics] WARNING: within-patient volatility is much larger than the "
               "assumed measurement noise -- trajectories look ACUTE/fluctuating rather "
@@ -143,15 +248,24 @@ def diagnose_cohort(patients, noise_sd=3.5):
               "cannot represent the rest. Consider --chronic-only to fit on the subset it can "
               "represent.")
     return dict(n_patients=n, frac_net_declining=round(frac_declining, 3),
-               median_volatility_mL_min=round(median_volatility, 2) if volatilities else None)
+               median_volatility_mL_min=round(median_volatility, 2) if volatilities else None,
+               median_obs_per_patient=median_obs, max_obs_per_patient=max_obs)
+
 
 def filter_chronic_like(patients, max_volatility_ratio=2.5, noise_sd=3.5):
     """
     Optional stricter cohort: keep only patients with a net-declining trend
     AND within-patient volatility not too far above measurement noise --
     i.e. trajectories the monotonic mechanistic model can plausibly represent.
-    This is a subset, not a fix: it trades cohort size for a fit the model
-    can actually explain, useful for a first honest proof-of-concept.
+
+    IMPORTANT (outcome-selection bias): this filter looks at each patient's
+    FULL observed trajectory (including their "future" relative to any
+    index date) to decide whether to keep them. That means a fit on this
+    subset CANNOT be used to claim the model predicts decline -- it was
+    selected for having already declined smoothly. Use this only as a
+    secondary mechanistic sanity check (does the model fit well on
+    textbook-like chronic trajectories?), never as the primary cohort for
+    comparing predictive performance against KFRE or any other baseline.
     """
     kept = []
     for pat in patients:
@@ -165,48 +279,117 @@ def filter_chronic_like(patients, max_volatility_ratio=2.5, noise_sd=3.5):
             kept.append(pat)
     return kept
 
+
+def assess_quality(result, diagnostics):
+    """
+    Formal accept/warn gate the APP checks before silently trusting a MIMIC
+    calibration as its active parameters (see app_web.py). Returns
+    (status, reasons).
+    """
+    reasons = []
+    if result["q"] <= LO[0] + 1e-6 or result["q"] >= HI[0] - 1e-6:
+        reasons.append("q_at_bound")
+    if result["chi2_per_n"] > 5:
+        reasons.append("high_chi2_per_observation")
+    if diagnostics.get("frac_net_declining", 1.0) < 0.6:
+        reasons.append("majority_nondeclining_cohort")
+    if diagnostics.get("median_volatility_mL_min", 0) and diagnostics["median_volatility_mL_min"] > 3 * 3.5:
+        reasons.append("high_within_patient_volatility")
+    if result["n_patients"] < 30:
+        reasons.append("small_cohort")
+    status = "pass" if not reasons else "warning"
+    return status, reasons
+
+
 def main():
     ap = argparse.ArgumentParser(description="Calibrates the twin with your LOCAL MIMIC-IV copy.")
-    ap.add_argument("--mimic-dir", required=True, help="Path to the hosp/ folder of your local MIMIC-IV copy")
+    ap.add_argument("--mimic-dir", default=None, help="Path to the hosp/ folder of your local MIMIC-IV copy (not needed with --from-csv)")
     ap.add_argument("--out", default=os.path.join(HERE, "..", "calibration", "mimic_calibration.json"))
     ap.add_argument("--mimic-version", default="3.1")
     ap.add_argument("--min-span-days", type=int, default=180)
     ap.add_argument("--min-points", type=int, default=4)
     ap.add_argument("--chronic-only", action="store_true",
-                    help="Keep only patients with a net-declining, low-volatility "
-                         "trajectory (a subset the monotonic mechanistic model can "
-                         "plausibly represent). Use if diagnostics flag an acute/"
-                         "fluctuating cohort.")
+                    help="SECONDARY mechanistic analysis only (outcome-selected -- see "
+                         "filter_chronic_like docstring). Do not use as the primary cohort "
+                         "for predictive comparisons against KFRE or similar.")
+    ap.add_argument("--max-patients", type=int, default=None,
+                    help="Randomly subsample the (post-filter) TRAINING cohort to at most "
+                         "this many patients before fitting, for speed. Fixed seed.")
+    ap.add_argument("--keep-csv", action="store_true",
+                    help="Do not delete the intermediate per-patient CSV after fitting. "
+                         "Reuse it with --from-csv to skip re-reading labevents.csv.gz.")
+    ap.add_argument("--from-csv", default=None,
+                    help="Skip rebuilding the cohort from raw MIMIC-IV and calibrate "
+                         "directly from a CSV previously produced with --keep-csv.")
+    ap.add_argument("--test-frac", type=float, default=0.3,
+                    help="Fraction of patients held out (by patient, not by row) for the "
+                         "reported holdout metrics. Never used to choose parameters/filters.")
     a = ap.parse_args()
+    if not a.from_csv and not a.mimic_dir:
+        ap.error("--mimic-dir is required unless --from-csv is given.")
 
-    tmp_csv = os.path.join(HERE, "..", "data", "_mimic_tmp.csv")
-    os.makedirs(os.path.dirname(tmp_csv), exist_ok=True)
+    tmp_csv = a.from_csv if a.from_csv else os.path.join(HERE, "..", "data", "_mimic_tmp.csv")
+    os.makedirs(os.path.dirname(os.path.abspath(tmp_csv)), exist_ok=True)
 
-    print("[1/3] Building the cohort from local MIMIC-IV (never leaves your machine)...")
-    build_mimic_csv(a.mimic_dir, tmp_csv, a.min_span_days, a.min_points)
+    if a.from_csv:
+        print(f"[1/3] Skipping MIMIC-IV rebuild -- calibrating directly from {a.from_csv}")
+    else:
+        print("[1/3] Building the cohort from local MIMIC-IV (never leaves your machine)...")
+        build_mimic_csv(a.mimic_dir, tmp_csv, a.min_span_days, a.min_points)
 
     print("\n[2/3] Calibrating the mechanistic model...")
-    patients = load_cohort(tmp_csv)
+    patients, missingness = load_cohort(tmp_csv)
     if len(patients) < 5:
         print(f"Only {len(patients)} patients with a usable trajectory -- insufficient, aborting.")
-        os.remove(tmp_csv)
+        if not a.keep_csv and not a.from_csv:
+            os.remove(tmp_csv)
         return
 
     diagnostics = diagnose_cohort(patients)
+    if missingness:
+        print(f"[diagnostics] Missingness (fraction of patients with a fully-imputed value): "
+             f"hba1c={missingness['hba1c']:.0%}  uacr={missingness['uacr']:.0%}  "
+             f"sbp={missingness['sbp']:.0%}")
+        if missingness["uacr"] > 0.5:
+            print("[diagnostics] WARNING: UACR is imputed for the majority of patients -- "
+                 "w_uacr is likely poorly identified. Consider it exploratory, not a robust "
+                 "population estimate, until a cohort with better UACR coverage is used.")
 
     if a.chronic_only:
         before = len(patients)
         patients = filter_chronic_like(patients)
         print(f"[diagnostics] --chronic-only: kept {len(patients)}/{before} patients "
-             f"with a net-declining, lower-volatility trajectory.")
+             f"(SECONDARY, outcome-selected subset -- see --chronic-only help text).")
         if len(patients) < 5:
             print("Too few patients remain after --chronic-only filtering -- aborting.")
-            os.remove(tmp_csv)
+            if not a.keep_csv and not a.from_csv:
+                os.remove(tmp_csv)
             return
 
-    result = calibrate(patients)
+    train, test = split_train_test(patients, test_frac=a.test_frac)
+    print(f"[diagnostics] Train/test split by patient: {len(train)} train, {len(test)} held-out "
+         f"(held-out set is NOT used to choose parameters/filters).")
+    if len(train) > 3000 and not a.max_patients:
+        print(f"[diagnostics] NOTE: {len(train)} training patients with the accurate (solve_ivp) "
+             "engine may take a long time to fit. Consider --max-patients 2000-3000 for a much "
+             "faster fit with essentially the same precision for 5 parameters.")
+
+    result = calibrate(train, max_patients=a.max_patients)
     result["diagnostics"] = diagnostics
+    result["missingness"] = missingness
     result["chronic_only_filter"] = bool(a.chronic_only)
+    result["max_patients_subsample"] = a.max_patients
+
+    holdout = evaluate_holdout(result, test)
+    if holdout:
+        result["holdout"] = holdout
+        print(f"\n[diagnostics] Held-out (n={holdout['n_patients']} patients): "
+             f"chi2/n={holdout['chi2_per_n']:.2f}  rmse={holdout['rmse_mL_min']:.1f} mL/min")
+
+    quality_status, quality_reasons = assess_quality(result, diagnostics)
+    result["quality_status"] = quality_status
+    result["quality_reasons"] = quality_reasons
+    result["validated"] = False   # never auto-set to True; externally-validated is a human judgment
 
     result["source"] = "MIMIC-IV (calibrated locally, not redistributed -- see docs/MIMIC_COMPLIANCE.md)"
     result["mimic_version"] = a.mimic_version
@@ -222,27 +405,30 @@ def main():
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
-    os.remove(tmp_csv)   # do not leave the intermediate per-patient CSV behind
+
+    if not a.keep_csv and not a.from_csv:
+        os.remove(tmp_csv)
+    elif a.keep_csv:
+        print(f"\n      (kept intermediate CSV at {tmp_csv} -- excluded from git; "
+             f"reuse with --from-csv {tmp_csv} to skip rebuilding next time)")
 
     print(f"\n[3/3] Saved: {out_path}")
     print(f"       q={result['q']:.2f}  k_hf={result['k_hf']:.4f}  "
-         f"n_patients={result['n_patients']}  chi2/n={result['chi2_per_n']:.2f}")
+         f"n_patients={result['n_patients']}  chi2/n={result['chi2_per_n']:.2f}  "
+         f"quality={quality_status}")
 
-    if result["q"] <= LO[0] + 1e-6 or result["q"] >= HI[0] - 1e-6:
-        print(f"\nWARNING: q converged AT its bound ({LO[0]}-{HI[0]}). This usually means "
-             "the model could not find an interior optimum -- treat this fit as unreliable, "
-             "not a physical result. See the [diagnostics] messages above.")
-    if result["chi2_per_n"] > 5:
-        print(f"WARNING: chi2/n = {result['chi2_per_n']:.1f} is far above the ~1 expected for "
-             "a good fit (rmse={:.1f} mL/min vs assumed noise={:.1f}). Do NOT treat this as a "
-             "trustworthy calibration for the app/demo without further investigation "
-             "(try --chronic-only, or use the hierarchical model).".format(
-                 result["rmse_mL_min"], 3.5))
+    if quality_reasons:
+        print(f"\nWARNING: quality_status='warning' -- reasons: {quality_reasons}. "
+             "The app will display this warning if it loads this calibration. "
+             "See docs/KNOWN_ISSUES.md before treating this as a trustworthy calibration.")
 
     print("\nThis JSON is NOT pushed to git (see .gitignore). It is the file that:")
     print("  - the web app uses automatically as the research/demo calibration.")
     print("  - you can share 'upon reasonable request' in the publication.")
     print("  - see calibration/README.md for the handling policy of this file.")
+    print("  - carries a 'Research-use calibration -- not externally validated' label "
+         "regardless of quality_status: MIMIC-IV data does not by itself make this a "
+         "validated clinical tool.")
 
 if __name__ == "__main__":
     main()
