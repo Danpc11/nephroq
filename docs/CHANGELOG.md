@@ -1,8 +1,36 @@
 # Changelog
 
-Notable fixes and changes to NephroQ, driven by several rounds of detailed
-code review. For currently open limitations, see
-[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
+Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
+
+## Round 6
+
+### Added
+- **Three explicit evaluation modes, no longer conflated.** The holdout evaluation previously used each test patient's FULL observed covariate
+  history (via the dynamic per-visit matching) even to "predict" early visits -- this measures dynamic RECONSTRUCTION given known exposure
+  history, not a genuine forecast, and is not comparable to a baseline model like KFRE (which only ever sees age/sex/eGFR/UACR at one index
+  date). Fixed by explicitly splitting into:
+  - **Mode A (dynamic reconstruction)** -- the existing holdout, now labeled `holdout_dynamic_reconstruction` and printed as "NOT comparable to KFRE".
+  - **Mode B (baseline forecast)** -- NEW: `evaluate_baseline_forecast` uses ONLY each patient's baseline (index-date) covariates, held CONSTANT, to predict eGFR at fixed horizons (2, 5 years) via the constant-insult engine. This is the metric to compare against KFRE. Only evaluated on a `filter_kfre_comparable` cohort -- patients whose baseline HbA1c AND UACR were REALLY observed (see below), not imputed.
+  - **Mode C (landmark updating)** -- explicitly deferred; see `KNOWN_ISSUES.md`.
+- **Strict, backward-only baseline observation.** `mimic_loader.py` now computes `{hba1c,uacr,sbp}_baseline_observed` (boolean) and `{hba1c,uacr,sbp}_baseline_strict` (the actual value), both via backward-only matching (a real measurement at or before the index date, never after -- no forward tolerance at all), vectorized with `merge_asof`'s `by=` grouping. This is stricter than the existing
+  baseline-window tier (Round 3), which allows a +14 day forward grace period defensible for retrospective reconstruction but not for a prospective forecast. `evaluate_baseline_forecast` was found to still use `hba1c_series[0]` (from the more permissive tiers) even after the strict flag was added for cohort filtering -- fixed to use `hba1c_baseline_strict` etc. directly, closing a residual leak where the eligibility check was strict but the value used wasn't. 
+- **`quality_status` now considers holdout performance**, not just training-fit metrics: flags `holdout_much_worse_than_training` (possible overfitting), `high_holdout_chi2`, `no_baseline_forecast_evaluation` (no KFRE-comparable patients in the held-out set), and per-horizon `poor_baseline_forecast_accuracy_year_{h}`.
+
+### Changed
+- **Bootstrap interval renamed and its statistics corrected.** The app
+  called its bootstrap-based band a "90% prediction interval" -- renamed to
+  "90% bootstrap **parameter**-uncertainty interval/band" throughout, since
+  it captures only calibrated-parameter uncertainty (from resampling
+  patients), not residual variability, measurement error, individual
+  random effects, unknown future covariate evolution, or structural model
+  error (see `KNOWN_ISSUES.md`). Also fixed a statistical issue: the
+  time-to-eGFR<15 interval previously dropped non-crossing (infinite-time)
+  bootstrap trajectories before computing percentiles, which could show a
+  falsely precise-looking interval even when most resamples never crossed
+  the threshold. Now reports the fraction of resamples that DO reach the
+  threshold within the horizon, and only shows a numeric interval when a
+  majority (>=50%) actually cross it; otherwise states the result is
+  better read as ">N years" for most resamples.
 
 ## Round 5
 
