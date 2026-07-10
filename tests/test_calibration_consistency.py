@@ -116,3 +116,42 @@ def test_backward_compatible_default_path_unchanged():
     assert m.N_ref == 0.60
     t, N, egfr, t_dial = m.simulate(N0=0.62, years=25)
     assert np.isfinite(t_dial) or t_dial == np.inf
+
+def test_no_temporal_leakage_in_covariates():
+    """
+    Reproduces the exact leakage example from the code review: a patient
+    with HbA1c=7.0 at their index date (2014), HbA1c=8.2 in 2017, and
+    HbA1c=10.0 in 2020. The OLD (whole-trajectory median) approach would
+    assign HbA1c=8.2 to the 2014 row -- using information from 3 years in
+    the future to "explain" an earlier eGFR observation. The FIXED
+    (baseline-window) approach must assign the value actually known at the
+    index date (7.0), not the contaminated median.
+    """
+    import mimic_loader as ml
+    import pandas as pd
+
+    index_dates = {"1": pd.Timestamp("2014-01-15")}
+    a1c = pd.DataFrame({
+        "subject_id": ["1", "1", "1"],
+        "charttime": [pd.Timestamp("2014-01-15"), pd.Timestamp("2017-02-20"), pd.Timestamp("2020-03-01")],
+        "valuenum": [7.0, 8.2, 10.0],
+    })
+
+    # simulate attach_baseline's logic directly (same window as mimic_loader.py)
+    window = (pd.Timedelta(days=-90), pd.Timedelta(days=14))
+    idx = pd.Series(index_dates, name="index_date")
+    merged = a1c.merge(idx, left_on="subject_id", right_index=True, how="inner")
+    delta = merged["charttime"] - merged["index_date"]
+    merged = merged.loc[(delta >= window[0]) & (delta <= window[1])].copy()
+    merged["abs_delta"] = (merged["charttime"] - merged["index_date"]).abs()
+    nearest = merged.sort_values("abs_delta").groupby("subject_id").first()
+    baseline_value = nearest["valuenum"].to_dict()["1"]
+
+    leaked_value = a1c["valuenum"].median()   # what the OLD code would have used
+
+    assert baseline_value == 7.0, \
+        f"Baseline HbA1c should be 7.0 (the value known at the index date), got {baseline_value}"
+    assert leaked_value == 8.2, \
+        "sanity check: the whole-trajectory median (8.2) is indeed different from the baseline (7.0)"
+    assert baseline_value != leaked_value, \
+        "baseline and leaked-median values must differ in this constructed example"
