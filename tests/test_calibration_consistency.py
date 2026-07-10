@@ -18,9 +18,16 @@ def test_calibrator_and_app_produce_same_trajectory():
     calibrate_mimic.py's (former) explicit RK4 integrator and the app's
     solve_ivp-based MechanisticRenalModel: compares the FULL trajectory
     produced by both code paths, not just an instantaneous hazard value.
-    Both now delegate to model_core.simulate_trajectory, so this should be
-    numerically identical (not just "close") -- this test guards against
-    that ever silently drifting apart again.
+
+    calibrate_mimic.py's predict_egfr is now DYNAMIC (time-varying insult
+    from a patient's own covariate series -- see docs/KNOWN_ISSUES.md
+    "dynamic covariates"), while the app's MechanisticRenalModel uses a
+    CONSTANT insult (a forward "what if these labs stay the same"
+    projection). This test checks the natural equivalence case: when a
+    patient's covariate series is literally constant over time, the dynamic
+    engine must collapse to the same trajectory as the app's constant
+    engine -- both ultimately call model_core's solve_ivp integrator with an
+    insult that doesn't change, so they should be numerically identical.
     """
     import numpy.testing as npt
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -30,12 +37,18 @@ def test_calibrator_and_app_produce_same_trajectory():
     w_a1c, w_uacr, w_sbp = 0.0144, 0.0180, 0.0108
     a1c, sbp, uacr, egfr0 = 8.1, 142, 145, 47.7
 
-    # path 1: the calibration script's predict_egfr
+    # path 1: the calibration script's (dynamic) predict_egfr, with a
+    # CONSTANT covariate series (same value at every visit) -- the
+    # degenerate case that should match a constant-insult simulation.
     t_query = np.linspace(0, 15, 50)
-    egfr_calibration = cal.predict_egfr(q, k_hf, (a1c, uacr, sbp),
-                                        np.array([w_a1c, w_uacr, w_sbp]), t_query, egfr0)
+    n_visits = 8
+    pac = dict(t=np.linspace(0, 15, n_visits), egfr0=egfr0,
+              hba1c_series=np.full(n_visits, a1c),
+              uacr_series=np.full(n_visits, uacr),
+              sbp_series=np.full(n_visits, sbp))
+    egfr_calibration = cal.predict_egfr(q, k_hf, pac, np.array([w_a1c, w_uacr, w_sbp]), t_query)
 
-    # path 2: the app's MechanisticRenalModel
+    # path 2: the app's MechanisticRenalModel (constant insult)
     m = MechanisticRenalModel(a1c=a1c, sbp=sbp, uacr=uacr, u=0.0, k_hf=k_hf, q=q,
                               w_a1c=w_a1c, w_uacr=w_uacr, w_sbp=w_sbp)
     _, _, egfr_app_full, _ = m.simulate(N_of_egfr(egfr0), years=15, n=600)
@@ -43,8 +56,42 @@ def test_calibrator_and_app_produce_same_trajectory():
     egfr_app = np.interp(t_query, t_app_full, egfr_app_full)
 
     npt.assert_allclose(egfr_calibration, egfr_app, rtol=1e-2, atol=0.5,
-                        err_msg="Calibration and app trajectories diverge -- "
-                        "they must both go through model_core.simulate_trajectory.")
+                        err_msg="Calibration (dynamic, constant covariates) and app "
+                        "(constant insult) trajectories diverge -- they must both go "
+                        "through model_core's solve_ivp integrator consistently.")
+
+
+def test_dynamic_insult_responds_to_changing_covariates():
+    """
+    The dynamic engine must actually behave differently from a constant one
+    when covariates change over time: a patient whose HbA1c rises partway
+    through follow-up should decline faster in the second half than an
+    otherwise-identical patient whose HbA1c stayed low throughout.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+
+    q, k_hf = 1.52, 0.0141
+    w = np.array([0.0144, 0.0180, 0.0108])
+    n_visits = 10
+    t = np.linspace(0, 10, n_visits)
+
+    pac_rising = dict(t=t, egfr0=80.0,
+                      hba1c_series=np.where(t < 5, 6.8, 10.0),   # jumps up at year 5
+                      uacr_series=np.full(n_visits, 30.0),
+                      sbp_series=np.full(n_visits, 125.0))
+    pac_stable = dict(t=t, egfr0=80.0,
+                      hba1c_series=np.full(n_visits, 6.8),        # stays low throughout
+                      uacr_series=np.full(n_visits, 30.0),
+                      sbp_series=np.full(n_visits, 125.0))
+
+    t_query = np.array([9.5])
+    egfr_rising = cal.predict_egfr(q, k_hf, pac_rising, w, t_query)[0]
+    egfr_stable = cal.predict_egfr(q, k_hf, pac_stable, w, t_query)[0]
+
+    assert egfr_rising < egfr_stable, (
+        f"the patient whose HbA1c rose should have LOWER eGFR at year 9.5 "
+        f"({egfr_rising:.1f}) than the one who stayed well-controlled ({egfr_stable:.1f})")
 
 
 def test_app_calibration_consistency():
@@ -199,3 +246,34 @@ def test_primary_sensitivity_fallback_when_too_small():
     assert used_fallback, "only 5 fully-observed patients should trigger the fallback"
     assert len(primary) == len(patients)
     assert sensitivity is None
+
+def test_bootstrap_calibrate_returns_requested_count():
+    """bootstrap_calibrate must return one parameter set per successful
+    replicate, each a well-formed dict with the 5 model parameters."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+
+    rng = np.random.default_rng(0)
+    patients = []
+    for i in range(15):
+        n_visits = 5
+        t = np.linspace(0, 4, n_visits)
+        patients.append(dict(t=t, e=80 - 3*t + rng.normal(0, 1, n_visits), egfr0=80.0,
+                             patient_id=str(i),
+                             hba1c_series=np.full(n_visits, 7.5),
+                             uacr_series=np.full(n_visits, 50.0),
+                             sbp_series=np.full(n_visits, 130.0)))
+    point = cal.calibrate(patients, verbose=False, n_multistarts=1)
+    boot = cal.bootstrap_calibrate(patients, point, n_boot=3, seed=1)
+    assert len(boot) == 3
+    for b in boot:
+        assert set(b.keys()) == {"q", "k_hf", "w_a1c", "w_uacr", "w_sbp"}
+        assert np.isfinite(b["q"]) and b["q"] > 0
+
+def test_bootstrap_disabled_returns_empty_list():
+    """n_boot=0 must return an empty list (the app's signal to fall back to
+    a point-estimate-only display), not None or an error."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+    point = dict(q=1.5, k_hf=0.01, w_a1c=0.01, w_uacr=0.01, w_sbp=0.01)
+    assert cal.bootstrap_calibrate([{}], point, n_boot=0) == []
