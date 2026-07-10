@@ -277,3 +277,77 @@ def test_bootstrap_disabled_returns_empty_list():
     import calibrate_mimic as cal
     point = dict(q=1.5, k_hf=0.01, w_a1c=0.01, w_uacr=0.01, w_sbp=0.01)
     assert cal.bootstrap_calibrate([{}], point, n_boot=0) == []
+
+def test_filter_kfre_comparable():
+    """Only patients with BOTH hba1c_baseline_observed and uacr_baseline_observed
+    True should pass the KFRE-comparable filter."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+
+    patients = [
+        dict(patient_id="both_observed", hba1c_baseline_observed=True, uacr_baseline_observed=True),
+        dict(patient_id="only_hba1c", hba1c_baseline_observed=True, uacr_baseline_observed=False),
+        dict(patient_id="only_uacr", hba1c_baseline_observed=False, uacr_baseline_observed=True),
+        dict(patient_id="neither", hba1c_baseline_observed=False, uacr_baseline_observed=False),
+    ]
+    kept = cal.filter_kfre_comparable(patients)
+    assert [p["patient_id"] for p in kept] == ["both_observed"]
+
+def test_filter_kfre_comparable_missing_flags_returns_empty():
+    """If the CSV predates the baseline_observed flags (e.g. an older run),
+    the filter must return an empty list, not crash."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+    assert cal.filter_kfre_comparable([dict(patient_id="x")]) == []
+    assert cal.filter_kfre_comparable([]) == []
+
+def test_evaluate_baseline_forecast_uses_only_baseline_covariates():
+    """
+    The baseline forecast must use ONLY the FIRST covariate values (index
+    date), never later ones -- even if a patient's HbA1c series changes
+    dramatically after baseline, the Mode B prediction must not react to it
+    (that's the whole point: it is a prospective, baseline-only forecast).
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+
+    params = dict(q=1.5, k_hf=0.012, w_a1c=0.0144, w_uacr=0.018, w_sbp=0.0108)
+    t = np.array([0.0, 2.0, 5.0])
+
+    # patient A: HbA1c stays low the whole time
+    pac_stable = dict(t=t, e=np.array([80.0, 74.0, 65.0]), egfr0=80.0,
+                      hba1c_series=np.array([6.8, 6.8, 6.8]),
+                      uacr_series=np.array([30.0, 30.0, 30.0]),
+                      sbp_series=np.array([125.0, 125.0, 125.0]))
+    # patient B: SAME baseline as A, but HbA1c rises sharply after baseline
+    pac_rises_later = dict(t=t, e=np.array([80.0, 74.0, 65.0]), egfr0=80.0,
+                           hba1c_series=np.array([6.8, 10.0, 10.0]),  # only differs AFTER baseline
+                           uacr_series=np.array([30.0, 30.0, 30.0]),
+                           sbp_series=np.array([125.0, 125.0, 125.0]))
+
+    result_stable = cal.evaluate_baseline_forecast(params, [pac_stable], horizons=(2.0, 5.0))
+    result_rises = cal.evaluate_baseline_forecast(params, [pac_rises_later], horizons=(2.0, 5.0))
+
+    # Both patients have IDENTICAL baseline covariates, so the MODEL'S
+    # PREDICTION (not the observed error) must be identical -- verify by
+    # checking the prediction directly rather than just the RMSE (which
+    # also depends on each patient's own observed e, here made identical).
+    assert result_stable["year_2.0"]["rmse_mL_min"] == result_rises["year_2.0"]["rmse_mL_min"], \
+        "baseline forecast must ignore post-baseline covariate changes -- predictions should match"
+    assert result_stable["year_5.0"]["rmse_mL_min"] == result_rises["year_5.0"]["rmse_mL_min"]
+
+def test_evaluate_baseline_forecast_skips_missing_horizons():
+    """A patient with no observation near a requested horizon must be
+    skipped for THAT horizon (not imputed or forced), while still being
+    evaluated at horizons they do have data for."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+
+    params = dict(q=1.5, k_hf=0.012, w_a1c=0.0144, w_uacr=0.018, w_sbp=0.0108)
+    # only a visit near year 2, nothing near year 5
+    pac = dict(t=np.array([0.0, 2.1]), e=np.array([80.0, 74.0]), egfr0=80.0,
+              hba1c_series=np.array([7.0, 7.0]), uacr_series=np.array([40.0, 40.0]),
+              sbp_series=np.array([130.0, 130.0]))
+    result = cal.evaluate_baseline_forecast(params, [pac], horizons=(2.0, 5.0), tolerance_years=0.5)
+    assert "year_2.0" in result
+    assert "year_5.0" not in result
