@@ -55,6 +55,7 @@ Full documentation: [`docs/MODEL_DOCUMENTATION.md`](docs/MODEL_DOCUMENTATION.md)
 
 ```
 ├── src/                          # All the code, ready to run
+│   ├── model_core.py             # SINGLE source of truth for the model (imported by app + calibration)
 │   ├── mechanistic_twin.py       # Nonlinear core (hyperfiltration + compensation)
 │   ├── hybrid_twin.py            # Matrix variant: state-space + absorbing Markov + Kalman
 │   ├── egfr_measurement.py       # CKD-EPI 2021 equations (creatinine / cystatin / combined)
@@ -94,7 +95,7 @@ ran, how long it took, and whether the system passed or failed overall.
 ```bash
 cd src
 python system_twin.py --skip-slow --skip-bayes   # fast full-system run (~1 min)
-cd .. && python -m pytest tests/ -v                # 10 unit tests
+cd .. && python -m pytest tests/ -v                # 17 unit tests
 ```
 
 Each `system_twin.py` run generates `results/system_run_<timestamp>/` with
@@ -158,7 +159,7 @@ the project matures beyond TRL5.
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/nephroq.git
+git clone https://github.com/Danpc11/nephroq.git
 cd nephroq
 python -m venv venv && source venv/bin/activate    # optional but recommended
 pip install -r requirements.txt
