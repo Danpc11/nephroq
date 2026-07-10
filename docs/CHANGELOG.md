@@ -4,6 +4,46 @@ Notable fixes and changes to NephroQ, driven by several rounds of detailed
 code review. For currently open limitations, see
 [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
 
+## Round 5
+
+### Added
+- **Dynamic (time-varying) covariates.** HbA1c/UACR/SBP were a single
+  static value per patient (from the Round 3 baseline-window fix), applied
+  across their whole trajectory. `mimic_loader.py` now attaches covariates
+  in three tiers per row: (1) the measurement nearest to THAT visit's own
+  date, within +/-60 days (genuinely time-varying); (2) falling back to the
+  patient's baseline value (Round 3's index-date window) where no nearby
+  measurement exists; (3) population-median imputation, unchanged. A new
+  `model_core.simulate_trajectory_dynamic` integrates the ODE with a
+  linearly-interpolated, time-varying insult instead of a constant one; the
+  app's forward "what-if these labs stay the same" projection is
+  unaffected (still uses the constant-insult engine, which is the correct
+  framing for a forward scenario). New regression tests verify (a) the
+  dynamic engine collapses to the same trajectory as the app's constant
+  engine when covariates are literally constant, and (b) it correctly
+  responds to a patient's HbA1c rising partway through follow-up.
+  Performance note: `attach_dynamic_per_visit` was first written with an
+  O(n_patients × n_measurements) per-patient table scan; fixed to
+  pre-group once (O(n log n)) before the per-row loop, since the naive
+  version would not have scaled to a 25k-patient cohort.
+- **Bootstrap prediction intervals in the app.** `calibrate_mimic.py` now
+  runs a patient-level bootstrap (`--n-bootstrap`, default 15) after the
+  primary fit: resample patients with replacement, refit (1 cheap
+  multistart, seeded at the point estimate) on each resample, and save the
+  resulting parameter sets as `bootstrap_params` in the calibration JSON.
+  This runs once, offline. `app_web.py` re-simulates (fast -- no fitting)
+  a patient's projection under each bootstrap parameter set and displays a
+  90% interval (shaded band on the trajectory plot, and a numeric range
+  for "time to eGFR<15") instead of a bare point estimate, whenever
+  `bootstrap_params` is present; falls back cleanly to a point estimate
+  otherwise. Verified with a constructed cohort with genuine per-patient
+  heterogeneity (bootstrap correctly shows a wide, non-degenerate interval)
+  versus a homogeneous test cohort (correctly shows a tight interval,
+  since there is no real between-patient variation to capture in that
+  case) -- confirming the mechanism responds to actual data properties
+  rather than always reporting a fixed-width interval regardless of
+  content.
+
 ## Round 4
 
 ### Fixed
