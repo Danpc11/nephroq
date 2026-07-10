@@ -201,6 +201,34 @@ def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True):
     return result
 
 
+def split_primary_sensitivity(patients, min_primary=30):
+    """
+    PRIMARY analysis: only patients with OBSERVED HbA1c and UACR (not
+    population-median imputed) -- the reviewer's recommendation, since
+    treating an imputed value with the same weight as a measured one can
+    bias w_uacr/w_a1c toward whatever the imputation constant was, rather
+    than a real population effect.
+
+    SENSITIVITY analysis: the full cohort (imputation included), fit
+    separately and reported for comparison, never as the "active" result.
+
+    Falls back to using the full cohort as primary (with a flag) if the
+    observed-only subset is too small to fit 5 parameters reliably.
+
+    Returns (primary_patients, sensitivity_patients_or_None, used_fallback).
+    """
+    has_flags = all(("hba1c_imputed" in p and "uacr_imputed" in p) for p in patients) if patients else False
+    if not has_flags:
+        return patients, None, False   # no flags available (e.g. non-MIMIC CSV) -- can't split
+
+    observed = [p for p in patients
+               if not p.get("hba1c_imputed", True) and not p.get("uacr_imputed", True)]
+    if len(observed) >= min_primary:
+        return observed, patients, False
+    else:
+        return patients, None, True   # fallback: primary cohort too small, used full (imputed) cohort
+
+
 def diagnose_cohort(patients, noise_sd=3.5):
     """
     Cheap, per-patient diagnostics computed from trajectories ALREADY in
@@ -297,6 +325,8 @@ def assess_quality(result, diagnostics):
         reasons.append("high_within_patient_volatility")
     if result["n_patients"] < 30:
         reasons.append("small_cohort")
+    if result.get("primary_analysis", {}).get("used_fallback_to_full_cohort"):
+        reasons.append("primary_cohort_too_small_used_full_imputed_cohort")
     status = "pass" if not reasons else "warning"
     return status, reasons
 
@@ -324,6 +354,10 @@ def main():
     ap.add_argument("--test-frac", type=float, default=0.3,
                     help="Fraction of patients held out (by patient, not by row) for the "
                          "reported holdout metrics. Never used to choose parameters/filters.")
+    ap.add_argument("--include-imputed", action="store_true",
+                    help="Skip the primary(observed-only)/sensitivity(imputed-included) split "
+                         "and fit the full cohort directly as before. Useful for quick "
+                         "iteration; not recommended for a result you plan to report.")
     a = ap.parse_args()
     if not a.from_csv and not a.mimic_dir:
         ap.error("--mimic-dir is required unless --from-csv is given.")
@@ -366,7 +400,22 @@ def main():
                 os.remove(tmp_csv)
             return
 
-    train, test = split_train_test(patients, test_frac=a.test_frac)
+    if a.include_imputed:
+        primary_patients, sensitivity_patients, used_fallback = patients, None, False
+        print("[diagnostics] --include-imputed: skipping the primary/sensitivity split "
+             "(fitting the full cohort directly, as before).")
+    else:
+        primary_patients, sensitivity_patients, used_fallback = split_primary_sensitivity(patients)
+        if used_fallback:
+            print(f"[diagnostics] WARNING: fewer than 30 patients have BOTH HbA1c and UACR "
+                 f"observed (not imputed) -- falling back to the full cohort "
+                 f"(n={len(patients)}) as the primary analysis. Treat weights with caution.")
+        elif sensitivity_patients is not None:
+            print(f"[diagnostics] Primary analysis: {len(primary_patients)}/{len(patients)} patients "
+                 f"with OBSERVED HbA1c and UACR (not imputed). Sensitivity analysis (full "
+                 f"cohort, imputation included) will be fit separately and reported for comparison.")
+
+    train, test = split_train_test(primary_patients, test_frac=a.test_frac)
     print(f"[diagnostics] Train/test split by patient: {len(train)} train, {len(test)} held-out "
          f"(held-out set is NOT used to choose parameters/filters).")
     if len(train) > 3000 and not a.max_patients:
@@ -374,11 +423,33 @@ def main():
              "engine may take a long time to fit. Consider --max-patients 2000-3000 for a much "
              "faster fit with essentially the same precision for 5 parameters.")
 
+    print("\n      --- PRIMARY analysis ---")
     result = calibrate(train, max_patients=a.max_patients)
     result["diagnostics"] = diagnostics
     result["missingness"] = missingness
     result["chronic_only_filter"] = bool(a.chronic_only)
     result["max_patients_subsample"] = a.max_patients
+    result["primary_analysis"] = dict(
+        observed_covariates_only=not (a.include_imputed or used_fallback),
+        used_fallback_to_full_cohort=used_fallback,
+        n_patients_available=len(patients),
+    )
+
+    if sensitivity_patients is not None and len(sensitivity_patients) > len(primary_patients):
+        print("\n      --- SENSITIVITY analysis (full cohort, imputation included) ---")
+        sens_train, sens_test = split_train_test(sensitivity_patients, test_frac=a.test_frac)
+        sens_result = calibrate(sens_train, max_patients=a.max_patients, seed=1)
+        sens_holdout = evaluate_holdout(sens_result, sens_test)
+        result["sensitivity_analysis"] = dict(
+            q=sens_result["q"], k_hf=sens_result["k_hf"],
+            w_a1c=sens_result["w_a1c"], w_uacr=sens_result["w_uacr"], w_sbp=sens_result["w_sbp"],
+            n_patients=sens_result["n_patients"], chi2_per_n=sens_result["chi2_per_n"],
+            rmse_mL_min=sens_result["rmse_mL_min"],
+            holdout=sens_holdout,
+        )
+        print(f"      Sensitivity: q={sens_result['q']:.2f}  k_hf={sens_result['k_hf']:.4f}  "
+             f"w_uacr={sens_result['w_uacr']:.4f}  (n={sens_result['n_patients']}) "
+             f"-- compare against the primary result printed below.")
 
     holdout = evaluate_holdout(result, test)
     if holdout:
@@ -416,6 +487,18 @@ def main():
     print(f"       q={result['q']:.2f}  k_hf={result['k_hf']:.4f}  "
          f"n_patients={result['n_patients']}  chi2/n={result['chi2_per_n']:.2f}  "
          f"quality={quality_status}")
+    if result["primary_analysis"]["observed_covariates_only"]:
+        print(f"       (PRIMARY analysis: observed HbA1c+UACR only, "
+             f"{result['n_patients']}/{result['primary_analysis']['n_patients_available']} patients)")
+    if "sensitivity_analysis" in result:
+        s = result["sensitivity_analysis"]
+        print(f"       Sensitivity (full/imputed cohort, n={s['n_patients']}): "
+             f"q={s['q']:.2f}  k_hf={s['k_hf']:.4f}  w_uacr={s['w_uacr']:.4f}")
+        rel_diff_q = abs(s["q"] - result["q"]) / max(result["q"], 1e-6)
+        if rel_diff_q > 0.25:
+            print(f"       WARNING: primary and sensitivity q differ by {100*rel_diff_q:.0f}% -- "
+                 "the imputed covariates are likely materially affecting the fit. Trust the "
+                 "primary (observed-only) result, but investigate before publishing either.")
 
     if quality_reasons:
         print(f"\nWARNING: quality_status='warning' -- reasons: {quality_reasons}. "
