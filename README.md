@@ -97,7 +97,7 @@ ran, how long it took, and whether the system passed or failed overall.
 ```bash
 cd src
 python system_twin.py --skip-slow --skip-bayes   # fast full-system run (~1 min)
-cd .. && python -m pytest tests/ -v                # 20 unit tests
+cd .. && python -m pytest tests/ -v                # 23 unit tests
 ```
 
 Each `system_twin.py` run generates `results/system_run_<timestamp>/` with
@@ -120,6 +120,13 @@ deleted automatically. See [`calibration/README.md`](calibration/README.md)
 for the handling policy of this file (shareable "upon reasonable request"
 in the publication) and
 [`docs/MIMIC_COMPLIANCE.md`](docs/MIMIC_COMPLIANCE.md) for license detail.
+
+Covariates (HbA1c/UACR/SBP) are time-varying by default — each visit uses
+its own nearest measurement, falling back to a patient baseline and then
+population imputation only where needed (see `docs/CHANGELOG.md` Round 5).
+A patient-level bootstrap (`--n-bootstrap`, default 15) also runs after the
+fit, so the app can show a 90% prediction interval instead of a bare point
+estimate; use `--n-bootstrap 0` to skip it for a faster run.
 
 ## Reproducible environment (Docker)
 
