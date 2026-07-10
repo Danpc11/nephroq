@@ -39,7 +39,7 @@ def load_calibration():
         cal = st.secrets["calibration"]
         q = float(cal["q"]); khf = float(cal["k_hf"])
         w = np.array([float(cal["w_a1c"]), float(cal["w_uacr"]), float(cal["w_sbp"])])
-        return q, khf, w, "private (clinical cohort)", "pass", []
+        return q, khf, w, "private (clinical cohort)", "pass", [], None
     except Exception:
         pass
     # tier 2: local calibration with MIMIC-IV (calibrate_mimic.py)
@@ -54,14 +54,17 @@ def load_calibration():
         # chi2/n, outcome-selected cohort, etc. -- see docs/KNOWN_ISSUES.md).
         quality_status = cal.get("quality_status", "unknown")
         quality_reasons = cal.get("quality_reasons", [])
+        # Bootstrap parameter sets (see calibrate_mimic.py's bootstrap_calibrate) --
+        # used below to show a prediction interval instead of a bare point estimate.
+        bootstrap_params = cal.get("bootstrap_params") or None
         return (q, khf, w, f"MIMIC-IV {cal.get('mimic_version','')} (n={cal.get('n_patients','?')} patients)",
-               quality_status, quality_reasons)
+               quality_status, quality_reasons, bootstrap_params)
     except Exception:
         pass
     # tier 3: public fallback (synthetic + Al-Shamsi validation)
-    return Q_POP_PUBLIC, KHF_POP_PUBLIC, W_POP_PUBLIC, "public (synthetic + Al-Shamsi 2018 validation)", "pass", []
+    return Q_POP_PUBLIC, KHF_POP_PUBLIC, W_POP_PUBLIC, "public (synthetic + Al-Shamsi 2018 validation)", "pass", [], None
 
-Q_POP, KHF_POP, W_POP, CALIBRATION_SOURCE, CALIBRATION_QUALITY, CALIBRATION_QUALITY_REASONS = load_calibration()
+Q_POP, KHF_POP, W_POP, CALIBRATION_SOURCE, CALIBRATION_QUALITY, CALIBRATION_QUALITY_REASONS, BOOTSTRAP_PARAMS = load_calibration()
 
 st.set_page_config(page_title="NephroQ · Diabetes → CKD", page_icon="🩺", layout="wide")
 
@@ -112,10 +115,14 @@ col1.metric("Baseline eGFR", f"{egfr0:.1f} mL/min/1.73m²", help=f"Calculated wi
 col2.metric("KDIGO GFR category", gfr_category(egfr0))
 
 # ---- projection ----
-def project(a1c, sbp, uacr, egfr0, treated, years=15):
+def project(a1c, sbp, uacr, egfr0, treated, q=None, khf=None, w=None, years=15):
+    """q/khf/w default to the active point-estimate calibration; overridden
+    per-call when re-simulating under a bootstrap parameter set (see below)."""
+    q = Q_POP if q is None else q
+    khf = KHF_POP if khf is None else khf
+    w = W_POP if w is None else w
     m = MechanisticRenalModel(a1c=a1c, sbp=sbp, uacr=uacr, u=1.0 if treated else 0.0,
-                              k_hf=KHF_POP, q=Q_POP,
-                              w_a1c=W_POP[0], w_uacr=W_POP[1], w_sbp=W_POP[2])
+                              k_hf=khf, q=q, w_a1c=w[0], w_uacr=w[1], w_sbp=w[2])
     t, N, egfr, t_dial = m.simulate(N_of_egfr(egfr0), years=years)
     return t, egfr, t_dial
 
@@ -124,13 +131,43 @@ t_b, e_b, td_b = project(hba1c, sbp, uacr, egfr0, not treated)
 label_a = "Current treatment" if treated else "No treatment (current scenario)"
 label_b = "Illustrative renoprotective scenario added" if not treated else "If treatment is stopped"
 
+# ---- prediction interval from the calibration's bootstrap (if available) ----
+# Re-simulates (cheap: no fitting, just integration) under each bootstrap
+# parameter set computed OFFLINE by calibrate_mimic.py -- this is what turns
+# a bare point estimate into an honest interval. See docs/KNOWN_ISSUES.md
+# "uncertainty intervals" and calibrate_mimic.py's bootstrap_calibrate.
+e_a_lo = e_a_hi = td_a_lo = td_a_hi = None
+if BOOTSTRAP_PARAMS:
+    boot_e_a, boot_td_a = [], []
+    for bp in BOOTSTRAP_PARAMS:
+        bw = np.array([bp["w_a1c"], bp["w_uacr"], bp["w_sbp"]])
+        _, e_boot, td_boot = project(hba1c, sbp, uacr, egfr0, treated,
+                                     q=bp["q"], khf=bp["k_hf"], w=bw)
+        boot_e_a.append(e_boot)
+        boot_td_a.append(td_boot)
+    boot_e_a = np.array(boot_e_a)
+    e_a_lo, e_a_hi = np.percentile(boot_e_a, [5, 95], axis=0)
+    finite_td = [t for t in boot_td_a if np.isfinite(t)]
+    if len(finite_td) >= max(3, len(BOOTSTRAP_PARAMS) // 2):
+        td_a_lo, td_a_hi = np.percentile(finite_td, [5, 95])
+
 col3.metric(f"Modeled time to eGFR<15 ({'current' if treated else 'untreated'})",
            f"{td_a:.1f} years" if np.isfinite(td_a) else ">15 years",
            help="This is a modeled kidney-function threshold (eGFR<15), not a "
                 "prediction of when dialysis would actually start. Real dialysis "
                 "initiation depends on symptoms, labs, and clinical judgment.")
+if td_a_lo is not None:
+    st.caption(f"90% bootstrap interval: **{td_a_lo:.1f} – {td_a_hi:.1f} years** "
+              f"(from {len(BOOTSTRAP_PARAMS)} patient-level bootstrap resamples "
+              f"of the calibration cohort).")
+elif BOOTSTRAP_PARAMS is None:
+    st.caption("No prediction interval available for this calibration -- point "
+              "estimate only (see docs/KNOWN_ISSUES.md).")
 
 fig, ax = plt.subplots(figsize=(9, 4.5))
+if e_a_lo is not None:
+    ax.fill_between(t_a, e_a_lo, e_a_hi, color="#E24B4A", alpha=0.15,
+                    label="90% bootstrap interval")
 ax.plot(t_a, e_a, lw=2.5, color="#E24B4A", label=label_a)
 ax.plot(t_b, e_b, lw=2.5, color="#1D9E75", label=label_b)
 ax.axhline(DIALYSIS_eGFR, color="k", lw=1, ls="--")
