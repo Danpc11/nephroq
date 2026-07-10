@@ -97,7 +97,7 @@ ran, how long it took, and whether the system passed or failed overall.
 ```bash
 cd src
 python system_twin.py --skip-slow --skip-bayes   # fast full-system run (~1 min)
-cd .. && python -m pytest tests/ -v                # 23 unit tests
+cd .. && python -m pytest tests/ -v                # 27 unit tests
 ```
 
 Each `system_twin.py` run generates `results/system_run_<timestamp>/` with
