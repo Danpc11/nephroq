@@ -38,27 +38,25 @@ from scipy.integrate import solve_ivp
 G_MAX = 120.0      # eGFR with intact kidney (N=1)
 ALPHA = 0.80       # compensation exponent (<1 => buffering)
 
-N_FLOOR = 1e-4
+import model_core as core
 
-def egfr_of_N(N):          return G_MAX * np.power(np.clip(N, 1e-9, None), ALPHA)
-def N_of_egfr(egfr):
-    """Maps eGFR -> N, clipped to (0,1] as documented (N(t) in (0,1])."""
-    N = np.power(np.clip(egfr, 1e-6, None) / G_MAX, 1.0 / ALPHA)
-    return np.clip(N, N_FLOOR, 1.0)
-
-DIALYSIS_eGFR = 15.0
-N_DIALYSIS = N_of_egfr(DIALYSIS_eGFR)     # N threshold equivalent to dialysis
+G_MAX, ALPHA, N_FLOOR = core.G_MAX, core.ALPHA, core.N_FLOOR
+egfr_of_N = core.egfr_of_N
+N_of_egfr = core.N_of_egfr
+DIALYSIS_eGFR = core.DIALYSIS_eGFR
+N_DIALYSIS = core.N_DIALYSIS
+gfr_category = core.gfr_category
 
 
 # ------------------------------------------------------------------------------
-# Metabolic insult
+# Metabolic insult (re-exported from model_core -- see docs/KNOWN_ISSUES.md for
+# why this used to be reimplemented separately per script)
 # ------------------------------------------------------------------------------
 def metabolic_insult(a1c, uacr, sbp):
-    """I >= 0. Combines hyperglycemia, albuminuria, and blood pressure."""
-    I = (0.40 * max(a1c - 6.5, 0.0)
-         + 0.50 * np.log1p(uacr / 30.0)
-         + 0.30 * max(sbp - 130.0, 0.0) / 10.0)
-    return I
+    """I >= 0. Combines hyperglycemia, albuminuria, and blood pressure
+    (fixed literature weights 0.40/0.50/0.30 -- the DEFAULT physiological
+    parameterization, not a calibrated one)."""
+    return core.literature_metabolic_hazard(a1c, uacr, sbp)
 
 
 # ------------------------------------------------------------------------------
@@ -95,34 +93,23 @@ class MechanisticRenalModel:
             if not (w_a1c is not None and w_uacr is not None and w_sbp is not None):
                 raise ValueError("w_a1c, w_uacr, w_sbp must be given together, or not at all.")
             self.N_ref = 1.0
-            I = (w_a1c * max(a1c - 6.5, 0.0)
-                 + w_uacr * np.log1p(uacr / 30.0)
-                 + w_sbp * max(sbp - 130.0, 0.0) / 10.0)
+            I = core.metabolic_hazard(a1c, uacr, sbp, w_a1c, w_uacr, w_sbp)
             self.k_met_I = I * (1 - eff_met * u)     # weights already fully scaled
         else:
             self.N_ref = N_ref
-            I = metabolic_insult(a1c, uacr, sbp)
+            I = core.literature_metabolic_hazard(a1c, uacr, sbp)
             self.k_met_I = k_met * I * (1 - eff_met * u)
 
     def hazard(self, N):
         """Hazard per nephron (1/year). Grows as N falls (hyperfiltration)."""
-        N = max(N, 1e-4)
-        return self.k0 + self.k_hf * (self.N_ref / N) ** self.q + self.k_met_I
-
-    def rhs(self, t, y):
-        N = y[0]
-        return [-N * self.hazard(N)]
+        return core.renal_hazard(N, self.k0, self.k_hf, self.q, self.N_ref, self.k_met_I)
 
     def simulate(self, N0, years=25, n=600):
-        t_eval = np.linspace(0, years, n)
-        sol = solve_ivp(self.rhs, [0, years], [N0], t_eval=t_eval,
-                        rtol=1e-8, atol=1e-10, dense_output=True)
-        N = sol.y[0]
-        egfr = egfr_of_N(N)
-        # time to dialysis: first crossing of N < N_DIALYSIS
-        below = np.where(N < N_DIALYSIS)[0]
-        t_dial = t_eval[below[0]] if len(below) else np.inf
-        return t_eval, N, egfr, t_dial
+        """Delegates to model_core.simulate_trajectory -- the SAME integrator
+        calibrate_mimic.py uses, so the app and the calibration script can
+        never silently diverge again (see docs/KNOWN_ISSUES.md)."""
+        return core.simulate_trajectory(self.k0, self.k_hf, self.q, self.N_ref,
+                                        self.k_met_I, N0, years, n=n)
 
 
 # ------------------------------------------------------------------------------
