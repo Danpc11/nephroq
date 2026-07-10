@@ -272,6 +272,7 @@ def main(mimic_dir, out_path, min_span_days=180, min_points=4):
             eg = egfr_cr(r.valuenum, age_at_lab, sex)
             t_years = (r.charttime - t0).days / 365.25
             rows.append(dict(patient_id=pid, time_years=t_years, egfr=eg,
+                             charttime=r.charttime,   # kept temporarily for dynamic covariate matching, dropped before saving
                              hba1c=np.nan, uacr=np.nan, sbp=np.nan))
         n_ok += 1
     df = pd.DataFrame(rows)
@@ -279,24 +280,59 @@ def main(mimic_dir, out_path, min_span_days=180, min_points=4):
           f">= {min_span_days} days of follow-up): {n_ok}")
 
     # ------------------------------------------------------------------------
-    # BASELINE covariate model (fixes temporal leakage): for each patient,
-    # take the HbA1c/UACR/SBP measurement NEAREST to their index date (first
-    # eGFR observation), but ONLY from within a defined window. Measurements
-    # from AFTER the index date by more than a few weeks are excluded, so a
-    # value measured in 2020 can never be used to "explain" an eGFR observed
-    # in 2014 (see docs/KNOWN_ISSUES.md item 19 for the leakage example this
-    # fixes, and why a full time-varying-covariate model is deferred).
+    # COVARIATE MODEL, three tiers (best available data wins):
     #
-    # Windows are asymmetric: mostly BEFORE the index date (true baseline),
-    # with a small grace period after it (labs ordered the same admission,
-    # a day or two after the first creatinine, still describe the same
-    # clinical baseline).
+    #   1) DYNAMIC (per-visit): for each individual eGFR row, use the
+    #      HbA1c/UACR/SBP measurement nearest to THAT ROW'S OWN charttime,
+    #      within a modest SYMMETRIC window (+/- 60 days -- labs ordered
+    #      within ~2 months of a visit are a standard "concurrent" clinical
+    #      assumption, a small local window, not a whole-trajectory summary).
+    #      This makes the metabolic insult genuinely time-varying across a
+    #      patient's follow-up instead of one fixed value for their whole
+    #      trajectory -- see docs/KNOWN_ISSUES.md "dynamic covariates".
+    #
+    #   2) BASELINE (per-patient, Round 3 fix): for rows with no nearby
+    #      measurement, fall back to the value nearest the patient's INDEX
+    #      DATE (first eGFR observation), within an ASYMMETRIC window
+    #      (mostly before the index date) -- this is the temporal-leakage
+    #      fix: never use a value from meaningfully after the index date as
+    #      a stand-in baseline.
+    #
+    #   3) POPULATION MEDIAN (unchanged): for rows still missing a value,
+    #      impute with the population median, flagged via *_imputed.
     # ------------------------------------------------------------------------
+    DYNAMIC_WINDOW = pd.Timedelta(days=60)          # symmetric, per-visit
     BASELINE_WINDOW = {
         "hba1c": (pd.Timedelta(days=-90),  pd.Timedelta(days=14)),
         "uacr":  (pd.Timedelta(days=-180), pd.Timedelta(days=14)),
         "sbp":   (pd.Timedelta(days=-90),  pd.Timedelta(days=14)),
     }
+
+    def attach_dynamic_per_visit(df, series_df, value_col, window):
+        """
+        For each row of df (columns include patient_id, charttime), find the
+        nearest series_df measurement for the SAME patient within +/-window
+        of THAT row's own charttime. Returns a Series aligned to df.index.
+
+        Pre-groups series_df by patient ONCE (instead of re-filtering the
+        whole table per patient, which is O(n_patients * n_measurements) and
+        far too slow at real MIMIC-IV scale, e.g. 25k+ patients).
+        """
+        out = pd.Series(np.nan, index=df.index)
+        if series_df.empty:
+            return out
+        series_groups = dict(list(series_df.groupby("subject_id")))
+        for pid, idx in df.groupby("patient_id").groups.items():
+            s = series_groups.get(pid)
+            if s is None or s.empty:
+                continue
+            rows_sub = df.loc[idx, ["charttime"]].sort_values("charttime")
+            s_sorted = s[["charttime", value_col]].sort_values("charttime")
+            merged = pd.merge_asof(rows_sub, s_sorted, on="charttime",
+                                   direction="nearest", tolerance=window)
+            merged.index = rows_sub.index
+            out.loc[merged.index] = merged[value_col].values
+        return out
 
     def attach_baseline(series_df, value_col, window):
         """
@@ -316,31 +352,40 @@ def main(mimic_dir, out_path, min_span_days=180, min_points=4):
         nearest = merged.sort_values("abs_delta").groupby("subject_id").first()
         return nearest[value_col].to_dict()
 
-    hba1c_baseline = attach_baseline(a1c, "valuenum", BASELINE_WINDOW["hba1c"])
-    uacr_baseline  = attach_baseline(uacr, "valuenum", BASELINE_WINDOW["uacr"])
-    df["hba1c"] = df.patient_id.map(hba1c_baseline)
-    df["uacr"]  = df.patient_id.map(uacr_baseline)
-    print(f"      Baseline HbA1c found within window for {len(hba1c_baseline)}/{n_ok} patients "
-         f"(window {BASELINE_WINDOW['hba1c'][0].days}/+{BASELINE_WINDOW['hba1c'][1].days} days).")
-    print(f"      Baseline UACR found within window for {len(uacr_baseline)}/{n_ok} patients "
-         f"(window {BASELINE_WINDOW['uacr'][0].days}/+{BASELINE_WINDOW['uacr'][1].days} days).")
+    def attach_covariate(df, series_df, window_dynamic, window_baseline, label):
+        """series_df must already have columns [subject_id, charttime, value]."""
+        # tier 1: per-visit dynamic
+        dynamic = attach_dynamic_per_visit(df, series_df, "value", window_dynamic)
+        n_dynamic = dynamic.notna().sum()
+        # tier 2: per-patient baseline, for whatever tier 1 missed
+        baseline_map = attach_baseline(series_df, "value", window_baseline)
+        baseline = df["patient_id"].map(baseline_map)
+        combined = dynamic.fillna(baseline)
+        n_baseline_only = combined.notna().sum() - n_dynamic
+        print(f"      {label}: {n_dynamic} rows from per-visit data (dynamic), "
+             f"{n_baseline_only} more rows from patient baseline, "
+             f"{combined.isna().sum()} rows will use population-median imputation.")
+        return combined
+
+    df["hba1c"] = attach_covariate(df, a1c.rename(columns={"valuenum": "value"}),
+                                   DYNAMIC_WINDOW, BASELINE_WINDOW["hba1c"], "HbA1c")
+    df["uacr"]  = attach_covariate(df, uacr.rename(columns={"valuenum": "value"}),
+                                   DYNAMIC_WINDOW, BASELINE_WINDOW["uacr"], "UACR")
 
     print("      Looking for real blood pressure in omr.csv.gz (v3.0+)...")
     omr_sbp = load_sbp_from_omr(mimic_dir, dm_ids)
     if not omr_sbp.empty:
-        sbp_baseline = attach_baseline(omr_sbp.rename(columns={"chartdate": "charttime"}),
-                                       "sbp", BASELINE_WINDOW["sbp"])
-        df["sbp"] = df.patient_id.map(sbp_baseline)
-        print(f"      Baseline SBP found within window for {len(sbp_baseline)}/{n_ok} patients "
-             f"(window {BASELINE_WINDOW['sbp'][0].days}/+{BASELINE_WINDOW['sbp'][1].days} days).")
+        omr_sbp = omr_sbp.rename(columns={"chartdate": "charttime", "sbp": "value"})
+        df["sbp"] = attach_covariate(df, omr_sbp, DYNAMIC_WINDOW, BASELINE_WINDOW["sbp"], "SBP")
 
-    # Explicit, flagged imputation (only what is truly missing)
+    # Explicit, flagged imputation (only what is truly missing after tiers 1+2)
     df["hba1c_imputed"] = df["hba1c"].isna()
     df["uacr_imputed"]  = df["uacr"].isna()
     df["sbp_imputed"]   = df["sbp"].isna()
     df["hba1c"] = df["hba1c"].fillna(df["hba1c"].median() if df["hba1c"].notna().any() else 7.5)
     df["uacr"]  = df["uacr"].fillna(df["uacr"].median() if df["uacr"].notna().any() else 30.0)
     df["sbp"]   = df["sbp"].fillna(df["sbp"].median() if df["sbp"].notna().any() else 135.0)
+    df = df.drop(columns=["charttime"])   # only needed for the matching above
 
     df.to_csv(out_path, index=False)
     print(f"[5/5] Saved: {out_path}  ({df.patient_id.nunique()} patients, {len(df)} rows)")
