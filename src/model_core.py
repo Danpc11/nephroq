@@ -50,6 +50,15 @@ def metabolic_hazard(a1c, uacr, sbp, w_a1c, w_uacr, w_sbp):
             + w_sbp * max(sbp - 130.0, 0.0) / 10.0)
 
 
+def metabolic_hazard_series(a1c, uacr, sbp, w_a1c, w_uacr, w_sbp):
+    """Vectorized counterpart of metabolic_hazard, for a patient's whole
+    covariate time series at once (used to build a time-varying insult)."""
+    a1c, uacr, sbp = np.asarray(a1c, dtype=float), np.asarray(uacr, dtype=float), np.asarray(sbp, dtype=float)
+    return (w_a1c * np.maximum(a1c - 6.5, 0.0)
+            + w_uacr * np.log1p(uacr / 30.0)
+            + w_sbp * np.maximum(sbp - 130.0, 0.0) / 10.0)
+
+
 def literature_metabolic_hazard(a1c, uacr, sbp):
     """Original fixed-literature-weight insult (0.40, 0.50, 0.30), for the
     default (non-calibrated) physiological parameterization."""
@@ -94,6 +103,40 @@ def predict_egfr_at(k0, k_hf, q, N_ref, insult, N0, t_query, dt_max=0.05):
     t_max = float(np.max(t_query)) + dt_max
     n = max(int(t_max / dt_max), 50)
     t_eval, N, egfr, _ = simulate_trajectory(k0, k_hf, q, N_ref, insult, N0, t_max, n=n)
+    return np.clip(np.interp(t_query, t_eval, egfr), 0, G_MAX)
+
+
+def simulate_trajectory_dynamic(k0, k_hf, q, N_ref, insult_t, insult_v, N0, years, n=600):
+    """
+    Same as simulate_trajectory, but with a TIME-VARYING insult instead of a
+    constant one: insult_t/insult_v are the (years-since-t0, insult value)
+    pairs at each of a patient's actual visits, linearly interpolated
+    between them (and held constant before the first / after the last visit
+    -- np.interp's natural clamping behavior). This lets a patient's real
+    HbA1c/UACR/SBP trajectory drive the model instead of one fixed baseline
+    value for their whole follow-up. See docs/KNOWN_ISSUES.md "dynamic
+    covariates" and mimic_loader.py's three-tier covariate model.
+    """
+    def rhs(t, y):
+        N = y[0]
+        I_t = np.interp(t, insult_t, insult_v)
+        return [-N * renal_hazard(N, k0, k_hf, q, N_ref, I_t)]
+
+    t_eval = np.linspace(0, years, n)
+    sol = solve_ivp(rhs, [0, years], [N0], t_eval=t_eval, rtol=1e-8, atol=1e-10)
+    N = np.clip(sol.y[0], N_FLOOR, 1.0)
+    egfr = egfr_of_N(N)
+    below = np.where(N < N_DIALYSIS)[0]
+    t_dial = t_eval[below[0]] if len(below) else np.inf
+    return t_eval, N, egfr, t_dial
+
+
+def predict_egfr_at_dynamic(k0, k_hf, q, N_ref, insult_t, insult_v, N0, t_query, dt_max=0.05):
+    """Dynamic-insult counterpart of predict_egfr_at."""
+    t_max = float(np.max(t_query)) + dt_max
+    n = max(int(t_max / dt_max), 50)
+    t_eval, N, egfr, _ = simulate_trajectory_dynamic(k0, k_hf, q, N_ref, insult_t, insult_v,
+                                                      N0, t_max, n=n)
     return np.clip(np.interp(t_query, t_eval, egfr), 0, G_MAX)
 
 
