@@ -1,0 +1,85 @@
+# Changelog
+
+Notable fixes and changes to NephroQ, driven by two rounds of detailed code
+review. For currently open limitations, see [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
+
+## Round 3
+
+### Fixed
+- **Temporal leakage in covariates.** HbA1c/UACR/SBP were attached to a
+  patient's entire trajectory as a single whole-trajectory median --
+  including measurements from years after an earlier eGFR observation
+  being "explained." Example: a patient with HbA1c=7.0 at their 2014 index
+  date, 8.2 in 2017, and 10.0 in 2020 had their 2014 eGFR explained using
+  HbA1c=8.2 (the median), leaking three years of future information into
+  the earliest prediction. Fixed with a **baseline covariate model**: each
+  patient's index date is their first eGFR observation; HbA1c/UACR/SBP are
+  attached from the nearest measurement within a defined window relative
+  to that index date only (-90/+14 days for HbA1c and SBP, -180/+14 days
+  for the sparser UACR). Patients without a measurement inside the window
+  fall back to the existing population-median imputation (unchanged,
+  still flagged via `*_imputed`). Verified with a constructed reproduction
+  of the leakage example, now a permanent regression test
+  (`test_no_temporal_leakage_in_covariates`), plus a full end-to-end
+  calibration re-run (`quality_status="pass"`).
+
+## Round 2
+
+### Fixed
+- **[Critical] Duplicated simulator.** `calibrate_mimic.py` had its own
+  explicit fixed-step RK4 integrator; the app's `MechanisticRenalModel`
+  used `solve_ivp`. Measured divergence: up to ~11 mL/min/1.73m² near the
+  terminal collapse region -- exactly where time-to-eGFR<15 decisions are
+  made. Fixed by creating `src/model_core.py` as the single source of
+  truth; both the app and the calibration script now delegate to it. New
+  regression test: `test_calibrator_and_app_produce_same_trajectory`
+  (compares full trajectories, not just an instantaneous hazard value).
+- **`gfr_category()` duplicated** between the app and its own test.
+  Centralized into `model_core.py`; the test now imports the real function.
+- **Observations were unweighted by patient**, letting heavily-monitored
+  patients (e.g. ICU stays with labs drawn daily) dominate the fit. Fixed:
+  residuals scaled by `1/sqrt(n_i)` per patient during fitting; reported
+  RMSE/chi2 remain unweighted (interpretable, original units).
+- **No missingness reporting.** `calibrate_mimic.py` now reports the
+  fraction of patients with a fully-imputed covariate, and warns if UACR
+  imputation exceeds 50%.
+- **No train/test split.** Patients are now split 70/30 (fixed seed); the
+  held-out set is never used to choose parameters or filters, only to
+  report `holdout` metrics.
+- **The app trusted any MIMIC calibration unconditionally.**
+  `calibrate_mimic.py` now writes `quality_status`/`quality_reasons` to
+  the JSON; `app_web.py` shows a visible error banner instead of silently
+  presenting an unreliable calibration as trustworthy.
+- **`--chronic-only` under-labeled** as a general-purpose filter. Clarified
+  everywhere that it is a SECONDARY, outcome-selected sanity check, not a
+  valid primary cohort for predictive comparisons (e.g. vs. KFRE).
+- **Editorial:** `<your-username>` placeholders replaced with the real
+  GitHub username; unit-test count kept in sync in the README.
+
+## Round 1
+
+### Fixed
+- **[Critical] App/calibration parameterization mismatch.** The app
+  monkeypatched `metabolic_insult()` with already-scaled calibrated
+  weights, but `MechanisticRenalModel` still defaulted to `N_ref=0.60` and
+  `k_met=0.036`, silently double-scaling the metabolic insult. On a sample
+  patient this changed the modeled time to eGFR<15 from 14.5 years (buggy)
+  to 5.0/6.3 years (correct). Fixed with explicit `w_a1c`/`w_uacr`/`w_sbp`
+  parameters that force `N_ref=1`, `k_met=1`; the fragile monkeypatch was
+  removed.
+- **N could exceed its documented (0,1] range.** Clipped.
+- **KDIGO category error**: missing G3a/G3b split. Fixed; relabeled
+  "Approximate KDIGO stage" -> "KDIGO GFR category."
+- **"Time to dialysis" mislabeling.** Relabeled to "modeled time to eGFR<15
+  threshold" with an explicit disclaimer.
+- **Treatment framing** relabeled as an explicit "illustrative" scenario.
+- **Demonstration-mode banner** added for the public/synthetic calibration.
+- **MIMIC-IV ICD-9 type-2 filter** fixed to check the actual type digit
+  instead of matching any `250*` code (which includes type 1).
+- **No lab unit validation.** `mimic_loader.py` now reads `valueuom` and
+  drops measurements in unexpected units.
+- **ZeroDivisionError on creatinine=0.0** (a real value found in MIMIC-IV).
+  Fixed with a numerical floor in the CKD-EPI equations and a
+  physiological plausibility filter on lab values.
+- **`labevents.csv.gz` read 4x** (once per analyte, re-decompressing a
+  multi-GB file each time). Fixed to a single pass.
