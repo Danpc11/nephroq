@@ -39,7 +39,7 @@ def load_calibration():
         cal = st.secrets["calibration"]
         q = float(cal["q"]); khf = float(cal["k_hf"])
         w = np.array([float(cal["w_a1c"]), float(cal["w_uacr"]), float(cal["w_sbp"])])
-        return q, khf, w, "private (clinical cohort)"
+        return q, khf, w, "private (clinical cohort)", "pass", []
     except Exception:
         pass
     # tier 2: local calibration with MIMIC-IV (calibrate_mimic.py)
@@ -49,24 +49,35 @@ def load_calibration():
             cal = json.load(f)
         q = float(cal["q"]); khf = float(cal["k_hf"])
         w = np.array([float(cal["w_a1c"]), float(cal["w_uacr"]), float(cal["w_sbp"])])
-        return q, khf, w, f"MIMIC-IV {cal.get('mimic_version','')} (n={cal.get('n_patients','?')} patients)"
+        # Formal quality gate: don't silently trust a calibration that
+        # calibrate_mimic.py itself flagged as unreliable (q at bound, huge
+        # chi2/n, outcome-selected cohort, etc. -- see docs/KNOWN_ISSUES.md).
+        quality_status = cal.get("quality_status", "unknown")
+        quality_reasons = cal.get("quality_reasons", [])
+        return (q, khf, w, f"MIMIC-IV {cal.get('mimic_version','')} (n={cal.get('n_patients','?')} patients)",
+               quality_status, quality_reasons)
     except Exception:
         pass
     # tier 3: public fallback (synthetic + Al-Shamsi validation)
-    return Q_POP_PUBLIC, KHF_POP_PUBLIC, W_POP_PUBLIC, "public (synthetic + Al-Shamsi 2018 validation)"
+    return Q_POP_PUBLIC, KHF_POP_PUBLIC, W_POP_PUBLIC, "public (synthetic + Al-Shamsi 2018 validation)", "pass", []
 
-Q_POP, KHF_POP, W_POP, CALIBRATION_SOURCE = load_calibration()
+Q_POP, KHF_POP, W_POP, CALIBRATION_SOURCE, CALIBRATION_QUALITY, CALIBRATION_QUALITY_REASONS = load_calibration()
 
 st.set_page_config(page_title="NephroQ · Diabetes → CKD", page_icon="🩺", layout="wide")
 
 st.title("🩺 NephroQ — renal risk digital twin in type 2 diabetes")
 st.caption("Research prototype (TRL4) — NOT a diagnostic tool. "
           "Must not be used for clinical decisions without qualified medical supervision.")
+st.caption("**Research-use calibration — not externally validated.**")
 st.caption(f"Active calibration: **{CALIBRATION_SOURCE}**")
 if CALIBRATION_SOURCE.startswith("public"):
     st.warning("**Demonstration mode** — projections are generated from a synthetic "
               "research calibration and must not be interpreted as individualized "
               "clinical predictions.")
+elif CALIBRATION_QUALITY != "pass":
+    st.error(f"**Calibration quality warning** — the active MIMIC-IV calibration was "
+            f"flagged by calibrate_mimic.py as unreliable: {CALIBRATION_QUALITY_REASONS}. "
+            f"Do not treat these projections as trustworthy. See docs/KNOWN_ISSUES.md.")
 
 with st.sidebar:
     st.header("Patient markers")
@@ -94,16 +105,7 @@ else:
     egfr0 = egfr_cr(creatinine, age, sex)
     method = "creatinine only"
 
-def gfr_category(egfr):
-    """KDIGO GFR category. G3 splits into G3a (45-59) and G3b (30-44) --
-    a single eGFR value gives the GFR category, not a CKD diagnosis (that
-    requires persistence >=3 months plus cause and albuminuria, per KDIGO)."""
-    if egfr >= 90: return "G1"
-    if egfr >= 60: return "G2"
-    if egfr >= 45: return "G3a"
-    if egfr >= 30: return "G3b"
-    if egfr >= 15: return "G4"
-    return "G5"
+from mechanistic_twin import gfr_category  # single source of truth, see model_core.py
 
 col1, col2, col3 = st.columns(3)
 col1.metric("Baseline eGFR", f"{egfr0:.1f} mL/min/1.73m²", help=f"Calculated with: {method}")
@@ -164,4 +166,4 @@ with st.expander("What does this mean? (to share with the patient/physician)"):
 
 st.divider()
 st.caption("Source code and full documentation: "
-          "[github.com/<your-username>/nephroq](https://github.com)")
+          "[github.com/Danpc11/nephroq](https://github.com)")
