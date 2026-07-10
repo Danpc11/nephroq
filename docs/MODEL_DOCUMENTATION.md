@@ -1,14 +1,12 @@
 # Model documentation — Mechanistic digital twin: Diabetes → CKD
 ### Specification, laboratory panel, step-by-step implementation, and publication analysis
 
-**Author:** Daniel Pérez-Calixto, Ph.D. · **Version:** 1.0
-
 This documentation accompanies the code built in this repository:
 `mechanistic_twin.py`, `hybrid_twin.py`, `inverse_fit.py`, `amortized_ai.py`, `hierarchical_model.py`, `egfr_measurement.py`, `noise_identifiability.py`.
 
 ---
 
-## 1. What the model is (one page, for you)
+## 1. What the model is
 
 It is a **low-dimensional dynamical system** describing how a diabetic
 patient's kidney function deteriorates over the years, calibratable to
