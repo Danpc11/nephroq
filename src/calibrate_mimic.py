@@ -57,23 +57,33 @@ G_MAX, ALPHA, N_FLOOR, K0_FIX = core.G_MAX, core.ALPHA, core.N_FLOOR, core.K0_DE
 N_of_egfr = core.N_of_egfr
 egfr_of_N = core.egfr_of_N
 
-def insult(cov, w):
-    a1c, uacr, sbp = cov
-    return core.metabolic_hazard(a1c, uacr, sbp, w[0], w[1], w[2])
-
-def predict_egfr(q, khf, cov, w, t_query, egfr0):
-    """Delegates to model_core.predict_egfr_at -- the SAME solve_ivp-based
-    integrator MechanisticRenalModel.simulate() uses in the app."""
-    N0 = N_of_egfr(egfr0)
-    return core.predict_egfr_at(K0_FIX, khf, q, 1.0, insult(cov, w), N0, t_query)
+def predict_egfr(q, khf, pac, w, t_query):
+    """
+    Delegates to model_core.predict_egfr_at_dynamic -- builds a TIME-VARYING
+    insult from the patient's own HbA1c/UACR/SBP series (one value per
+    visit, from mimic_loader.py's three-tier covariate model: per-visit
+    measurement > patient baseline > population imputation), instead of a
+    single constant value for their whole trajectory. See docs/KNOWN_ISSUES.md
+    "dynamic covariates".
+    """
+    N0 = N_of_egfr(pac["egfr0"])
+    insult_v = core.metabolic_hazard_series(pac["hba1c_series"], pac["uacr_series"],
+                                            pac["sbp_series"], w[0], w[1], w[2])
+    return core.predict_egfr_at_dynamic(K0_FIX, khf, q, 1.0, pac["t"], insult_v, N0, t_query)
 
 
 def load_cohort(csv_path):
     """
-    Returns (patients, missingness) where missingness is the fraction of
-    patients whose HbA1c/UACR/SBP were fully imputed (never actually
-    measured) rather than observed -- important context for how much to
-    trust w_uacr etc. (see docs/KNOWN_ISSUES.md).
+    Returns (patients, missingness). Each patient carries their FULL
+    HbA1c/UACR/SBP time series (hba1c_series, uacr_series, sbp_series,
+    aligned with 't'), not a single per-patient median -- this is what
+    lets the model use a time-varying insult (see predict_egfr above).
+    `cov` (the old median-based triple) is kept for reference/backward
+    compatibility but is not used by the fitting path anymore.
+
+    missingness is the fraction of patients with NO real (non-imputed)
+    measurement anywhere in their trajectory for a covariate -- important
+    context for how much to trust w_uacr etc. (see docs/KNOWN_ISSUES.md).
     """
     df = pd.read_csv(csv_path)
     has_flags = {"hba1c_imputed", "uacr_imputed", "sbp_imputed"}.issubset(df.columns)
@@ -86,11 +96,17 @@ def load_cohort(csv_path):
         cov = (float(g["hba1c"].median()), float(g["uacr"].median()), float(g["sbp"].median()))
         pat = dict(cov=cov, egfr0=float(g["egfr"].iloc[0]),
                   t=g["time_years"].values.astype(float),
-                  e=g["egfr"].values.astype(float), patient_id=str(pid))
+                  e=g["egfr"].values.astype(float), patient_id=str(pid),
+                  hba1c_series=g["hba1c"].values.astype(float),
+                  uacr_series=g["uacr"].values.astype(float),
+                  sbp_series=g["sbp"].values.astype(float))
         if has_flags:
-            pat["hba1c_imputed"] = bool(g["hba1c_imputed"].iloc[0])
-            pat["uacr_imputed"]  = bool(g["uacr_imputed"].iloc[0])
-            pat["sbp_imputed"]   = bool(g["sbp_imputed"].iloc[0])
+            # patient-level flag = ALL rows imputed (no real measurement anywhere
+            # in the trajectory) -- with time-varying covariates, a patient with
+            # SOME real measurements has meaningful signal even if not every row.
+            pat["hba1c_imputed"] = bool(g["hba1c_imputed"].all())
+            pat["uacr_imputed"]  = bool(g["uacr_imputed"].all())
+            pat["sbp_imputed"]   = bool(g["sbp_imputed"].all())
             for k in ("hba1c", "uacr", "sbp"):
                 if pat[f"{k}_imputed"]:
                     n_imputed[k] += 1
@@ -121,13 +137,52 @@ def split_train_test(patients, test_frac=0.3, seed=42):
     return train, test
 
 
+def bootstrap_calibrate(patients, point_estimate, n_boot=15, max_patients=None, seed=100):
+    """
+    Patient-level bootstrap for uncertainty quantification: resample
+    patients WITH REPLACEMENT (same size as the training set) n_boot times,
+    refit on each resample (1 multistart, seeded at the point estimate --
+    a bootstrap resample is similar data, so this converges fast), and
+    return the list of fitted parameter sets.
+
+    This runs ONCE, offline, during calibration -- the app then just
+    RE-SIMULATES (cheap) a patient's projection under each of these
+    parameter sets to get a prediction interval, instead of running any
+    fitting at request time. See docs/KNOWN_ISSUES.md "uncertainty
+    intervals" and app_web.py.
+    """
+    if n_boot <= 0:
+        return []
+    init = np.array([point_estimate["q"], point_estimate["k_hf"], point_estimate["w_a1c"],
+                     point_estimate["w_uacr"], point_estimate["w_sbp"]])
+    boot_params = []
+    n = len(patients)
+    rng = np.random.default_rng(seed)
+    print(f"      Bootstrap ({n_boot} resamples, patient-level, for the app's uncertainty band)...")
+    for b in range(n_boot):
+        idx = rng.integers(0, n, size=n)   # resample WITH replacement
+        resample = [patients[i] for i in idx]
+        t0 = time.time()
+        try:
+            r = calibrate(resample, max_patients=max_patients, seed=seed + b,
+                          verbose=False, n_multistarts=1, init_guess=init)
+            boot_params.append(dict(q=r["q"], k_hf=r["k_hf"],
+                                    w_a1c=r["w_a1c"], w_uacr=r["w_uacr"], w_sbp=r["w_sbp"]))
+        except Exception as e:
+            print(f"      (bootstrap replicate {b+1} failed, skipped: {e})")
+        if (b + 1) % 5 == 0:
+            print(f"        ...{b+1}/{n_boot} bootstrap replicates done "
+                 f"({time.time()-t0:.1f}s for the last one)")
+    return boot_params
+
+
 def evaluate_holdout(params, patients, noise_sd=3.5):
     """Unweighted RMSE/chi2 of the ALREADY-FITTED params on a patient set
     that was not used for fitting. No parameters are adjusted here."""
     q, khf, w = params["q"], params["k_hf"], np.array([params["w_a1c"], params["w_uacr"], params["w_sbp"]])
     res = []
     for pac in patients:
-        pred = predict_egfr(q, khf, pac["cov"], w, pac["t"], pac["egfr0"])
+        pred = predict_egfr(q, khf, pac, w, pac["t"])
         res.append((pred - pac["e"]) / noise_sd)
     if not res:
         return None
@@ -139,7 +194,8 @@ def evaluate_holdout(params, patients, noise_sd=3.5):
     return dict(n_patients=len(patients), n_obs=n_obs, chi2_per_n=chi2_n, rmse_mL_min=rmse)
 
 
-def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True):
+def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True,
+              n_multistarts=5, init_guess=None):
     """
     max_patients: if set, randomly subsample the cohort (fixed seed, for
     reproducibility) before fitting. 5 parameters need nowhere near tens of
@@ -152,6 +208,10 @@ def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True):
     dominate the objective over one with 4 -- both are one person. This
     matters a lot in MIMIC-IV, where critically ill patients can have labs
     drawn many times a day (see docs/KNOWN_ISSUES.md).
+
+    n_multistarts / init_guess: used to make bootstrap refits (see
+    bootstrap_calibrate below) cheap -- 1 multistart, seeded at the primary
+    fit's optimum, converges fast since a bootstrap resample is similar data.
     """
     if max_patients and len(patients) > max_patients:
         rng_sub = np.random.default_rng(seed)
@@ -168,21 +228,21 @@ def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True):
         for pac in patients:
             n_i = max(len(pac["t"]), 1)
             per_patient_scale = noise_sd * np.sqrt(n_i)   # equalizes total per-patient weight
-            r.append((predict_egfr(q, khf, pac["cov"], w, pac["t"], pac["egfr0"]) - pac["e"]) / per_patient_scale)
+            r.append((predict_egfr(q, khf, pac, w, pac["t"]) - pac["e"]) / per_patient_scale)
         r = np.concatenate(r)
         return np.where(np.isfinite(r), r, 100.0)
 
     rng = np.random.default_rng(seed)
-    base = np.array([1.5, 0.012, 0.014, 0.018, 0.011])
+    base = init_guess if init_guess is not None else np.array([1.5, 0.012, 0.014, 0.018, 0.011])
     best = None
-    for s in range(5):
+    for s in range(n_multistarts):
         t0 = time.time()
         p_init = pack(base) if s == 0 else pack(np.clip(base*rng.uniform(0.5, 1.8, 5), LO*1.01, HI*0.99))
         sol = least_squares(residuals, p_init, method="trf", max_nfev=3000)
         dt = time.time() - t0
         if verbose:
             q_s, khf_s, *_ = unpack(sol.x)
-            print(f"      [fit {s+1}/5] {dt:5.1f}s  cost={sol.cost:.1f}  "
+            print(f"      [fit {s+1}/{n_multistarts}] {dt:5.1f}s  cost={sol.cost:.1f}  "
                  f"nfev={sol.nfev}  q={q_s:.2f}  k_hf={khf_s:.4f}"
                  f"{'  <- best so far' if best is None or sol.cost < best.cost else ''}")
         if best is None or sol.cost < best.cost:
@@ -358,6 +418,11 @@ def main():
                     help="Skip the primary(observed-only)/sensitivity(imputed-included) split "
                          "and fit the full cohort directly as before. Useful for quick "
                          "iteration; not recommended for a result you plan to report.")
+    ap.add_argument("--n-bootstrap", type=int, default=15,
+                    help="Number of patient-level bootstrap resamples for the app's "
+                         "prediction interval. 0 disables (app falls back to a point "
+                         "estimate only). Each replicate is a cheap 1-multistart refit "
+                         "seeded at the point estimate.")
     a = ap.parse_args()
     if not a.from_csv and not a.mimic_dir:
         ap.error("--mimic-dir is required unless --from-csv is given.")
@@ -434,6 +499,12 @@ def main():
         used_fallback_to_full_cohort=used_fallback,
         n_patients_available=len(patients),
     )
+
+    if a.n_bootstrap > 0:
+        result["bootstrap_params"] = bootstrap_calibrate(train, result, n_boot=a.n_bootstrap,
+                                                          max_patients=a.max_patients)
+        print(f"      Bootstrap done: {len(result['bootstrap_params'])}/{a.n_bootstrap} "
+             f"replicates succeeded.")
 
     if sensitivity_patients is not None and len(sensitivity_patients) > len(primary_patients):
         print("\n      --- SENSITIVITY analysis (full cohort, imputation included) ---")
