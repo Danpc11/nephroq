@@ -12,6 +12,41 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import numpy as np
 from mechanistic_twin import MechanisticRenalModel, N_of_egfr, egfr_of_N
 
+def test_calibrator_and_app_produce_same_trajectory():
+    """
+    THE test that would have caught the ~11 mL/min/1.73m2 divergence between
+    calibrate_mimic.py's (former) explicit RK4 integrator and the app's
+    solve_ivp-based MechanisticRenalModel: compares the FULL trajectory
+    produced by both code paths, not just an instantaneous hazard value.
+    Both now delegate to model_core.simulate_trajectory, so this should be
+    numerically identical (not just "close") -- this test guards against
+    that ever silently drifting apart again.
+    """
+    import numpy.testing as npt
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+
+    q, k_hf = 1.52, 0.0141
+    w_a1c, w_uacr, w_sbp = 0.0144, 0.0180, 0.0108
+    a1c, sbp, uacr, egfr0 = 8.1, 142, 145, 47.7
+
+    # path 1: the calibration script's predict_egfr
+    t_query = np.linspace(0, 15, 50)
+    egfr_calibration = cal.predict_egfr(q, k_hf, (a1c, uacr, sbp),
+                                        np.array([w_a1c, w_uacr, w_sbp]), t_query, egfr0)
+
+    # path 2: the app's MechanisticRenalModel
+    m = MechanisticRenalModel(a1c=a1c, sbp=sbp, uacr=uacr, u=0.0, k_hf=k_hf, q=q,
+                              w_a1c=w_a1c, w_uacr=w_uacr, w_sbp=w_sbp)
+    _, _, egfr_app_full, _ = m.simulate(N_of_egfr(egfr0), years=15, n=600)
+    t_app_full = np.linspace(0, 15, 600)
+    egfr_app = np.interp(t_query, t_app_full, egfr_app_full)
+
+    npt.assert_allclose(egfr_calibration, egfr_app, rtol=1e-2, atol=0.5,
+                        err_msg="Calibration and app trajectories diverge -- "
+                        "they must both go through model_core.simulate_trajectory.")
+
+
 def test_app_calibration_consistency():
     """
     The app must use EXACTLY the same hazard the calibration script assumes:
@@ -52,14 +87,11 @@ def test_n_egfr_roundtrip_stays_bounded():
         assert N2 <= 1.0 + 1e-9
 
 def test_gfr_category_boundaries():
-    """KDIGO GFR categories: G1>=90, G2 60-89, G3a 45-59, G3b 30-44, G4 15-29, G5<15."""
-    def gfr_category(egfr):
-        if egfr >= 90: return "G1"
-        if egfr >= 60: return "G2"
-        if egfr >= 45: return "G3a"
-        if egfr >= 30: return "G3b"
-        if egfr >= 15: return "G4"
-        return "G5"
+    """KDIGO GFR categories: G1>=90, G2 60-89, G3a 45-59, G3b 30-44, G4 15-29, G5<15.
+    Imports the REAL function (from model_core, re-exported by mechanistic_twin
+    and used by app_web.py) instead of reimplementing the boundaries locally --
+    a local copy could drift from the real one and still pass its own test."""
+    from mechanistic_twin import gfr_category
 
     cases = {95: "G1", 90: "G1", 89: "G2", 60: "G2", 59: "G3a",
             45: "G3a", 44: "G3b", 35: "G3b", 30: "G3b",
