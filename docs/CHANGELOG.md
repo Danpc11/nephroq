@@ -1,7 +1,25 @@
 # Changelog
 
-Notable fixes and changes to NephroQ, driven by two rounds of detailed code
-review. For currently open limitations, see [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
+Notable fixes and changes to NephroQ, driven by several rounds of detailed
+code review. For currently open limitations, see
+[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
+
+## Round 4
+
+### Fixed
+- **Imputed values used in the primary analysis with the same weight as
+  observed ones.** `calibrate_mimic.py` now splits the cohort into a
+  **primary analysis** (only patients with OBSERVED, non-imputed HbA1c AND
+  UACR) and a **sensitivity analysis** (the full cohort, imputation
+  included), fit separately. The primary result is what the app uses and
+  what `quality_status` is computed from; the sensitivity result is
+  reported alongside for comparison, never silently blended in. If fewer
+  than 30 patients have both covariates observed, the code falls back to
+  the full cohort as primary and flags this explicitly
+  (`quality_reasons: ["primary_cohort_too_small_used_full_imputed_cohort"]`)
+  rather than fitting 5 parameters on a handful of patients. Opt out with
+  `--include-imputed` for quick iteration. New regression tests:
+  `test_primary_sensitivity_split`, `test_primary_sensitivity_fallback_when_too_small`.
 
 ## Round 3
 
