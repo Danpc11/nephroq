@@ -87,6 +87,8 @@ def load_cohort(csv_path):
     """
     df = pd.read_csv(csv_path)
     has_flags = {"hba1c_imputed", "uacr_imputed", "sbp_imputed"}.issubset(df.columns)
+    has_baseline_flags = {"hba1c_baseline_observed", "uacr_baseline_observed",
+                          "sbp_baseline_observed"}.issubset(df.columns)
     patients = []
     n_imputed = dict(hba1c=0, uacr=0, sbp=0)
     for pid, g in df.groupby("patient_id"):
@@ -110,6 +112,24 @@ def load_cohort(csv_path):
             for k in ("hba1c", "uacr", "sbp"):
                 if pat[f"{k}_imputed"]:
                     n_imputed[k] += 1
+        if has_baseline_flags:
+            # STRICT, backward-only flags (see mimic_loader.py's
+            # flag_baseline_observed): whether a REAL measurement exists at
+            # or before the patient's index date -- used for the
+            # KFRE-comparable baseline-forecast cohort, distinct from the
+            # more permissive *_imputed flags above.
+            pat["hba1c_baseline_observed"] = bool(g["hba1c_baseline_observed"].iloc[0])
+            pat["uacr_baseline_observed"]  = bool(g["uacr_baseline_observed"].iloc[0])
+            pat["sbp_baseline_observed"]   = bool(g["sbp_baseline_observed"].iloc[0])
+            # STRICT baseline VALUES (not just the flag) -- what
+            # evaluate_baseline_forecast must use, since hba1c_series[0]
+            # could still come from the more permissive dynamic/baseline
+            # tiers (a small forward tolerance).
+            if "hba1c_baseline_strict" in g.columns:
+                pat["hba1c_baseline_strict"] = float(g["hba1c_baseline_strict"].iloc[0])
+                pat["uacr_baseline_strict"]  = float(g["uacr_baseline_strict"].iloc[0])
+                sbp_strict = g["sbp_baseline_strict"].iloc[0]
+                pat["sbp_baseline_strict"] = float(sbp_strict) if pd.notna(sbp_strict) else None
         patients.append(pat)
     n = len(patients)
     missingness = {k: round(n_imputed[k]/n, 3) for k in n_imputed} if (has_flags and n) else None
@@ -176,9 +196,88 @@ def bootstrap_calibrate(patients, point_estimate, n_boot=15, max_patients=None, 
     return boot_params
 
 
+def filter_kfre_comparable(patients):
+    """
+    The cohort for a genuine, KFRE-comparable baseline forecast: patients
+    whose HbA1c AND UACR were REALLY observed at or before their index
+    date (see mimic_loader.py's flag_baseline_observed) -- not the more
+    permissive "not all rows imputed" criterion used for the primary/
+    sensitivity split (which allows a real measurement anywhere in the
+    trajectory, including well after baseline). KFRE itself is a baseline
+    model (age, sex, eGFR, UACR at an index date), so the comparison cohort
+    must satisfy the same "known at time zero" standard.
+    """
+    if not patients or "hba1c_baseline_observed" not in patients[0]:
+        return []   # baseline flags not available (e.g. older CSV / non-MIMIC source)
+    return [p for p in patients if p.get("hba1c_baseline_observed") and p.get("uacr_baseline_observed")]
+
+
+def evaluate_baseline_forecast(params, patients, horizons=(2.0, 5.0), tolerance_years=0.5):
+    """
+    MODE B (prospective baseline forecast) -- see docs/KNOWN_ISSUES.md
+    "three evaluation modes". Uses ONLY each patient's BASELINE (first
+    observed) HbA1c/UACR/SBP, held CONSTANT from the index date forward
+    (via model_core's constant-insult engine, NOT the dynamic one), and
+    predicts eGFR at fixed horizons. This is what should be compared
+    against KFRE -- unlike evaluate_holdout() above (MODE A, dynamic
+    reconstruction), which uses each patient's full observed covariate
+    history and therefore measures a different, easier task (reconstructing
+    a trajectory given knowledge of how it evolved, not forecasting it
+    from baseline alone).
+
+    Only meaningful on a filter_kfre_comparable() cohort -- patients whose
+    baseline covariates were actually observed, not imputed.
+    """
+    q, khf, w = params["q"], params["k_hf"], np.array([params["w_a1c"], params["w_uacr"], params["w_sbp"]])
+    per_horizon = {h: [] for h in horizons}
+    n_used = 0
+    for pac in patients:
+        t, e = pac["t"], pac["e"]
+        if len(t) < 1:
+            continue
+        # STRICT baseline values (backward-only match at/before index date)
+        # -- NOT hba1c_series[0]/uacr_series[0]/sbp_series[0], which come
+        # from the more permissive dynamic/baseline-window tiers and could
+        # still carry a small amount of forward-looking information. Falls
+        # back to series[0] only if strict values weren't computed (e.g. an
+        # older CSV without them) -- shouldn't happen when this function is
+        # only ever called on a filter_kfre_comparable() cohort.
+        a1c0 = pac.get("hba1c_baseline_strict", pac["hba1c_series"][0])
+        uacr0 = pac.get("uacr_baseline_strict", pac["uacr_series"][0])
+        sbp0 = pac.get("sbp_baseline_strict") or pac["sbp_series"][0]
+        N0 = N_of_egfr(pac["egfr0"])
+        insult0 = core.metabolic_hazard(a1c0, uacr0, sbp0, w[0], w[1], w[2])
+        used_patient = False
+        for h in horizons:
+            idx_near = int(np.argmin(np.abs(t - h)))
+            if abs(t[idx_near] - h) > tolerance_years:
+                continue   # no observation near this horizon for this patient -- skip, don't impute
+            pred = core.predict_egfr_at(K0_FIX, khf, q, 1.0, insult0, N0, np.array([h]))[0]
+            per_horizon[h].append(float((pred - e[idx_near]) ** 2))
+            used_patient = True
+        if used_patient:
+            n_used += 1
+    out = {}
+    for h in horizons:
+        errs = per_horizon[h]
+        if errs:
+            out[f"year_{h}"] = dict(n_patients=len(errs), rmse_mL_min=round(float(np.sqrt(np.mean(errs))), 2))
+    out["n_patients_evaluated"] = n_used
+    out["n_patients_available"] = len(patients)
+    return out
+
+
 def evaluate_holdout(params, patients, noise_sd=3.5):
-    """Unweighted RMSE/chi2 of the ALREADY-FITTED params on a patient set
-    that was not used for fitting. No parameters are adjusted here."""
+    """
+    MODE A (dynamic reconstruction) -- see docs/KNOWN_ISSUES.md "three
+    evaluation modes". Unweighted RMSE/chi2 of the ALREADY-FITTED params on
+    a patient set that was not used for fitting. Uses each patient's FULL
+    observed covariate history (via predict_egfr's dynamic insult), so this
+    measures how well the model reconstructs a trajectory GIVEN the actual
+    exposure history -- not a prospective forecast from baseline alone.
+    NOT directly comparable to KFRE; see evaluate_baseline_forecast (MODE B)
+    for that. No parameters are adjusted here.
+    """
     q, khf, w = params["q"], params["k_hf"], np.array([params["w_a1c"], params["w_uacr"], params["w_sbp"]])
     res = []
     for pac in patients:
@@ -373,6 +472,10 @@ def assess_quality(result, diagnostics):
     Formal accept/warn gate the APP checks before silently trusting a MIMIC
     calibration as its active parameters (see app_web.py). Returns
     (status, reasons).
+
+    Now also checks HOLDOUT performance (both evaluation modes), not just
+    training-fit metrics -- a calibration can look fine on the data it was
+    fit to and still generalize poorly.
     """
     reasons = []
     if result["q"] <= LO[0] + 1e-6 or result["q"] >= HI[0] - 1e-6:
@@ -387,6 +490,23 @@ def assess_quality(result, diagnostics):
         reasons.append("small_cohort")
     if result.get("primary_analysis", {}).get("used_fallback_to_full_cohort"):
         reasons.append("primary_cohort_too_small_used_full_imputed_cohort")
+
+    holdout_a = result.get("holdout_dynamic_reconstruction")
+    if holdout_a:
+        if holdout_a["chi2_per_n"] > 2 * max(result["chi2_per_n"], 0.1):
+            reasons.append("holdout_much_worse_than_training")   # possible overfitting
+        if holdout_a["chi2_per_n"] > 5:
+            reasons.append("high_holdout_chi2")
+
+    baseline_fc = result.get("holdout_baseline_forecast")
+    if not baseline_fc:
+        reasons.append("no_baseline_forecast_evaluation")   # can't yet compare to KFRE
+    else:
+        for h in (2.0, 5.0):
+            key = f"year_{h}"
+            if key in baseline_fc and baseline_fc[key]["rmse_mL_min"] > 15:
+                reasons.append(f"poor_baseline_forecast_accuracy_{key}")
+
     status = "pass" if not reasons else "warning"
     return status, reasons
 
@@ -524,9 +644,29 @@ def main():
 
     holdout = evaluate_holdout(result, test)
     if holdout:
-        result["holdout"] = holdout
-        print(f"\n[diagnostics] Held-out (n={holdout['n_patients']} patients): "
+        result["holdout_dynamic_reconstruction"] = holdout
+        print(f"\n[diagnostics] Held-out, MODE A (dynamic reconstruction, uses full covariate "
+             f"history -- NOT comparable to KFRE): n={holdout['n_patients']} patients, "
              f"chi2/n={holdout['chi2_per_n']:.2f}  rmse={holdout['rmse_mL_min']:.1f} mL/min")
+
+    kfre_test = filter_kfre_comparable(test)
+    if kfre_test:
+        baseline_forecast = evaluate_baseline_forecast(result, kfre_test)
+        result["holdout_baseline_forecast"] = baseline_forecast
+        print(f"[diagnostics] Held-out, MODE B (baseline forecast, baseline covariates held "
+             f"constant -- THIS is the KFRE-comparable metric): "
+             f"{kfre_test and len(kfre_test)}/{len(test)} held-out patients have observed "
+             f"baseline HbA1c+UACR.")
+        for h in (2.0, 5.0):
+            key = f"year_{h}"
+            if key in baseline_forecast:
+                print(f"      Year {h}: n={baseline_forecast[key]['n_patients']}  "
+                     f"rmse={baseline_forecast[key]['rmse_mL_min']:.1f} mL/min")
+    else:
+        print("[diagnostics] MODE B (baseline forecast, KFRE-comparable) skipped -- no "
+             "held-out patients have a strictly observed baseline HbA1c AND UACR. See "
+             "docs/KNOWN_ISSUES.md 'three evaluation modes'.")
+        result["holdout_baseline_forecast"] = None
 
     quality_status, quality_reasons = assess_quality(result, diagnostics)
     result["quality_status"] = quality_status
