@@ -178,7 +178,7 @@ def load_sbp_from_omr(mimic_dir, subject_ids):
         print("      omr.csv.gz not found (MIMIC-IV <3.0?) -> SBP will be imputed.")
         return pd.DataFrame(columns=["subject_id", "chartdate", "sbp"])
     rows = []
-    reader = pd.read_csv(path, dtype={"subject_id": str}, chunksize=1_000_000)
+    reader = pd.read_csv(path, dtype={"subject_id": str}, parse_dates=["chartdate"], chunksize=1_000_000)
     for chunk in reader:
         m = (chunk.result_name == "Blood Pressure") & chunk.subject_id.isin(subject_ids)
         sub = chunk.loc[m, ["subject_id", "chartdate", "result_value"]].dropna()
@@ -252,12 +252,16 @@ def main(mimic_dir, out_path, min_span_days=180, min_points=4):
 
     rows = []
     n_ok = 0
+    index_dates = {}   # patient_id -> index date (first eGFR observation),
+                       # used below to attach BASELINE covariates without
+                       # letting later measurements leak into earlier ones.
     for pid, g in creat.groupby("subject_id"):
         g = g.sort_values("charttime")
         span_days = (g.charttime.max() - g.charttime.min()).days
         if span_days < min_span_days or len(g) < min_points:
             continue                                    # discard single acute episodes
         t0 = g.charttime.min()
+        index_dates[pid] = t0
         age = float(g.anchor_age.iloc[0]); sex = g.sex.iloc[0]
         # eGFR by creatinine (age approximated at the time of the lab; MIMIC
         # only gives anchor_age at anchor_year -> corrected by elapsed years)
@@ -274,21 +278,61 @@ def main(mimic_dir, out_path, min_span_days=180, min_points=4):
     print(f"[4/5] Patients with a usable trajectory (>= {min_points} measurements, "
           f">= {min_span_days} days of follow-up): {n_ok}")
 
-    # Attach the closest HbA1c in time (if present) per patient
-    if not a1c.empty:
-        a1c_med = a1c.groupby("subject_id").valuenum.median()
-        df["hba1c"] = df.patient_id.map(a1c_med)
-    # UACR: almost certainly sparse/absent -> impute with global median if missing
-    if not uacr.empty:
-        uacr_med = uacr.groupby("subject_id").valuenum.median()
-        df["uacr"] = df.patient_id.map(uacr_med)
+    # ------------------------------------------------------------------------
+    # BASELINE covariate model (fixes temporal leakage): for each patient,
+    # take the HbA1c/UACR/SBP measurement NEAREST to their index date (first
+    # eGFR observation), but ONLY from within a defined window. Measurements
+    # from AFTER the index date by more than a few weeks are excluded, so a
+    # value measured in 2020 can never be used to "explain" an eGFR observed
+    # in 2014 (see docs/KNOWN_ISSUES.md item 19 for the leakage example this
+    # fixes, and why a full time-varying-covariate model is deferred).
+    #
+    # Windows are asymmetric: mostly BEFORE the index date (true baseline),
+    # with a small grace period after it (labs ordered the same admission,
+    # a day or two after the first creatinine, still describe the same
+    # clinical baseline).
+    # ------------------------------------------------------------------------
+    BASELINE_WINDOW = {
+        "hba1c": (pd.Timedelta(days=-90),  pd.Timedelta(days=14)),
+        "uacr":  (pd.Timedelta(days=-180), pd.Timedelta(days=14)),
+        "sbp":   (pd.Timedelta(days=-90),  pd.Timedelta(days=14)),
+    }
+
+    def attach_baseline(series_df, value_col, window):
+        """
+        series_df: columns [subject_id, charttime, <value_col>].
+        Returns {patient_id: nearest-to-index value within window}.
+        """
+        if series_df.empty or not index_dates:
+            return {}
+        idx = pd.Series(index_dates, name="index_date")
+        merged = series_df.merge(idx, left_on="subject_id", right_index=True, how="inner")
+        delta = merged["charttime"] - merged["index_date"]
+        lo, hi = window
+        merged = merged.loc[(delta >= lo) & (delta <= hi)].copy()
+        if merged.empty:
+            return {}
+        merged["abs_delta"] = (merged["charttime"] - merged["index_date"]).abs()
+        nearest = merged.sort_values("abs_delta").groupby("subject_id").first()
+        return nearest[value_col].to_dict()
+
+    hba1c_baseline = attach_baseline(a1c, "valuenum", BASELINE_WINDOW["hba1c"])
+    uacr_baseline  = attach_baseline(uacr, "valuenum", BASELINE_WINDOW["uacr"])
+    df["hba1c"] = df.patient_id.map(hba1c_baseline)
+    df["uacr"]  = df.patient_id.map(uacr_baseline)
+    print(f"      Baseline HbA1c found within window for {len(hba1c_baseline)}/{n_ok} patients "
+         f"(window {BASELINE_WINDOW['hba1c'][0].days}/+{BASELINE_WINDOW['hba1c'][1].days} days).")
+    print(f"      Baseline UACR found within window for {len(uacr_baseline)}/{n_ok} patients "
+         f"(window {BASELINE_WINDOW['uacr'][0].days}/+{BASELINE_WINDOW['uacr'][1].days} days).")
 
     print("      Looking for real blood pressure in omr.csv.gz (v3.0+)...")
     omr_sbp = load_sbp_from_omr(mimic_dir, dm_ids)
     if not omr_sbp.empty:
-        sbp_med = omr_sbp.groupby("subject_id").sbp.median()
-        df["sbp"] = df.patient_id.map(sbp_med)
-        print(f"      Real SBP found for {sbp_med.notna().sum()} patients.")
+        sbp_baseline = attach_baseline(omr_sbp.rename(columns={"chartdate": "charttime"}),
+                                       "sbp", BASELINE_WINDOW["sbp"])
+        df["sbp"] = df.patient_id.map(sbp_baseline)
+        print(f"      Baseline SBP found within window for {len(sbp_baseline)}/{n_ok} patients "
+             f"(window {BASELINE_WINDOW['sbp'][0].days}/+{BASELINE_WINDOW['sbp'][1].days} days).")
 
     # Explicit, flagged imputation (only what is truly missing)
     df["hba1c_imputed"] = df["hba1c"].isna()
