@@ -131,12 +131,17 @@ t_b, e_b, td_b = project(hba1c, sbp, uacr, egfr0, not treated)
 label_a = "Current treatment" if treated else "No treatment (current scenario)"
 label_b = "Illustrative renoprotective scenario added" if not treated else "If treatment is stopped"
 
-# ---- prediction interval from the calibration's bootstrap (if available) ----
+# ---- bootstrap PARAMETER-uncertainty band from the calibration (if available) ----
 # Re-simulates (cheap: no fitting, just integration) under each bootstrap
-# parameter set computed OFFLINE by calibrate_mimic.py -- this is what turns
-# a bare point estimate into an honest interval. See docs/KNOWN_ISSUES.md
-# "uncertainty intervals" and calibrate_mimic.py's bootstrap_calibrate.
+# parameter set computed OFFLINE by calibrate_mimic.py. IMPORTANT: this
+# captures only CALIBRATED-PARAMETER uncertainty (from resampling patients),
+# not residual/measurement noise, individual random effects, unknown future
+# evolution of the labs, or structural model error -- so it is deliberately
+# NOT called a "prediction interval" (that would overclaim how complete the
+# uncertainty is). See docs/KNOWN_ISSUES.md "bootstrap, not full Bayesian,
+# uncertainty" and calibrate_mimic.py's bootstrap_calibrate.
 e_a_lo = e_a_hi = td_a_lo = td_a_hi = None
+p_reach_threshold = None
 if BOOTSTRAP_PARAMS:
     boot_e_a, boot_td_a = [], []
     for bp in BOOTSTRAP_PARAMS:
@@ -147,8 +152,16 @@ if BOOTSTRAP_PARAMS:
         boot_td_a.append(td_boot)
     boot_e_a = np.array(boot_e_a)
     e_a_lo, e_a_hi = np.percentile(boot_e_a, [5, 95], axis=0)
-    finite_td = [t for t in boot_td_a if np.isfinite(t)]
-    if len(finite_td) >= max(3, len(BOOTSTRAP_PARAMS) // 2):
+
+    boot_td_a = np.array(boot_td_a)
+    n_boot = len(boot_td_a)
+    finite_td = boot_td_a[np.isfinite(boot_td_a)]
+    p_reach_threshold = len(finite_td) / n_boot   # fraction of resamples that DO cross within the horizon
+    # Only report an interval among crossings if a clear majority actually
+    # cross -- otherwise showing "8-14 years" while most resamples never
+    # reach the threshold would hide that fact and look falsely precise
+    # (see docs/KNOWN_ISSUES.md).
+    if p_reach_threshold >= 0.5 and len(finite_td) >= 3:
         td_a_lo, td_a_hi = np.percentile(finite_td, [5, 95])
 
 col3.metric(f"Modeled time to eGFR<15 ({'current' if treated else 'untreated'})",
@@ -156,18 +169,27 @@ col3.metric(f"Modeled time to eGFR<15 ({'current' if treated else 'untreated'})"
            help="This is a modeled kidney-function threshold (eGFR<15), not a "
                 "prediction of when dialysis would actually start. Real dialysis "
                 "initiation depends on symptoms, labs, and clinical judgment.")
-if td_a_lo is not None:
-    st.caption(f"90% bootstrap interval: **{td_a_lo:.1f} – {td_a_hi:.1f} years** "
-              f"(from {len(BOOTSTRAP_PARAMS)} patient-level bootstrap resamples "
-              f"of the calibration cohort).")
-elif BOOTSTRAP_PARAMS is None:
-    st.caption("No prediction interval available for this calibration -- point "
-              "estimate only (see docs/KNOWN_ISSUES.md).")
+if BOOTSTRAP_PARAMS:
+    st.caption(f"Of {len(BOOTSTRAP_PARAMS)} bootstrap parameter resamples, "
+              f"**{100*p_reach_threshold:.0f}%** reach eGFR<15 within the {int(t_a[-1])}-year horizon shown.")
+    if td_a_lo is not None:
+        st.caption(f"90% bootstrap **parameter**-uncertainty interval, among resamples that "
+                  f"cross the threshold: **{td_a_lo:.1f} – {td_a_hi:.1f} years**. This reflects "
+                  f"calibration-parameter uncertainty only -- not measurement noise, individual "
+                  f"variability, or unknown future lab values (see docs/KNOWN_ISSUES.md).")
+    else:
+        st.caption("Fewer than half of the bootstrap resamples reach the threshold within this "
+                  "horizon, so no interval is shown here (it would be conditioned on an "
+                  "unrepresentative minority of resamples). Modeled time is best read as "
+                  f"'>{int(t_a[-1])} years' for a majority of parameter resamples.")
+else:
+    st.caption("No bootstrap parameter-uncertainty band available for this calibration -- "
+              "point estimate only (see docs/KNOWN_ISSUES.md).")
 
 fig, ax = plt.subplots(figsize=(9, 4.5))
 if e_a_lo is not None:
     ax.fill_between(t_a, e_a_lo, e_a_hi, color="#E24B4A", alpha=0.15,
-                    label="90% bootstrap interval")
+                    label="90% bootstrap parameter-uncertainty band")
 ax.plot(t_a, e_a, lw=2.5, color="#E24B4A", label=label_a)
 ax.plot(t_b, e_b, lw=2.5, color="#1D9E75", label=label_b)
 ax.axhline(DIALYSIS_eGFR, color="k", lw=1, ls="--")
