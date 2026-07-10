@@ -155,3 +155,47 @@ def test_no_temporal_leakage_in_covariates():
         "sanity check: the whole-trajectory median (8.2) is indeed different from the baseline (7.0)"
     assert baseline_value != leaked_value, \
         "baseline and leaked-median values must differ in this constructed example"
+
+def test_primary_sensitivity_split():
+    """
+    The primary analysis must include ONLY patients with observed (not
+    imputed) HbA1c AND UACR; patients missing either must be excluded from
+    primary and only appear in the sensitivity (full-cohort) analysis.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+
+    def mk(pid, hba1c_imp, uacr_imp):
+        return dict(patient_id=pid, cov=(8.0, 100.0, 140.0), egfr0=70.0,
+                   t=np.array([0., 1., 2.]), e=np.array([70., 65., 60.]),
+                   hba1c_imputed=hba1c_imp, uacr_imputed=uacr_imp)
+
+    patients = ([mk(f"obs{i}", False, False) for i in range(35)]
+               + [mk(f"missing_uacr{i}", False, True) for i in range(10)]
+               + [mk(f"missing_both{i}", True, True) for i in range(5)])
+
+    primary, sensitivity, used_fallback = cal.split_primary_sensitivity(patients, min_primary=30)
+    assert not used_fallback, "35 fully-observed patients should be enough, no fallback expected"
+    assert len(primary) == 35
+    assert all(not p["hba1c_imputed"] and not p["uacr_imputed"] for p in primary)
+    assert len(sensitivity) == len(patients)
+
+def test_primary_sensitivity_fallback_when_too_small():
+    """If too few patients have both covariates observed, fall back to the
+    full cohort as primary (with the fallback flag set) rather than fitting
+    5 parameters on a handful of patients."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+
+    def mk(pid, hba1c_imp, uacr_imp):
+        return dict(patient_id=pid, cov=(8.0, 100.0, 140.0), egfr0=70.0,
+                   t=np.array([0., 1., 2.]), e=np.array([70., 65., 60.]),
+                   hba1c_imputed=hba1c_imp, uacr_imputed=uacr_imp)
+
+    patients = ([mk(f"obs{i}", False, False) for i in range(5)]
+               + [mk(f"missing{i}", False, True) for i in range(50)])
+
+    primary, sensitivity, used_fallback = cal.split_primary_sensitivity(patients, min_primary=30)
+    assert used_fallback, "only 5 fully-observed patients should trigger the fallback"
+    assert len(primary) == len(patients)
+    assert sensitivity is None
