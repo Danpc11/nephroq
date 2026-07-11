@@ -81,7 +81,10 @@ st.caption(_("active_calibration", src=src_display))
 if CALIB_TIER == "public":
     st.warning(_("demo_mode"))
 elif CALIBRATION_QUALITY != "pass":
-    st.error(_("quality_warning", reasons=CALIBRATION_QUALITY_REASONS))
+    # Render the machine-readable flags as a human-readable list
+    # (e.g. "high_chi2_per_observation" -> "high chi2 per observation").
+    _reasons = ", ".join(str(r).replace("_", " ") for r in (CALIBRATION_QUALITY_REASONS or [])) or "—"
+    st.error(_("quality_warning", reasons=_reasons))
 
 # ------------------------------------------------------------------------------
 # Seed widget state once, then apply any pending preset BEFORE the widgets are
@@ -166,6 +169,25 @@ horizon = int(t_a[-1])
 # ---- bootstrap PARAMETER-uncertainty band (parameter uncertainty ONLY) --------
 e_a_lo = e_a_hi = td_a_lo = td_a_hi = None
 p_reach_threshold = None
+
+# DEGENERATE-BOOTSTRAP GUARD.
+# If the calibration's optimizer terminated prematurely (see docs/KNOWN_ISSUES.md
+# "optimizer scaling"), every bootstrap replicate returns essentially the SAME
+# parameters. Their spread would then be ~0 and the band would collapse onto the
+# central line -- rendering as a *falsely precise* projection, which is worse
+# than showing no band at all. Detect that and suppress the band instead.
+_boot_degenerate = False
+if BOOTSTRAP_PARAMS and len(BOOTSTRAP_PARAMS) >= 2:
+    _q = np.array([bp["q"] for bp in BOOTSTRAP_PARAMS], dtype=float)
+    _k = np.array([bp["k_hf"] for bp in BOOTSTRAP_PARAMS], dtype=float)
+    # relative spread: a real patient-level bootstrap moves q by ~1e-2 or more;
+    # ~1e-6 is floating-point noise around a frozen optimum.
+    _rel = max(_q.std() / max(abs(_q.mean()), 1e-12), _k.std() / max(abs(_k.mean()), 1e-12))
+    _boot_degenerate = _rel < 1e-4
+
+if BOOTSTRAP_PARAMS and _boot_degenerate:
+    BOOTSTRAP_PARAMS = None   # fall through to the point-estimate-only path below
+
 if BOOTSTRAP_PARAMS:
     boot_e_a, boot_td_a = [], []
     for bp in BOOTSTRAP_PARAMS:
@@ -191,10 +213,17 @@ if BOOTSTRAP_PARAMS:
         st.caption(_("boot_interval", lo=td_a_lo, hi=td_a_hi))
     else:
         st.caption(_("boot_no_interval", horizon=horizon))
+elif _boot_degenerate:
+    st.warning(_("boot_degenerate"))
 else:
     st.caption(_("boot_none"))
 
-fig, ax = plt.subplots(figsize=(9, 4.5))
+# constrained_layout (rather than tight_layout) keeps the axis labels, title and
+# legend from being clipped when Streamlit scales the figure down on a narrow
+# screen; use_container_width lets it track the column width instead of being
+# pinned to a fixed pixel size. The legend labels are long in Spanish, so they
+# go below the axes rather than overlapping the curves.
+fig, ax = plt.subplots(figsize=(9, 4.6), constrained_layout=True)
 if e_a_lo is not None:
     ax.fill_between(t_a, e_a_lo, e_a_hi, color="#E24B4A", alpha=0.15, label=_("band_label"))
 ax.plot(t_a, e_a, lw=2.5, color="#E24B4A", label=label_a)
@@ -202,8 +231,11 @@ ax.plot(t_b, e_b, lw=2.5, color="#1D9E75", label=label_b)
 ax.axhline(DIALYSIS_eGFR, color="k", lw=1, ls="--")
 ax.text(0.3, DIALYSIS_eGFR + 2, _("plot_threshold"), fontsize=9)
 ax.set_xlabel(_("plot_x")); ax.set_ylabel(_("plot_y"))
-ax.set_title(_("plot_title")); ax.legend()
-st.pyplot(fig)
+ax.set_title(_("plot_title"))
+ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=1, fontsize=9, frameon=False)
+ax.grid(alpha=0.15)
+st.pyplot(fig, use_container_width=True)
+plt.close(fig)   # Streamlit reruns on every widget change; without this, figures accumulate.
 
 if np.isfinite(td_a) and np.isfinite(td_b):
     st.info(_("diff_info", label=label_b, d=abs(td_b - td_a)))
