@@ -317,10 +317,83 @@ def compute_development_defaults(patients):
                 uacr=_med("uacr_baseline_strict"))
 
 
+def _brier(probs, labels):
+    """Mean squared error of a probabilistic forecast. Lower is better."""
+    p = np.asarray(probs, dtype=float)
+    y = np.asarray(labels, dtype=float)
+    return float(np.mean((p - y) ** 2))
+
+
+def _calibration_slope_intercept(probs, labels, max_iter=100, tol=1e-8):
+    """
+    Logistic recalibration: fit  y ~ intercept + slope * logit(p).
+
+    A perfectly calibrated model gives slope = 1 and intercept = 0.
+    slope < 1 => predictions are too extreme (overfitted / over-dispersed).
+    intercept != 0 => calibration-in-the-large is off (systematically high/low).
+
+    IRLS in plain numpy (no sklearn dependency). Returns (intercept, slope) or
+    (None, None) if the fit is degenerate (e.g. no outcome variation).
+    """
+    p = np.clip(np.asarray(probs, dtype=float), 1e-6, 1 - 1e-6)
+    y = np.asarray(labels, dtype=float)
+    if len(np.unique(y)) < 2:
+        return None, None
+    x = np.log(p / (1 - p))                      # logit of the predicted risk
+    if np.allclose(x, x[0]):
+        return None, None                        # no spread in predictions
+    X = np.column_stack([np.ones_like(x), x])
+    beta = np.zeros(2)
+    for _ in range(max_iter):
+        eta = X @ beta
+        mu = 1.0 / (1.0 + np.exp(-eta))
+        W = np.clip(mu * (1 - mu), 1e-10, None)
+        z = eta + (y - mu) / W
+        try:
+            beta_new = np.linalg.solve((X * W[:, None]).T @ X, (X * W[:, None]).T @ z)
+        except np.linalg.LinAlgError:
+            return None, None
+        if np.max(np.abs(beta_new - beta)) < tol:
+            beta = beta_new
+            break
+        beta = beta_new
+    return float(beta[0]), float(beta[1])
+
+
+def nephroq_risk_from_bootstrap(bootstrap_params, a1c, uacr, sbp, egfr0, horizon):
+    """
+    Turn NephroQ's mechanistic projection into an actual PROBABILITY, so it can
+    be compared with KFRE on more than rank-based metrics (AUC).
+
+        P_NQ(T <= h) = (1/B) * sum_b  1[ eGFR_b(h) < 15 ]
+
+    i.e. the fraction of bootstrap parameter resamples under which this patient
+    crosses the threshold by the horizon. This unlocks Brier score and
+    calibration slope/intercept, which a bare score (-eGFR) cannot support.
+
+    CAVEAT: this propagates ONLY calibration-parameter uncertainty (the same
+    limitation as the app's uncertainty band -- see docs/KNOWN_ISSUES.md). It
+    does not include measurement noise, individual random effects, or unknown
+    future covariates, so it will tend to be UNDER-dispersed (too confident).
+    Read the calibration slope with that in mind.
+    """
+    if not bootstrap_params:
+        return None
+    crossed = 0
+    for bp in bootstrap_params:
+        insult = core.metabolic_hazard(a1c, uacr, sbp,
+                                       bp["w_a1c"], bp["w_uacr"], bp["w_sbp"])
+        eg = core.predict_egfr_at(K0_FIX, bp["k_hf"], bp["q"], 1.0, insult,
+                                  N_of_egfr(egfr0), np.array([horizon]))[0]
+        crossed += int(eg < core.DIALYSIS_eGFR)
+    return crossed / len(bootstrap_params)
+
+
 def evaluate_kfre_benchmark(params, patients, horizons=(2.0, 5.0),
                             development_defaults=None,
                             min_followup_tolerance=0.25,
-                            egfr_range=(15.0, 60.0)):
+                            egfr_range=(15.0, 60.0),
+                            bootstrap_params=None):
     """
     MODE C -- EXPLORATORY KFRE SCORE COMPARISON (using an eGFR<15 proxy outcome).
 
@@ -333,13 +406,15 @@ def evaluate_kfre_benchmark(params, patients, horizons=(2.0, 5.0),
     Both models are scored on the SAME patients and compared by discrimination:
       - KFRE     : P(treated kidney failure by horizon) from age/sex/eGFR/UACR.
       - NephroQ  : mechanistic projection from baseline covariates held constant.
-                   The score is -eGFR(horizon) -- a monotone transform of risk,
-                   which is all AUC needs. NOTE this is a SCORE, not a
-                   probability: Brier score, calibration slope/intercept and
-                   decision-curve analysis are therefore NOT computed here. To
-                   get a probability, the bootstrap parameter sets can be used
-                   (fraction of resamples crossing the threshold before t) --
-                   that is the outstanding work for a full comparison.
+                   If `bootstrap_params` are supplied, NephroQ is turned into an
+                   actual PROBABILITY -- the fraction of bootstrap parameter
+                   resamples under which the patient crosses eGFR<15 by the
+                   horizon -- which makes Brier score and calibration
+                   slope/intercept computable alongside AUC. Without them it
+                   falls back to a bare score (-eGFR at horizon), which supports
+                   AUC only. NOTE the probability propagates ONLY parameter
+                   uncertainty, so it is likely UNDER-dispersed (over-confident);
+                   read the calibration slope accordingly.
 
     NO TEMPORAL LEAKAGE: a missing baseline covariate is filled from
     `development_defaults` (medians of BASELINE values in the training set),
@@ -366,7 +441,7 @@ def evaluate_kfre_benchmark(params, patients, horizons=(2.0, 5.0),
     for h in horizons:
         if h not in KFRE_S0:
             continue
-        kfre_scores, nq_scores, labels = [], [], []
+        kfre_scores, nq_scores, nq_probs, labels = [], [], [], []
         n_hba1c_imputed = 0
         n_excluded_followup = 0
         n_excluded_egfr = 0
@@ -404,22 +479,60 @@ def evaluate_kfre_benchmark(params, patients, horizons=(2.0, 5.0),
             nq_scores.append(-float(egfr_h))     # lower projected eGFR = higher risk
             kfre_scores.append(kfre_risk(pac["age_at_index"], pac["sex"], egfr0, uacr_b, h))
             labels.append(label)
+            # PROBABILISTIC NephroQ risk (needs the bootstrap parameter sets)
+            nq_probs.append(nephroq_risk_from_bootstrap(
+                bootstrap_params, float(a1c), uacr_b, float(sbp_b), egfr0, h))
 
         if len(labels) < 10 or len(set(labels)) < 2:
             continue    # AUC undefined / meaningless
-        out[f"year_{h}"] = dict(
-            n_patients=len(labels),
+
+        n_scored = len(labels)
+        entry = dict(
+            n_patients=n_scored,
             n_events=int(sum(labels)),
             auc_kfre=_auc(kfre_scores, labels),
             auc_nephroq=_auc(nq_scores, labels),
             n_hba1c_imputed_for_nephroq=n_hba1c_imputed,
+            frac_hba1c_baseline_observed=round(1 - n_hba1c_imputed / n_scored, 3),
+            frac_hba1c_imputed_from_development_cohort=round(n_hba1c_imputed / n_scored, 3),
             n_excluded_incomplete_followup=n_excluded_followup,
             n_excluded_egfr_out_of_range=n_excluded_egfr,
             egfr_range=list(egfr_range) if egfr_range else None,
-            nephroq_output="score (-eGFR at horizon), NOT a probability",
             outcome="PROXY: observed eGFR<15 within horizon (NOT treated kidney failure)",
             interpretation="exploratory score comparison; not a KFRE validation",
         )
+
+        # KFRE is already a probability -> it always gets the probabilistic metrics.
+        entry["brier_kfre"] = _brier(kfre_scores, labels)
+        ci, sl = _calibration_slope_intercept(kfre_scores, labels)
+        entry["calibration_intercept_kfre"], entry["calibration_slope_kfre"] = ci, sl
+        # !! DO NOT REPORT KFRE's Brier/calibration AGAINST THE PROXY OUTCOME AS A
+        # FAIR COMPARISON. KFRE is calibrated for TREATED KIDNEY FAILURE, a much
+        # RARER event than "observed eGFR<15". Scoring it against the common proxy
+        # penalises it for predicting the right (rarer) thing: its Brier looks bad
+        # and its calibration intercept blows up, purely because of the outcome
+        # mismatch -- not because it is a worse model. AUC (rank-based) is not
+        # affected by this base-rate mismatch and remains the only fair headline
+        # comparison until a real KRT outcome is available.
+        entry["kfre_absolute_risk_metrics_are_not_interpretable"] = (
+            "KFRE is calibrated for treated kidney failure; scoring its Brier/calibration "
+            "against the eGFR<15 proxy (a much more common event) is an outcome-base-rate "
+            "mismatch. Use AUC for the head-to-head; do NOT report KFRE Brier/calibration "
+            "as evidence that NephroQ is better calibrated.")
+
+        # NephroQ only becomes a probability if bootstrap replicates were supplied.
+        if bootstrap_params and all(p is not None for p in nq_probs):
+            entry["nephroq_output"] = ("probability P(eGFR<15 by horizon), from the fraction of "
+                                       "bootstrap parameter resamples crossing the threshold")
+            entry["brier_nephroq"] = _brier(nq_probs, labels)
+            ci, sl = _calibration_slope_intercept(nq_probs, labels)
+            entry["calibration_intercept_nephroq"], entry["calibration_slope_nephroq"] = ci, sl
+            # AUC on the probability agrees with AUC on the score up to ties; report both.
+            entry["auc_nephroq_prob"] = _auc(nq_probs, labels)
+        else:
+            entry["nephroq_output"] = ("score (-eGFR at horizon), NOT a probability -- "
+                                       "run with --n-bootstrap > 0 to get Brier/calibration")
+        out[f"year_{h}"] = entry
     return out or None
 
 
@@ -956,23 +1069,40 @@ def main():
         kfre_bench = evaluate_kfre_benchmark(
             result, kfre_test,
             development_defaults=result["development_defaults"],
-            egfr_range=(a.kfre_egfr_min, a.kfre_egfr_max))
+            egfr_range=(a.kfre_egfr_min, a.kfre_egfr_max),
+            bootstrap_params=result.get("bootstrap_params"))
         result["holdout_kfre_benchmark"] = kfre_bench
         if kfre_bench:
             print("[diagnostics] Held-out, MODE C (EXPLORATORY KFRE SCORE COMPARISON -- "
                   "discrimination on the SAME patients; NOT a KFRE validation):")
             for key, v in kfre_bench.items():
-                a_k = v["auc_kfre"]; a_n = v["auc_nephroq"]
-                print(f"      {key}: n={v['n_patients']} ({v['n_events']} events)  "
-                     f"AUC KFRE={a_k:.3f}  AUC NephroQ={a_n:.3f}  "
-                     f"[HbA1c filled from development defaults in "
-                     f"{v['n_hba1c_imputed_for_nephroq']}; excluded: "
-                     f"{v['n_excluded_incomplete_followup']} incomplete follow-up, "
-                     f"{v['n_excluded_egfr_out_of_range']} eGFR out of range {v['egfr_range']}]")
+                print(f"      --- {key} : n={v['n_patients']} ({v['n_events']} events) ---")
+                print(f"          baseline HbA1c observed {100*v['frac_hba1c_baseline_observed']:.0f}%  |  "
+                     f"imputed from development cohort {100*v['frac_hba1c_imputed_from_development_cohort']:.0f}%")
+                print(f"          excluded: {v['n_excluded_incomplete_followup']} incomplete follow-up, "
+                     f"{v['n_excluded_egfr_out_of_range']} eGFR outside {v['egfr_range']}")
+                def _f(x):
+                    return "  --  " if x is None else f"{x:6.3f}"
+                print(f"          {'metric':<22}{'NephroQ':>9}{'KFRE':>9}")
+                print(f"          {'AUC':<22}{_f(v.get('auc_nephroq_prob', v['auc_nephroq'])):>9}{_f(v['auc_kfre']):>9}")
+                print(f"          {'Brier':<22}{_f(v.get('brier_nephroq')):>9}{_f(v.get('brier_kfre')):>9}")
+                print(f"          {'calibration slope':<22}{_f(v.get('calibration_slope_nephroq')):>9}"
+                     f"{_f(v.get('calibration_slope_kfre')):>9}")
+                print(f"          {'calibration intercept':<22}{_f(v.get('calibration_intercept_nephroq')):>9}"
+                     f"{_f(v.get('calibration_intercept_kfre')):>9}")
+                print(f"          NephroQ output: {v['nephroq_output']}")
             print("      NOTE: outcome is a PROXY (observed eGFR<15 within horizon), NOT treated "
-                  "kidney failure; NephroQ contributes a SCORE, not a probability (so no Brier/"
-                  "calibration/decision-curve). Report this as an 'exploratory KFRE score "
-                  "comparison', never as a KFRE validation. See docs/KNOWN_ISSUES.md.")
+                  "kidney failure. Report this as an 'exploratory KFRE score comparison', never "
+                  "as a KFRE validation.")
+            print("      !! WARNING -- KFRE's Brier and calibration numbers above are NOT a fair "
+                  "comparison. KFRE predicts TREATED KIDNEY FAILURE (rare); the proxy outcome "
+                  "here is eGFR<15 (common). That base-rate mismatch inflates KFRE's Brier and "
+                  "its calibration intercept no matter how good the model is. Use AUC for the "
+                  "head-to-head. Absolute-risk metrics only become meaningful once a real KRT "
+                  "outcome is extracted from MIMIC procedure/ICD codes.")
+            print("      !! NephroQ's probability propagates ONLY parameter uncertainty, so it is "
+                  "under-dispersed and its calibration slope will read << 1. That is a property "
+                  "of the uncertainty model, not (necessarily) of the mechanism.")
         else:
             print("[diagnostics] MODE C (KFRE benchmark) skipped -- too few eligible patients "
                   "or no outcome variation in the held-out set.")
