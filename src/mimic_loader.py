@@ -266,13 +266,22 @@ def main(mimic_dir, out_path, min_span_days=180, min_points=4):
         # eGFR by creatinine (age approximated at the time of the lab; MIMIC
         # only gives anchor_age at anchor_year -> corrected by elapsed years)
         anchor_year = g.anchor_year.iloc[0]
+        age_at_index = age + (t0.year - anchor_year)
+        baseline_egfr = egfr_cr(g.valuenum.iloc[0], age_at_index, sex)
         for _, r in g.iterrows():
             years_since_anchor = (r.charttime.year - anchor_year)
             age_at_lab = age + years_since_anchor
             eg = egfr_cr(r.valuenum, age_at_lab, sex)
             t_years = (r.charttime - t0).days / 365.25
+            # age_at_index / sex / index_date / baseline_egfr are REQUIRED for the
+            # KFRE benchmark (MODE C): KFRE is a 4-variable model of
+            # age + sex + eGFR + UACR at an index date. They were previously
+            # computed here but never exported, which made a KFRE head-to-head
+            # comparison impossible downstream. They are constant per patient.
             rows.append(dict(patient_id=pid, time_years=t_years, egfr=eg,
                              charttime=r.charttime,   # kept temporarily for dynamic covariate matching, dropped before saving
+                             index_date=t0, age_at_index=age_at_index, sex=sex,
+                             baseline_egfr=baseline_egfr,
                              hba1c=np.nan, uacr=np.nan, sbp=np.nan))
         n_ok += 1
     df = pd.DataFrame(rows)
