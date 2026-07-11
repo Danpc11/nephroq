@@ -468,3 +468,47 @@ def test_unpack_does_not_overflow():
         vals = cal.unpack(np.array([-800.0, 800.0, 0.0, 0.0, 0.0]))
     assert np.all(np.isfinite(vals))
     assert np.all(vals >= cal.LO) and np.all(vals <= cal.HI)
+
+
+def test_calibration_slope_intercept_recovers_perfect_calibration():
+    """A perfectly calibrated forecaster must give slope ~1 and intercept ~0;
+    an over-confident (too-extreme) one must give slope < 1."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    p = rng.uniform(0.02, 0.95, 4000)
+    y = (rng.uniform(size=4000) < p).astype(int)          # outcomes really occur with prob p
+    intercept, slope = cal._calibration_slope_intercept(p, y)
+    assert 0.9 < slope < 1.1
+    assert abs(intercept) < 0.15
+
+    p_over = np.clip((p - 0.5) * 2.2 + 0.5, 0.01, 0.99)   # too extreme
+    _, slope_over = cal._calibration_slope_intercept(p_over, y)
+    assert slope_over < slope
+
+
+def test_brier_bounds():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+    assert cal._brier([1.0, 0.0], [1, 0]) == pytest.approx(0.0)   # perfect
+    assert cal._brier([0.0, 1.0], [1, 0]) == pytest.approx(1.0)   # maximally wrong
+
+
+def test_nephroq_risk_from_bootstrap_is_a_probability():
+    """The bootstrap-derived NephroQ risk must be a fraction in [0,1] and must
+    increase for a sicker patient."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+    import numpy as np
+
+    boot = [dict(q=1.52 + d, k_hf=0.0141 * (1 + d / 4), w_a1c=0.0144,
+                 w_uacr=0.0180, w_sbp=0.0108) for d in np.linspace(-0.25, 0.25, 15)]
+    healthy = cal.nephroq_risk_from_bootstrap(boot, a1c=6.5, uacr=10.0, sbp=120.0,
+                                              egfr0=55.0, horizon=5.0)
+    sick = cal.nephroq_risk_from_bootstrap(boot, a1c=10.0, uacr=1500.0, sbp=165.0,
+                                           egfr0=20.0, horizon=5.0)
+    assert 0.0 <= healthy <= 1.0 and 0.0 <= sick <= 1.0
+    assert sick > healthy
+    assert cal.nephroq_risk_from_bootstrap(None, 8.0, 300.0, 140.0, 40.0, 5.0) is None
