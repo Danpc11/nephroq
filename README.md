@@ -23,8 +23,6 @@ inference (public tier) and validated against published data.
 terminal collapse of renal function is. It is estimated from clinical
 trajectories, not just fitted as a black box.
 
-**Author:** Daniel Pérez-Calixto — INMEGEN / UNAM (Facultad de Ciencias)
-
 ---
 
 ## What this is
