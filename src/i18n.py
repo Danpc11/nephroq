@@ -151,6 +151,31 @@ STRINGS = {
               "horizonte, por lo que no se muestra intervalo. El tiempo modelado se lee "
               "mejor como '>{horizon} años' para la mayoría de los remuestreos.",
     },
+    "boot_degenerate": {
+        "en": "**Uncertainty band suppressed.** All bootstrap resamples of this calibration "
+              "returned effectively identical parameters (zero spread), which indicates the "
+              "calibration's optimizer did not converge properly rather than a genuinely "
+              "precise estimate. Showing a band here would look falsely precise. Point "
+              "estimate only — see docs/KNOWN_ISSUES.md ('optimizer scaling').",
+        "es": "**Banda de incertidumbre suprimida.** Todos los remuestreos bootstrap de esta "
+              "calibración devolvieron parámetros prácticamente idénticos (dispersión cero), "
+              "lo que indica que el optimizador de la calibración no convergió correctamente, "
+              "no que la estimación sea realmente precisa. Mostrar una banda aquí se vería "
+              "falsamente precisa. Solo estimación puntual — ver docs/KNOWN_ISSUES.md "
+              "('optimizer scaling').",
+    },
+    "boot_degenerate": {
+        "en": "The bootstrap parameter resamples in this calibration are essentially "
+              "identical (spread ≈ 0), which means the optimizer did not move off its "
+              "initial guess rather than that the parameters are precisely known. The "
+              "uncertainty band is therefore **not shown**, to avoid displaying a "
+              "falsely precise result. See docs/KNOWN_ISSUES.md §2b.",
+        "es": "Los remuestreos bootstrap de esta calibración son prácticamente idénticos "
+              "(dispersión ≈ 0), lo que indica que el optimizador no se movió de su punto "
+              "inicial, no que los parámetros se conozcan con precisión. Por eso **no se "
+              "muestra** la banda de incertidumbre: sería falsamente precisa. Ver "
+              "docs/KNOWN_ISSUES.md §2b.",
+    },
     "boot_none": {
         "en": "No bootstrap parameter-uncertainty band available for this calibration — "
               "point estimate only (see docs/KNOWN_ISSUES.md).",
