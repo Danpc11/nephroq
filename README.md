@@ -56,6 +56,7 @@ Full documentation: [`docs/MODEL_DOCUMENTATION.md`](docs/MODEL_DOCUMENTATION.md)
 ```
 ├── src/                          # All the code, ready to run
 │   ├── model_core.py             # SINGLE source of truth for the model (imported by app + calibration)
+│   ├── i18n.py                   # SINGLE source of truth for UI strings (EN/ES) + example patients (app + notebook)
 │   ├── mechanistic_twin.py       # Nonlinear core (hyperfiltration + compensation)
 │   ├── hybrid_twin.py            # Matrix variant: state-space + absorbing Markov + Kalman
 │   ├── egfr_measurement.py       # CKD-EPI 2021 equations (creatinine / cystatin / combined)
@@ -71,6 +72,7 @@ Full documentation: [`docs/MODEL_DOCUMENTATION.md`](docs/MODEL_DOCUMENTATION.md)
 │   └── mvp_calibration.py        # MVP: calibrates and validates with real or synthetic data
 ├── docs/                         # Documentation and protocol
 │   ├── MODEL_DOCUMENTATION.md               # Mathematical spec + implementation guide + publication analysis
+│   ├── CLINICIAN_DEMO.md                     # 7-min demo script for clinicians (ES) + example patients
 │   ├── digital_twin_protocol.md
 │   ├── validation_report_example.md
 │   ├── WEB_DEPLOYMENT.md
@@ -147,6 +149,15 @@ and see the risk projection, designed to share with physicians.
 ```bash
 streamlit run app_web.py
 ```
+
+The app ships with **one-click example patients** (four clinical vignettes) so
+a clinician can see the model's behavior without typing lab values, and is
+**bilingual (English / Spanish)** with a language toggle at the top of the
+sidebar — all UI strings and vignettes live in `src/i18n.py`, shared with the
+Colab notebook so the two interfaces never drift. For a guided 7-minute
+walkthrough — including what to point at, the honest caveats to say out loud,
+and the "normal eGFR, hidden risk" case that is the core value story — see
+[`docs/CLINICIAN_DEMO.md`](docs/CLINICIAN_DEMO.md).
 
 The active calibration is resolved automatically across three tiers
 (highest to lowest priority):
