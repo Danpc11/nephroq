@@ -333,19 +333,54 @@ def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True,
 
     rng = np.random.default_rng(seed)
     base = init_guess if init_guess is not None else np.array([1.5, 0.012, 0.014, 0.018, 0.011])
+
+    # Robust-loss scale for soft_l1: calibrate f_scale to the SPREAD of the
+    # residuals at the initial guess (robust MAD estimate). soft_l1 then
+    # progressively downweights observations whose standardized residual sits
+    # well beyond the bulk -- i.e. acute AKI-type spikes, common in a hospital
+    # cohort like MIMIC-IV -- instead of letting a handful of them dominate the
+    # least-squares objective. (Because residuals are also weighted 1/sqrt(n_i)
+    # per patient, a single global f_scale maps to a slightly different raw-error
+    # threshold per patient; that is an accepted approximation.) See
+    # docs/KNOWN_ISSUES.md "acute-event contamination".
+    r0 = residuals(pack(base))
+    mad = float(np.median(np.abs(r0 - np.median(r0))))
+    f_scale = max(1.4826 * mad, 1e-6)
+
     best = None
     for s in range(n_multistarts):
         t0 = time.time()
         p_init = pack(base) if s == 0 else pack(np.clip(base*rng.uniform(0.5, 1.8, 5), LO*1.01, HI*0.99))
-        sol = least_squares(residuals, p_init, method="trf", max_nfev=3000)
+        # x_scale="jac" is essential here: the logit reparameterization gives the
+        # Jacobian columns very different magnitudes (the q column is ~60x steeper
+        # than the k_hf / weight columns near the initial guess), so with the
+        # default x_scale=1 TRF's scaled-gradient test (gtol) can trigger on the
+        # FIRST evaluation and return the initial guess almost unchanged -- a
+        # "frozen" optimizer that produces round-number parameters and a bootstrap
+        # with ~0 variance. Scaling by the Jacobian column norms removes that
+        # disparity. loss="soft_l1" adds robustness to acute spikes (f_scale above).
+        sol = least_squares(residuals, p_init, method="trf", max_nfev=3000,
+                            x_scale="jac", loss="soft_l1", f_scale=f_scale,
+                            xtol=1e-10, ftol=1e-10, gtol=1e-12)
         dt = time.time() - t0
         if verbose:
             q_s, khf_s, *_ = unpack(sol.x)
+            moved = float(np.max(np.abs(unpack(sol.x) - base)))
             print(f"      [fit {s+1}/{n_multistarts}] {dt:5.1f}s  cost={sol.cost:.1f}  "
-                 f"nfev={sol.nfev}  q={q_s:.2f}  k_hf={khf_s:.4f}"
+                 f"nfev={sol.nfev}  status={sol.status}  q={q_s:.3f}  k_hf={khf_s:.4f}  "
+                 f"|Δparam|max={moved:.3g}"
                  f"{'  <- best so far' if best is None or sol.cost < best.cost else ''}")
         if best is None or sol.cost < best.cost:
             best = sol
+
+    if verbose and best is not None:
+        # Explicit freeze check: if the optimum still equals the initial guess to
+        # working precision, the optimizer did not move -- the fit is not trustworthy.
+        moved_best = float(np.max(np.abs(unpack(best.x) - base)))
+        msg = (best.message or "").strip()
+        print(f"      [fit] best status={best.status} ({msg}); nfev={best.nfev}; "
+             f"|Δparam|max from x0 = {moved_best:.3g}"
+             f"{'   *** WARNING: optimizer did not move off the initial guess ***' if moved_best < 1e-6 else ''}")
 
     q, khf, wa, wu, wb = unpack(best.x)
     params = dict(q=float(q), k_hf=float(khf), w_a1c=float(wa), w_uacr=float(wu), w_sbp=float(wb))
@@ -565,6 +600,19 @@ def main():
         return
 
     diagnostics = diagnose_cohort(patients)
+    # Empirical measurement-noise estimate: the assumed 3.5 mL/min is an
+    # instrument-only floor, but the median within-patient volatility (scatter
+    # around each patient's own straight-line trend) is the honest estimate of
+    # how noisy these trajectories actually are. Using it makes chi2/n
+    # interpretable (chi2/n = (rmse/sigma)^2); reporting chi2/n against an
+    # unrealistically small 3.5 inflates it ~6x for no reason. Floored at 3.5 so
+    # we never claim MORE precision than the instrument. See docs/KNOWN_ISSUES.md.
+    _mv = diagnostics.get("median_volatility_mL_min")
+    noise_sd_emp = float(max(_mv, 3.5)) if (_mv and np.isfinite(_mv)) else 3.5
+    print(f"[diagnostics] Empirical measurement-noise estimate sigma={noise_sd_emp:.1f} mL/min "
+         f"(median within-patient volatility, floored at 3.5) used for chi2/n reporting "
+         f"and the quality gate. The fitted parameters are unaffected by this choice "
+         f"(a global residual scale does not move the optimum); only the reported chi2/n is.")
     if missingness:
         print(f"[diagnostics] Missingness (fraction of patients with a fully-imputed value): "
              f"hba1c={missingness['hba1c']:.0%}  uacr={missingness['uacr']:.0%}  "
@@ -609,8 +657,9 @@ def main():
              "faster fit with essentially the same precision for 5 parameters.")
 
     print("\n      --- PRIMARY analysis ---")
-    result = calibrate(train, max_patients=a.max_patients)
+    result = calibrate(train, max_patients=a.max_patients, noise_sd=noise_sd_emp)
     result["diagnostics"] = diagnostics
+    result["noise_sd_empirical"] = noise_sd_emp
     result["missingness"] = missingness
     result["chronic_only_filter"] = bool(a.chronic_only)
     result["max_patients_subsample"] = a.max_patients
@@ -629,8 +678,8 @@ def main():
     if sensitivity_patients is not None and len(sensitivity_patients) > len(primary_patients):
         print("\n      --- SENSITIVITY analysis (full cohort, imputation included) ---")
         sens_train, sens_test = split_train_test(sensitivity_patients, test_frac=a.test_frac)
-        sens_result = calibrate(sens_train, max_patients=a.max_patients, seed=1)
-        sens_holdout = evaluate_holdout(sens_result, sens_test)
+        sens_result = calibrate(sens_train, max_patients=a.max_patients, seed=1, noise_sd=noise_sd_emp)
+        sens_holdout = evaluate_holdout(sens_result, sens_test, noise_sd=noise_sd_emp)
         result["sensitivity_analysis"] = dict(
             q=sens_result["q"], k_hf=sens_result["k_hf"],
             w_a1c=sens_result["w_a1c"], w_uacr=sens_result["w_uacr"], w_sbp=sens_result["w_sbp"],
@@ -642,7 +691,7 @@ def main():
              f"w_uacr={sens_result['w_uacr']:.4f}  (n={sens_result['n_patients']}) "
              f"-- compare against the primary result printed below.")
 
-    holdout = evaluate_holdout(result, test)
+    holdout = evaluate_holdout(result, test, noise_sd=noise_sd_emp)
     if holdout:
         result["holdout_dynamic_reconstruction"] = holdout
         print(f"\n[diagnostics] Held-out, MODE A (dynamic reconstruction, uses full covariate "
