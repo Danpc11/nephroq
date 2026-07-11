@@ -2,7 +2,11 @@
 ================================================================================
 NEPHROQ WEB INTERFACE  ·  Type 2 Diabetes -> CKD   (Streamlit)
 ================================================================================
-Interactive web app to explore the model with clinicians/collaborators.
+Interactive, BILINGUAL (English / Spanish) web app to explore the model with
+clinicians/collaborators. Language toggle is at the top of the sidebar.
+All visible strings and the example patients live in src/i18n.py (single
+source of truth, shared with the Colab notebook).
+
 Run locally:            streamlit run app_web.py
 Deploys for free from GitHub on Streamlit Community Cloud or HF Spaces
 (see docs/WEB_DEPLOYMENT.md).
@@ -18,19 +22,17 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 from egfr_measurement import egfr_cr, egfr_cr_cys
-from mechanistic_twin import MechanisticRenalModel, N_of_egfr, DIALYSIS_eGFR
+from mechanistic_twin import MechanisticRenalModel, N_of_egfr, DIALYSIS_eGFR, gfr_category
+from i18n import t as _t, PRESETS, LANGUAGES, preset_by_id
 
 # ------------------------------------------------------------------------------
 # CALIBRATION: three tiers, from highest to lowest priority.
 #   1) st.secrets["calibration"]     -> future real clinical cohort (private, NDA)
 #   2) calibration/mimic_calibration.json -> generated locally with calibrate_mimic.py
-#      (research/demo of THIS repository; aggregate, not PHI; see docs/MIMIC_COMPLIANCE.md)
 #   3) hardcoded public values -> fallback if none of the above exist
-#      (e.g. someone clones the repo without running calibrate_mimic.py)
 # ------------------------------------------------------------------------------
 Q_POP_PUBLIC, KHF_POP_PUBLIC = 1.52, 0.0141
 W_POP_PUBLIC = np.array([0.0144, 0.0180, 0.0108])   # weights [A1c, UACR, blood pressure]
-
 MIMIC_JSON_PATH = os.path.join(os.path.dirname(__file__), "calibration", "mimic_calibration.json")
 
 def load_calibration():
@@ -39,7 +41,7 @@ def load_calibration():
         cal = st.secrets["calibration"]
         q = float(cal["q"]); khf = float(cal["k_hf"])
         w = np.array([float(cal["w_a1c"]), float(cal["w_uacr"]), float(cal["w_sbp"])])
-        return q, khf, w, "private (clinical cohort)", "pass", [], None
+        return q, khf, w, "private (clinical cohort)", "private", "pass", [], None
     except Exception:
         pass
     # tier 2: local calibration with MIMIC-IV (calibrate_mimic.py)
@@ -49,75 +51,104 @@ def load_calibration():
             cal = json.load(f)
         q = float(cal["q"]); khf = float(cal["k_hf"])
         w = np.array([float(cal["w_a1c"]), float(cal["w_uacr"]), float(cal["w_sbp"])])
-        # Formal quality gate: don't silently trust a calibration that
-        # calibrate_mimic.py itself flagged as unreliable (q at bound, huge
-        # chi2/n, outcome-selected cohort, etc. -- see docs/KNOWN_ISSUES.md).
         quality_status = cal.get("quality_status", "unknown")
         quality_reasons = cal.get("quality_reasons", [])
-        # Bootstrap parameter sets (see calibrate_mimic.py's bootstrap_calibrate) --
-        # used below to show a prediction interval instead of a bare point estimate.
         bootstrap_params = cal.get("bootstrap_params") or None
-        return (q, khf, w, f"MIMIC-IV {cal.get('mimic_version','')} (n={cal.get('n_patients','?')} patients)",
-               quality_status, quality_reasons, bootstrap_params)
+        src = f"MIMIC-IV {cal.get('mimic_version','')} (n={cal.get('n_patients','?')} patients)"
+        return q, khf, w, src, "mimic", quality_status, quality_reasons, bootstrap_params
     except Exception:
         pass
     # tier 3: public fallback (synthetic + Al-Shamsi validation)
-    return Q_POP_PUBLIC, KHF_POP_PUBLIC, W_POP_PUBLIC, "public (synthetic + Al-Shamsi 2018 validation)", "pass", [], None
+    return Q_POP_PUBLIC, KHF_POP_PUBLIC, W_POP_PUBLIC, None, "public", "pass", [], None
 
-Q_POP, KHF_POP, W_POP, CALIBRATION_SOURCE, CALIBRATION_QUALITY, CALIBRATION_QUALITY_REASONS, BOOTSTRAP_PARAMS = load_calibration()
+(Q_POP, KHF_POP, W_POP, CALIBRATION_SOURCE, CALIB_TIER,
+ CALIBRATION_QUALITY, CALIBRATION_QUALITY_REASONS, BOOTSTRAP_PARAMS) = load_calibration()
 
 st.set_page_config(page_title="NephroQ · Diabetes → CKD", page_icon="🩺", layout="wide")
 
-st.title("🩺 NephroQ — renal risk digital twin in type 2 diabetes")
-st.caption("Research prototype (TRL4) — NOT a diagnostic tool. "
-          "Must not be used for clinical decisions without qualified medical supervision.")
-st.caption("**Research-use calibration — not externally validated.**")
-st.caption(f"Active calibration: **{CALIBRATION_SOURCE}**")
-if CALIBRATION_SOURCE.startswith("public"):
-    st.warning("**Demonstration mode** — projections are generated from a synthetic "
-              "research calibration and must not be interpreted as individualized "
-              "clinical predictions.")
+# ---- language (read from session_state so the whole page reacts on rerun) ----
+st.session_state.setdefault("_lang_label", "English")
+LANG = LANGUAGES[st.session_state["_lang_label"]]
+def _(key, **kw):
+    return _t(LANG, key, **kw)
+
+st.title(_("title"))
+st.caption(_("disclaimer"))
+st.caption(_("research_use"))
+
+src_display = _("src_public") if CALIB_TIER == "public" else CALIBRATION_SOURCE
+st.caption(_("active_calibration", src=src_display))
+if CALIB_TIER == "public":
+    st.warning(_("demo_mode"))
 elif CALIBRATION_QUALITY != "pass":
-    st.error(f"**Calibration quality warning** — the active MIMIC-IV calibration was "
-            f"flagged by calibrate_mimic.py as unreliable: {CALIBRATION_QUALITY_REASONS}. "
-            f"Do not treat these projections as trustworthy. See docs/KNOWN_ISSUES.md.")
+    st.error(_("quality_warning", reasons=CALIBRATION_QUALITY_REASONS))
+
+# ------------------------------------------------------------------------------
+# Seed widget state once, then apply any pending preset BEFORE the widgets are
+# instantiated (Streamlit requires session_state set before the reading widget).
+# ------------------------------------------------------------------------------
+_DEFAULTS = dict(age=58, sex="F", creatinine=1.3, hba1c=8.1, uacr=145.0, sbp=142)
+for _k, _v in _DEFAULTS.items():
+    st.session_state.setdefault(_k, _v)
+if "_pending_preset" in st.session_state:
+    _pid = st.session_state.pop("_pending_preset")
+    _preset = preset_by_id(_pid)
+    if _preset:
+        for _k, _v in _preset["markers"].items():
+            st.session_state[_k] = _v
+        st.session_state["_active_preset"] = _pid
 
 with st.sidebar:
-    st.header("Patient markers")
-    age = st.number_input("Age (years)", 18, 100, 58)
-    sex = st.radio("Sex", ["F", "M"], horizontal=True)
+    st.radio(_("language"), list(LANGUAGES.keys()), key="_lang_label", horizontal=True)
     st.divider()
-    st.subheader("Blood")
-    creatinine = st.number_input("Serum creatinine (mg/dL)", 0.3, 10.0, 1.3, step=0.1)
-    use_cystatin = st.checkbox("I have cystatin C (more precise)")
-    cystatin = st.number_input("Cystatin C (mg/L)", 0.3, 8.0, 1.3, step=0.1) if use_cystatin else None
-    hba1c = st.number_input("HbA1c (%)", 4.0, 15.0, 8.1, step=0.1)
-    st.subheader("Urine")
-    uacr = st.number_input("UACR — urine albumin/creatinine ratio (mg/g)", 0.0, 3000.0, 145.0, step=5.0)
-    st.subheader("In clinic")
-    sbp = st.number_input("Systolic blood pressure (mmHg)", 80, 220, 142)
+    st.header(_("examples_header"))
+    st.caption(_("examples_caption"))
+    for _p in PRESETS:
+        if st.button(_p["label"][LANG], use_container_width=True, key=f"btn_{_p['id']}"):
+            st.session_state["_pending_preset"] = _p["id"]
+            st.rerun()
+    if st.button(_("reset"), use_container_width=True):
+        for _k, _v in _DEFAULTS.items():
+            st.session_state[_k] = _v
+        st.session_state.pop("_active_preset", None)
+        st.rerun()
     st.divider()
-    treated = st.checkbox("Already receiving a renoprotective therapy (illustrative: SGLT2i/ACEi-ARB combined effect)",
-                          value=False)
+
+    st.header(_("markers_header"))
+    age = st.number_input(_("age"), 18, 100, key="age")
+    sex = st.radio(_("sex"), ["F", "M"], horizontal=True, key="sex")
+    st.divider()
+    st.subheader(_("blood"))
+    creatinine = st.number_input(_("creatinine"), 0.3, 10.0, step=0.1, key="creatinine")
+    use_cystatin = st.checkbox(_("have_cystatin"))
+    cystatin = st.number_input(_("cystatin"), 0.3, 8.0, 1.3, step=0.1) if use_cystatin else None
+    hba1c = st.number_input(_("hba1c"), 4.0, 15.0, step=0.1, key="hba1c")
+    st.subheader(_("urine"))
+    uacr = st.number_input(_("uacr"), 0.0, 3000.0, step=5.0, key="uacr")
+    st.subheader(_("in_clinic"))
+    sbp = st.number_input(_("sbp"), 80, 220, key="sbp")
+    st.divider()
+    treated = st.checkbox(_("treated"), value=False)
 
 # ---- baseline eGFR ----
 if cystatin:
     egfr0 = egfr_cr_cys(creatinine, cystatin, age, sex)
-    method = "creatinine + cystatin (more precise)"
+    method = _("method_cr_cys")
 else:
     egfr0 = egfr_cr(creatinine, age, sex)
-    method = "creatinine only"
+    method = _("method_cr")
 
-from mechanistic_twin import gfr_category  # single source of truth, see model_core.py
+_active = st.session_state.get("_active_preset")
+_ap = preset_by_id(_active) if _active else None
+if _ap:
+    st.info(_("example_loaded", label=_ap["label"][LANG], note=_ap["note"][LANG]))
 
 col1, col2, col3 = st.columns(3)
-col1.metric("Baseline eGFR", f"{egfr0:.1f} mL/min/1.73m²", help=f"Calculated with: {method}")
-col2.metric("KDIGO GFR category", gfr_category(egfr0))
+col1.metric(_("baseline_egfr"), f"{egfr0:.1f} mL/min/1.73m²", help=_("baseline_help", method=method))
+col2.metric(_("kdigo"), gfr_category(egfr0))
 
 # ---- projection ----
 def project(a1c, sbp, uacr, egfr0, treated, q=None, khf=None, w=None, years=15):
-    """q/khf/w default to the active point-estimate calibration; overridden
-    per-call when re-simulating under a bootstrap parameter set (see below)."""
     q = Q_POP if q is None else q
     khf = KHF_POP if khf is None else khf
     w = W_POP if w is None else w
@@ -128,18 +159,11 @@ def project(a1c, sbp, uacr, egfr0, treated, q=None, khf=None, w=None, years=15):
 
 t_a, e_a, td_a = project(hba1c, sbp, uacr, egfr0, treated)
 t_b, e_b, td_b = project(hba1c, sbp, uacr, egfr0, not treated)
-label_a = "Current treatment" if treated else "No treatment (current scenario)"
-label_b = "Illustrative renoprotective scenario added" if not treated else "If treatment is stopped"
+label_a = _("label_current_tx") if treated else _("label_no_tx")
+label_b = _("label_reno_added") if not treated else _("label_tx_stopped")
+horizon = int(t_a[-1])
 
-# ---- bootstrap PARAMETER-uncertainty band from the calibration (if available) ----
-# Re-simulates (cheap: no fitting, just integration) under each bootstrap
-# parameter set computed OFFLINE by calibrate_mimic.py. IMPORTANT: this
-# captures only CALIBRATED-PARAMETER uncertainty (from resampling patients),
-# not residual/measurement noise, individual random effects, unknown future
-# evolution of the labs, or structural model error -- so it is deliberately
-# NOT called a "prediction interval" (that would overclaim how complete the
-# uncertainty is). See docs/KNOWN_ISSUES.md "bootstrap, not full Bayesian,
-# uncertainty" and calibrate_mimic.py's bootstrap_calibrate.
+# ---- bootstrap PARAMETER-uncertainty band (parameter uncertainty ONLY) --------
 e_a_lo = e_a_hi = td_a_lo = td_a_hi = None
 p_reach_threshold = None
 if BOOTSTRAP_PARAMS:
@@ -148,81 +172,47 @@ if BOOTSTRAP_PARAMS:
         bw = np.array([bp["w_a1c"], bp["w_uacr"], bp["w_sbp"]])
         _, e_boot, td_boot = project(hba1c, sbp, uacr, egfr0, treated,
                                      q=bp["q"], khf=bp["k_hf"], w=bw)
-        boot_e_a.append(e_boot)
-        boot_td_a.append(td_boot)
+        boot_e_a.append(e_boot); boot_td_a.append(td_boot)
     boot_e_a = np.array(boot_e_a)
     e_a_lo, e_a_hi = np.percentile(boot_e_a, [5, 95], axis=0)
-
     boot_td_a = np.array(boot_td_a)
-    n_boot = len(boot_td_a)
     finite_td = boot_td_a[np.isfinite(boot_td_a)]
-    p_reach_threshold = len(finite_td) / n_boot   # fraction of resamples that DO cross within the horizon
-    # Only report an interval among crossings if a clear majority actually
-    # cross -- otherwise showing "8-14 years" while most resamples never
-    # reach the threshold would hide that fact and look falsely precise
-    # (see docs/KNOWN_ISSUES.md).
+    p_reach_threshold = len(finite_td) / len(boot_td_a)
     if p_reach_threshold >= 0.5 and len(finite_td) >= 3:
         td_a_lo, td_a_hi = np.percentile(finite_td, [5, 95])
 
-col3.metric(f"Modeled time to eGFR<15 ({'current' if treated else 'untreated'})",
-           f"{td_a:.1f} years" if np.isfinite(td_a) else ">15 years",
-           help="This is a modeled kidney-function threshold (eGFR<15), not a "
-                "prediction of when dialysis would actually start. Real dialysis "
-                "initiation depends on symptoms, labs, and clinical judgment.")
+state = _("state_current") if treated else _("state_untreated")
+time_str = _("years", v=td_a) if np.isfinite(td_a) else _("gt_years", v=horizon)
+col3.metric(_("time_title", state=state), time_str, help=_("time_help"))
+
 if BOOTSTRAP_PARAMS:
-    st.caption(f"Of {len(BOOTSTRAP_PARAMS)} bootstrap parameter resamples, "
-              f"**{100*p_reach_threshold:.0f}%** reach eGFR<15 within the {int(t_a[-1])}-year horizon shown.")
+    st.caption(_("boot_reach", n=len(BOOTSTRAP_PARAMS), pct=100*p_reach_threshold, horizon=horizon))
     if td_a_lo is not None:
-        st.caption(f"90% bootstrap **parameter**-uncertainty interval, among resamples that "
-                  f"cross the threshold: **{td_a_lo:.1f} – {td_a_hi:.1f} years**. This reflects "
-                  f"calibration-parameter uncertainty only -- not measurement noise, individual "
-                  f"variability, or unknown future lab values (see docs/KNOWN_ISSUES.md).")
+        st.caption(_("boot_interval", lo=td_a_lo, hi=td_a_hi))
     else:
-        st.caption("Fewer than half of the bootstrap resamples reach the threshold within this "
-                  "horizon, so no interval is shown here (it would be conditioned on an "
-                  "unrepresentative minority of resamples). Modeled time is best read as "
-                  f"'>{int(t_a[-1])} years' for a majority of parameter resamples.")
+        st.caption(_("boot_no_interval", horizon=horizon))
 else:
-    st.caption("No bootstrap parameter-uncertainty band available for this calibration -- "
-              "point estimate only (see docs/KNOWN_ISSUES.md).")
+    st.caption(_("boot_none"))
 
 fig, ax = plt.subplots(figsize=(9, 4.5))
 if e_a_lo is not None:
-    ax.fill_between(t_a, e_a_lo, e_a_hi, color="#E24B4A", alpha=0.15,
-                    label="90% bootstrap parameter-uncertainty band")
+    ax.fill_between(t_a, e_a_lo, e_a_hi, color="#E24B4A", alpha=0.15, label=_("band_label"))
 ax.plot(t_a, e_a, lw=2.5, color="#E24B4A", label=label_a)
 ax.plot(t_b, e_b, lw=2.5, color="#1D9E75", label=label_b)
 ax.axhline(DIALYSIS_eGFR, color="k", lw=1, ls="--")
-ax.text(0.3, DIALYSIS_eGFR + 2, "modeled eGFR<15 threshold", fontsize=9)
-ax.set_xlabel("years"); ax.set_ylabel("projected eGFR (mL/min/1.73m²)")
-ax.set_title("Illustrative model projection of renal function"); ax.legend()
+ax.text(0.3, DIALYSIS_eGFR + 2, _("plot_threshold"), fontsize=9)
+ax.set_xlabel(_("plot_x")); ax.set_ylabel(_("plot_y"))
+ax.set_title(_("plot_title")); ax.legend()
 st.pyplot(fig)
 
 if np.isfinite(td_a) and np.isfinite(td_b):
-    diff = abs(td_b - td_a)
-    st.info(f"**{label_b}** changes the modeled time to the eGFR<15 threshold by "
-           f"approximately **{diff:.1f} years** relative to the current scenario, "
-           f"under the assumptions of the current research model. This is not a "
-           f"prediction of dialysis initiation.")
+    st.info(_("diff_info", label=label_b, d=abs(td_b - td_a)))
 
 if not use_cystatin:
-    st.warning("eGFR was calculated with creatinine only. Requesting cystatin C reduces "
-              "the estimation error of the feedback exponent (q) by ~5×.")
+    st.warning(_("cystatin_warning"))
 
-with st.expander("What does this mean? (to share with the patient/physician)"):
-    st.markdown("""
-    This model simulates the progressive loss of functional nephrons using two
-    mechanisms: **hyperfiltration** (as nephrons are lost, the remaining ones
-    become overloaded and are damaged faster) and **compensation** (eGFR stays
-    stable while there is reserve, and drops faster near the end).
-
-    The model parameters were calibrated with hierarchical Bayesian inference
-    on verified synthetic data and a first face-validity check against real
-    published data. **It has not been validated on a prospective clinical
-    cohort** — see `docs/MODEL_DOCUMENTATION.md` for the full project status
-    and what remains for clinical publication.
-    """)
+with st.expander(_("expander_title")):
+    st.markdown(_("expander_body"))
 
 st.divider()
-st.caption("Source code and full documentation: "
-          "[github.com/Danpc11/nephroq](https://github.com)")
+st.caption(_("footer"))
