@@ -11,10 +11,12 @@
 ![Streamlit](https://img.shields.io/badge/Streamlit-app-FF4B4B?logo=streamlit&logoColor=white)
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Danpc11/nephroq/blob/main/risk_notebook.ipynb)
 
-A calibratable, nonlinear mechanistic model to predict renal function
-(eGFR) progression in type 2 diabetic patients and estimate time to
-dialysis, with hierarchical Bayesian inference and validation against
-published data.
+A calibratable, nonlinear mechanistic model of renal function (eGFR)
+progression in type 2 diabetic patients. It projects the time to a MODELED
+eGFR < 15 mL/min/1.73m² threshold -- which is a kidney-function threshold, not
+a prediction of when dialysis would actually start (real KRT initiation depends
+on symptoms, labs and clinical judgment). Calibrated with hierarchical Bayesian
+inference (public tier) and validated against published data.
 
 **Why "NephroQ":** the model's central, physically meaningful parameter is
 `q` — the hyperfiltration feedback exponent that quantifies how abrupt the
@@ -127,8 +129,10 @@ Covariates (HbA1c/UACR/SBP) are time-varying by default — each visit uses
 its own nearest measurement, falling back to a patient baseline and then
 population imputation only where needed (see `docs/CHANGELOG.md` Round 5).
 A patient-level bootstrap (`--n-bootstrap`, default 15) also runs after the
-fit, so the app can show a 90% prediction interval instead of a bare point
-estimate; use `--n-bootstrap 0` to skip it for a faster run.
+fit, so the app can show a 90% bootstrap **parameter-uncertainty band** instead
+of a bare point estimate. It is NOT a prediction interval: it captures only
+calibration-parameter uncertainty, not measurement noise, individual
+variability, or unknown future lab values. Use `--n-bootstrap 0` to skip it.
 
 ## Reproducible environment (Docker)
 
