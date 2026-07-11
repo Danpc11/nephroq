@@ -53,6 +53,24 @@ STRINGS = {
               "estas proyecciones como confiables. Ver docs/KNOWN_ISSUES.md.",
     },
     # ---- sidebar -------------------------------------------------------------
+    "quality_optin": {
+        "en": "Use the flagged MIMIC calibration anyway (research mode, at your own risk)",
+        "es": "Usar de todos modos la calibración MIMIC marcada (modo investigación, bajo tu responsabilidad)",
+    },
+    "fell_back_public": {
+        "en": "**Falling back to the public calibration.** The MIMIC calibration on this machine "
+              "was flagged as unreliable, so it is **not** being used for the projections below. "
+              "Tick the box above to override (research only).",
+        "es": "**Usando la calibración pública.** La calibración MIMIC de esta máquina fue marcada "
+              "como poco confiable, así que **no** se está usando para las proyecciones de abajo. "
+              "Marca la casilla de arriba para anular (solo investigación).",
+    },
+    "using_flagged": {
+        "en": "**Research mode: using a calibration that FAILED its quality gate.** The projections "
+              "below are not trustworthy and must not be shown to clinicians as results.",
+        "es": "**Modo investigación: se está usando una calibración que NO pasó el control de calidad.** "
+              "Las proyecciones de abajo no son confiables y no deben mostrarse a clínicos como resultados.",
+    },
     "language": {"en": "Idioma / Language", "es": "Idioma / Language"},
     "examples_header": {"en": "Example patients", "es": "Pacientes de ejemplo"},
     "examples_caption": {
@@ -164,18 +182,6 @@ STRINGS = {
               "falsamente precisa. Solo estimación puntual — ver docs/KNOWN_ISSUES.md "
               "('optimizer scaling').",
     },
-    "boot_degenerate": {
-        "en": "The bootstrap parameter resamples in this calibration are essentially "
-              "identical (spread ≈ 0), which means the optimizer did not move off its "
-              "initial guess rather than that the parameters are precisely known. The "
-              "uncertainty band is therefore **not shown**, to avoid displaying a "
-              "falsely precise result. See docs/KNOWN_ISSUES.md §2b.",
-        "es": "Los remuestreos bootstrap de esta calibración son prácticamente idénticos "
-              "(dispersión ≈ 0), lo que indica que el optimizador no se movió de su punto "
-              "inicial, no que los parámetros se conozcan con precisión. Por eso **no se "
-              "muestra** la banda de incertidumbre: sería falsamente precisa. Ver "
-              "docs/KNOWN_ISSUES.md §2b.",
-    },
     "boot_none": {
         "en": "No bootstrap parameter-uncertainty band available for this calibration — "
               "point estimate only (see docs/KNOWN_ISSUES.md).",
@@ -208,10 +214,8 @@ STRINGS = {
               "del inicio de diálisis.",
     },
     "cystatin_warning": {
-        "en": "eGFR was calculated with creatinine only. Requesting cystatin C reduces "
-              "the estimation error of the feedback exponent (q) by ~5×.",
-        "es": "El eGFR se calculó solo con creatinina. Solicitar cistatina C reduce ~5× "
-              "el error de estimación del exponente de retroalimentación (q).",
+        "en": "eGFR was calculated with creatinine only. In synthetic longitudinal identifiability experiments, a combined creatinine\u2013cystatin C eGFR reduced the uncertainty in estimating the feedback exponent (q). This effect has not yet been clinically validated in NephroQ, and this app uses a population q rather than re-estimating it per patient.",
+        "es": "El eGFR se calculó solo con creatinina. En experimentos sintéticos de identificabilidad longitudinal, la eGFR combinada de creatinina y cistatina C redujo la incertidumbre en la estimación del exponente de retroalimentación (q). Este efecto aún no ha sido validado clínicamente en NephroQ, y esta app usa un q poblacional en lugar de reestimarlo por paciente."
     },
     "expander_title": {
         "en": "What does this mean? (to share with the patient/physician)",
@@ -234,6 +238,26 @@ STRINGS = {
               "sintéticos verificados y una primera comprobación de validez aparente contra "
               "datos reales publicados. **No ha sido validado en una cohorte clínica "
               "prospectiva** — ver `docs/MODEL_DOCUMENTATION.md` para el estado completo.",
+    },
+    "expander_body_mimic": {
+        "en": "This model simulates the progressive loss of functional nephrons using two "
+              "mechanisms: **hyperfiltration** (as nephrons are lost, the remaining ones "
+              "become overloaded and are damaged faster) and **compensation** (eGFR stays "
+              "stable while there is reserve, and drops faster near the end).\n\n"
+              "The ACTIVE parameters come from a **population mechanistic calibration on "
+              "MIMIC-IV using robust nonlinear least squares, with patient-level bootstrap "
+              "for parameter uncertainty** — not the hierarchical Bayesian workflow used for "
+              "the public synthetic calibration. **It has not been validated on a prospective "
+              "clinical cohort** — see `docs/KNOWN_ISSUES.md`.",
+        "es": "Este modelo simula la pérdida progresiva de nefronas funcionales con dos "
+              "mecanismos: **hiperfiltración** (al perderse nefronas, las restantes se "
+              "sobrecargan y se dañan más rápido) y **compensación** (el eGFR se mantiene "
+              "estable mientras hay reserva y cae más rápido cerca del final).\n\n"
+              "Los parámetros ACTIVOS provienen de una **calibración mecanística poblacional "
+              "sobre MIMIC-IV con mínimos cuadrados no lineales robustos y bootstrap a nivel "
+              "paciente para la incertidumbre de parámetros** — no del flujo bayesiano "
+              "jerárquico de la calibración pública sintética. **No ha sido validado en una "
+              "cohorte clínica prospectiva** — ver `docs/KNOWN_ISSUES.md`.",
     },
     "footer": {
         "en": "Source code and full documentation: "
