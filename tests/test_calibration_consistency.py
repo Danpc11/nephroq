@@ -1,3 +1,4 @@
+import pytest
 """
 Regression tests targeting the specific bugs found in code review:
   1. App/calibration parameterization mismatch (double-scaling of insult weights).
@@ -379,3 +380,91 @@ def test_evaluate_baseline_forecast_skips_missing_horizons():
     result = cal.evaluate_baseline_forecast(params, [pac], horizons=(2.0, 5.0), tolerance_years=0.5)
     assert "year_2.0" in result
     assert "year_5.0" not in result
+
+
+def test_auc_handles_ties():
+    """Tied scores must receive the AVERAGE rank. A score that cannot separate
+    the classes at all must give exactly 0.5; an argsort-of-argsort ranking
+    assigns arbitrary consecutive ranks to ties and fails this."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+    assert cal._auc([0.1, 0.1, 0.9, 0.9], [0, 1, 0, 1]) == pytest.approx(0.5)
+    assert cal._auc([0.1, 0.2, 0.8, 0.9], [0, 0, 1, 1]) == pytest.approx(1.0)
+    assert cal._auc([1.0, 1.0, 1.0, 1.0], [0, 1, 0, 1]) == pytest.approx(0.5)
+
+
+def test_mode_c_has_no_temporal_leakage():
+    """A missing BASELINE covariate must be filled from development-set defaults,
+    never from the patient's own later measurements. Two cohorts identical at
+    baseline but with wildly different FUTURE HbA1c must therefore produce the
+    identical baseline-anchored evaluation."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+    import numpy as np
+
+    def cohort(future_a1c):
+        pats = []
+        for i in range(40):
+            rng = np.random.default_rng(i)
+            n = 12
+            t = np.linspace(0, 6, n)
+            e0 = 25.0 + (i % 30)                      # inside the 15-60 KFRE range
+            e = np.clip(e0 - rng.uniform(3, 10) * t, 3, None)
+            pats.append(dict(
+                patient_id=str(i), t=t, e=e, egfr0=e0, baseline_egfr=e0,
+                hba1c_series=np.full(n, future_a1c),  # the patient's FUTURE
+                uacr_series=np.full(n, 300.0), sbp_series=np.full(n, 140.0),
+                uacr_baseline_observed=True, hba1c_baseline_observed=False,
+                hba1c_baseline_strict=np.nan,         # NO baseline HbA1c
+                uacr_baseline_strict=300.0, sbp_baseline_strict=140.0,
+                age_at_index=65.0, sex="M"))
+        return cal.filter_kfre_comparable(pats)
+
+    params = dict(q=1.52, k_hf=0.0141, w_a1c=0.0144, w_uacr=0.0180, w_sbp=0.0108)
+    dev = dict(hba1c=7.5, sbp=135.0, uacr=100.0)
+    low = cal.evaluate_kfre_benchmark(params, cohort(6.0), development_defaults=dev)
+    high = cal.evaluate_kfre_benchmark(params, cohort(12.0), development_defaults=dev)
+    assert low and high
+    for key in low:
+        assert low[key]["auc_nephroq"] == pytest.approx(high[key]["auc_nephroq"])
+
+
+def test_mode_c_excludes_incomplete_followup():
+    """A patient followed for only 2.6 years must NOT be scored as 'no event at
+    5 years' -- their outcome at that horizon is unknown."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+    import numpy as np
+
+    def pat(pid, tmax):
+        n = 8
+        t = np.linspace(0, tmax, n)
+        return dict(patient_id=pid, t=t, e=np.linspace(50, 40, n), egfr0=50.0,
+                    baseline_egfr=50.0,
+                    hba1c_series=np.full(n, 8.0), uacr_series=np.full(n, 300.0),
+                    sbp_series=np.full(n, 140.0),
+                    uacr_baseline_observed=True, hba1c_baseline_observed=True,
+                    hba1c_baseline_strict=8.0, uacr_baseline_strict=300.0,
+                    sbp_baseline_strict=140.0, age_at_index=65.0, sex="M")
+
+    short = cal.filter_kfre_comparable([pat(f"s{i}", 2.6) for i in range(20)])
+    dev = dict(hba1c=7.5, sbp=135.0, uacr=100.0)
+    params = dict(q=1.52, k_hf=0.0141, w_a1c=0.0144, w_uacr=0.0180, w_sbp=0.0108)
+    res = cal.evaluate_kfre_benchmark(params, short, horizons=(5.0,), development_defaults=dev)
+    # nobody has 5 years of follow-up -> the 5-year horizon must yield nothing,
+    # rather than silently labeling everyone event-free.
+    assert res is None or "year_5.0" not in res
+
+
+def test_unpack_does_not_overflow():
+    """The logistic reparameterization must be numerically stable at extreme
+    values (it previously raised RuntimeWarning: overflow encountered in exp)."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+    import numpy as np
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        vals = cal.unpack(np.array([-800.0, 800.0, 0.0, 0.0, 0.0]))
+    assert np.all(np.isfinite(vals))
+    assert np.all(vals >= cal.LO) and np.all(vals <= cal.HI)
