@@ -81,10 +81,24 @@ st.caption(_("active_calibration", src=src_display))
 if CALIB_TIER == "public":
     st.warning(_("demo_mode"))
 elif CALIBRATION_QUALITY != "pass":
-    # Render the machine-readable flags as a human-readable list
-    # (e.g. "high_chi2_per_observation" -> "high chi2 per observation").
+    # SAFE-BY-DEFAULT POLICY.
+    # Previously the app displayed a warning but still PROJECTED with the flagged
+    # parameters -- so in a clinician demo the curves on screen came from a
+    # calibration the pipeline itself had judged untrustworthy. A warning above a
+    # plot does not undo the plot. Now the flagged calibration is NOT used unless
+    # the user explicitly opts in (research mode); otherwise we fall back to the
+    # public calibration, which at least is honest about being a demo.
     _reasons = ", ".join(str(r).replace("_", " ") for r in (CALIBRATION_QUALITY_REASONS or [])) or "—"
     st.error(_("quality_warning", reasons=_reasons))
+    _use_flagged = st.checkbox(_("quality_optin"), value=False)
+    if _use_flagged:
+        st.error(_("using_flagged"))
+    else:
+        Q_POP, KHF_POP, W_POP = Q_POP_PUBLIC, KHF_POP_PUBLIC, W_POP_PUBLIC
+        BOOTSTRAP_PARAMS = None
+        CALIB_TIER = "public"
+        st.info(_("fell_back_public"))
+        st.warning(_("demo_mode"))
 
 # ------------------------------------------------------------------------------
 # Seed widget state once, then apply any pending preset BEFORE the widgets are
@@ -244,7 +258,10 @@ if not use_cystatin:
     st.warning(_("cystatin_warning"))
 
 with st.expander(_("expander_title")):
-    st.markdown(_("expander_body"))
+    # The description must match the ACTIVE calibration: the public tier really is a
+    # hierarchical Bayesian fit on synthetic data, but a MIMIC calibration produced by
+    # calibrate_mimic.py is robust nonlinear least squares + patient-level bootstrap.
+    st.markdown(_("expander_body_mimic" if CALIB_TIER == "mimic" else "expander_body"))
 
 st.divider()
 st.caption(_("footer"))
