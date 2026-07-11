@@ -46,6 +46,8 @@ import argparse, json, os, subprocess, sys, datetime, time
 import numpy as np
 import pandas as pd
 from scipy.optimize import least_squares
+from scipy.special import expit
+from scipy.stats import rankdata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -146,7 +148,9 @@ def load_cohort(csv_path):
 
 LO = np.array([0.5, 1e-4, 1e-4, 1e-4, 1e-4])
 HI = np.array([3.0, 0.06, 0.06, 0.06, 0.06])
-def unpack(p): return LO + (HI - LO) / (1 + np.exp(-p))
+# expit is the numerically stable logistic: 1/(1+exp(-p)) overflows in exp for
+# very negative p (harmless here, but it emits RuntimeWarnings during fitting).
+def unpack(p): return LO + (HI - LO) * expit(p)
 def pack(th):
     z = np.clip((th - LO) / (HI - LO), 1e-4, 1 - 1e-4)
     return np.log(z / (1 - z))
@@ -271,42 +275,91 @@ def kfre_risk(age, sex, egfr, uacr_mg_g, horizon_years=2.0):
 
 
 def _auc(scores, labels):
-    """AUC via the Mann-Whitney rank statistic (no sklearn dependency)."""
+    """AUC via the Mann-Whitney rank statistic.
+
+    Uses rankdata(method="average") so that TIED scores share the average rank.
+    An argsort-of-argsort assigns tied scores arbitrary consecutive ranks, which
+    biases the statistic -- and ties are common here (rounded risks, patients
+    with near-identical trajectories, and the floor/ceiling of the eGFR
+    projection). With correct tie handling, a score that cannot separate the
+    classes at all returns exactly 0.5.
+    """
     scores = np.asarray(scores, dtype=float)
     labels = np.asarray(labels, dtype=int)
-    pos, neg = scores[labels == 1], scores[labels == 0]
-    if len(pos) == 0 or len(neg) == 0:
+    pos_mask = labels == 1
+    n_pos, n_neg = int(pos_mask.sum()), int((~pos_mask).sum())
+    if n_pos == 0 or n_neg == 0:
         return None
-    ranks = np.argsort(np.argsort(np.concatenate([pos, neg]))) + 1
-    r_pos = ranks[:len(pos)].sum()
-    return float((r_pos - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))
+    ranks = rankdata(scores, method="average")
+    r_pos = ranks[pos_mask].sum()
+    return float((r_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
 
 
-def evaluate_kfre_benchmark(params, patients, horizons=(2.0, 5.0)):
+def compute_development_defaults(patients):
     """
-    MODE C -- the actual head-to-head risk comparison against KFRE, on the
-    filter_kfre_comparable() cohort (same patients for both models).
+    Population fallback values for covariates that are MISSING AT BASELINE,
+    computed ONLY from the development (training) set's BASELINE values.
 
-    Both models are reduced to a RISK SCORE and compared by discrimination (AUC)
-    against the same outcome:
+    This exists to prevent temporal leakage. The obvious-looking fallback --
+    "use the median of this patient's own series" -- is WRONG for any
+    baseline-anchored evaluation, because that series contains measurements
+    taken AFTER the index date. A prediction that is supposed to be made at
+    baseline would then be using the patient's own future. These defaults are
+    stored in the calibration JSON so the app and any evaluation reuse exactly
+    the same numbers.
+    """
+    def _med(key):
+        vals = [p.get(key) for p in patients]
+        vals = [float(v) for v in vals if v is not None and np.isfinite(v)]
+        return float(np.median(vals)) if vals else None
+    return dict(hba1c=_med("hba1c_baseline_strict"),
+                sbp=_med("sbp_baseline_strict"),
+                uacr=_med("uacr_baseline_strict"))
+
+
+def evaluate_kfre_benchmark(params, patients, horizons=(2.0, 5.0),
+                            development_defaults=None,
+                            min_followup_tolerance=0.25,
+                            egfr_range=(15.0, 60.0)):
+    """
+    MODE C -- EXPLORATORY KFRE SCORE COMPARISON (using an eGFR<15 proxy outcome).
+
+    Deliberately NOT called a "KFRE validation": KFRE is defined on TREATED
+    kidney failure (dialysis/transplant), and the outcome used here is a PROXY
+    (observed eGFR<15 within the horizon). The question actually answered is
+    "which score ranks patients better for reaching a modeled eGFR<15
+    threshold", which is related to, but not the same as, KFRE's target.
+
+    Both models are scored on the SAME patients and compared by discrimination:
       - KFRE     : P(treated kidney failure by horizon) from age/sex/eGFR/UACR.
-      - NephroQ  : mechanistic projection from baseline covariates held constant;
-                   the score is -eGFR(horizon), i.e. the lower the projected
-                   eGFR, the higher the risk (a monotone transform of risk, which
-                   is all AUC needs).
+      - NephroQ  : mechanistic projection from baseline covariates held constant.
+                   The score is -eGFR(horizon) -- a monotone transform of risk,
+                   which is all AUC needs. NOTE this is a SCORE, not a
+                   probability: Brier score, calibration slope/intercept and
+                   decision-curve analysis are therefore NOT computed here. To
+                   get a probability, the bootstrap parameter sets can be used
+                   (fraction of resamples crossing the threshold before t) --
+                   that is the outstanding work for a full comparison.
 
-    !! PROXY OUTCOME -- READ THIS. The true KFRE outcome is treated kidney
-    failure (dialysis/transplant). That is NOT reliably recoverable from the
-    labs alone, so the outcome used here is a PROXY: the patient's OBSERVED eGFR
-    falling below 15 mL/min/1.73m2 at any observed visit within the horizon.
-    This proxy will disagree with real KRT initiation, so the resulting AUCs
-    describe discrimination for "reaching a modeled eGFR threshold", not for
-    dialysis initiation. Extracting real KRT status from MIMIC-IV procedure/ICD
-    codes is the outstanding piece of work before this can be reported as a true
-    KFRE benchmark. See docs/KNOWN_ISSUES.md.
+    NO TEMPORAL LEAKAGE: a missing baseline covariate is filled from
+    `development_defaults` (medians of BASELINE values in the training set),
+    never from the patient's own later measurements.
+
+    FOLLOW-UP: a patient is only scored at horizon h if they were actually
+    followed to (approximately) h. Otherwise a patient with 2.6 years of
+    follow-up would be silently labeled "no event at 5 years", which is
+    outcome misclassification. The methodologically correct treatment is
+    survival analysis with censoring (time-dependent AUC, IPCW, Brier, and --
+    with real KRT -- death as a competing risk); this simple complete-follow-up
+    restriction is a stopgap, not a substitute. See docs/KNOWN_ISSUES.md.
     """
     if not patients:
         return None
+    if development_defaults is None:
+        # Fall back to the cohort's own BASELINE medians (still never a
+        # patient's own future), but this should normally be passed in from
+        # the training set.
+        development_defaults = compute_development_defaults(patients)
     q, khf = params["q"], params["k_hf"]
     w = np.array([params["w_a1c"], params["w_uacr"], params["w_sbp"]])
     out = {}
@@ -315,24 +368,37 @@ def evaluate_kfre_benchmark(params, patients, horizons=(2.0, 5.0)):
             continue
         kfre_scores, nq_scores, labels = [], [], []
         n_hba1c_imputed = 0
+        n_excluded_followup = 0
+        n_excluded_egfr = 0
         for pac in patients:
             t, e = pac["t"], pac["e"]
+            egfr0 = float(pac["baseline_egfr"])
+            if egfr_range is not None and not (egfr_range[0] <= egfr0 < egfr_range[1]):
+                n_excluded_egfr += 1
+                continue      # incident-prediction cohort (default G3a-G4): a
+                              # patient already below the threshold is in the very
+                              # state we are trying to predict.
+            if t.max() < (h - min_followup_tolerance):
+                n_excluded_followup += 1
+                continue      # incomplete follow-up: we do NOT know their outcome at h
             within = t <= h
-            if not within.any() or t.max() < h * 0.5:
-                continue      # not enough follow-up to know the outcome
+            if not within.any():
+                continue
             label = int(np.nanmin(e[within]) < core.DIALYSIS_eGFR)
 
+            # Baseline covariates ONLY. Missing -> development-set default.
             a1c = pac.get("hba1c_baseline_strict")
             if a1c is None or not np.isfinite(a1c):
-                a1c = float(np.nanmedian(pac["hba1c_series"]))   # documented fallback
+                a1c = development_defaults.get("hba1c")
                 n_hba1c_imputed += 1
-            uacr_b = float(pac["uacr_baseline_strict"])
             sbp_b = pac.get("sbp_baseline_strict")
             if sbp_b is None or not np.isfinite(sbp_b):
-                sbp_b = float(np.nanmedian(pac["sbp_series"]))
-            egfr0 = float(pac["baseline_egfr"])
+                sbp_b = development_defaults.get("sbp")
+            if a1c is None or sbp_b is None:
+                continue      # no usable baseline value and no development default
+            uacr_b = float(pac["uacr_baseline_strict"])
 
-            insult = core.metabolic_hazard(a1c, uacr_b, sbp_b, w[0], w[1], w[2])
+            insult = core.metabolic_hazard(float(a1c), uacr_b, float(sbp_b), w[0], w[1], w[2])
             egfr_h = core.predict_egfr_at(K0_FIX, khf, q, 1.0, insult,
                                           N_of_egfr(egfr0), np.array([h]))[0]
             nq_scores.append(-float(egfr_h))     # lower projected eGFR = higher risk
@@ -347,7 +413,12 @@ def evaluate_kfre_benchmark(params, patients, horizons=(2.0, 5.0)):
             auc_kfre=_auc(kfre_scores, labels),
             auc_nephroq=_auc(nq_scores, labels),
             n_hba1c_imputed_for_nephroq=n_hba1c_imputed,
+            n_excluded_incomplete_followup=n_excluded_followup,
+            n_excluded_egfr_out_of_range=n_excluded_egfr,
+            egfr_range=list(egfr_range) if egfr_range else None,
+            nephroq_output="score (-eGFR at horizon), NOT a probability",
             outcome="PROXY: observed eGFR<15 within horizon (NOT treated kidney failure)",
+            interpretation="exploratory score comparison; not a KFRE validation",
         )
     return out or None
 
@@ -722,11 +793,19 @@ def main():
                     help="Skip the primary(observed-only)/sensitivity(imputed-included) split "
                          "and fit the full cohort directly as before. Useful for quick "
                          "iteration; not recommended for a result you plan to report.")
+    ap.add_argument("--kfre-egfr-min", type=float, default=15.0,
+                    help="Lower bound of baseline eGFR for the MODE C cohort. Default 15 "
+                         "excludes patients already at/below the threshold being predicted.")
+    ap.add_argument("--kfre-egfr-max", type=float, default=60.0,
+                    help="Upper bound of baseline eGFR for the MODE C cohort (default 60 = "
+                         "an incident G3a-G4 prediction cohort).")
     ap.add_argument("--n-bootstrap", type=int, default=15,
                     help="Number of patient-level bootstrap resamples for the app's "
                          "parameter-uncertainty band. 0 disables (app falls back to a point "
                          "estimate only). Each replicate is a cheap 1-multistart refit "
-                         "seeded at the point estimate.")
+                         "seeded at the point estimate. SIZING: the default 15 is a PIPELINE "
+                         "SMOKE TEST, not a result -- use 100-200 for a preliminary analysis "
+                         "and 500-1000 for a number you intend to publish.")
     a = ap.parse_args()
     if not a.from_csv and not a.mimic_dir:
         ap.error("--mimic-dir is required unless --from-csv is given.")
@@ -822,6 +901,15 @@ def main():
         n_patients_available=len(patients),
     )
 
+    # Population fallbacks for MISSING BASELINE covariates, computed from the
+    # TRAINING set's baseline values only. Stored in the JSON so evaluation and
+    # the app reuse identical numbers, and so we never fill a baseline gap with
+    # the patient's own future measurements (temporal leakage).
+    result["development_defaults"] = compute_development_defaults(train)
+    print(f"[diagnostics] Development defaults (training-set BASELINE medians, used to fill "
+         f"missing baseline covariates without temporal leakage): "
+         f"{result['development_defaults']}")
+
     if a.n_bootstrap > 0:
         result["bootstrap_params"] = bootstrap_calibrate(train, result, n_boot=a.n_bootstrap,
                                                           max_patients=a.max_patients)
@@ -865,19 +953,26 @@ def main():
                      f"rmse={baseline_forecast[key]['rmse_mL_min']:.1f} mL/min")
 
         # ---- MODE C: direct head-to-head against KFRE (same patients) ----
-        kfre_bench = evaluate_kfre_benchmark(result, kfre_test)
+        kfre_bench = evaluate_kfre_benchmark(
+            result, kfre_test,
+            development_defaults=result["development_defaults"],
+            egfr_range=(a.kfre_egfr_min, a.kfre_egfr_max))
         result["holdout_kfre_benchmark"] = kfre_bench
         if kfre_bench:
-            print("[diagnostics] Held-out, MODE C (DIRECT KFRE BENCHMARK -- discrimination, "
-                  "same patients for both models):")
+            print("[diagnostics] Held-out, MODE C (EXPLORATORY KFRE SCORE COMPARISON -- "
+                  "discrimination on the SAME patients; NOT a KFRE validation):")
             for key, v in kfre_bench.items():
                 a_k = v["auc_kfre"]; a_n = v["auc_nephroq"]
                 print(f"      {key}: n={v['n_patients']} ({v['n_events']} events)  "
                      f"AUC KFRE={a_k:.3f}  AUC NephroQ={a_n:.3f}  "
-                     f"(HbA1c imputed for NephroQ in {v['n_hba1c_imputed_for_nephroq']} patients)")
+                     f"[HbA1c filled from development defaults in "
+                     f"{v['n_hba1c_imputed_for_nephroq']}; excluded: "
+                     f"{v['n_excluded_incomplete_followup']} incomplete follow-up, "
+                     f"{v['n_excluded_egfr_out_of_range']} eGFR out of range {v['egfr_range']}]")
             print("      NOTE: outcome is a PROXY (observed eGFR<15 within horizon), NOT treated "
-                  "kidney failure. Real KRT status from MIMIC procedure/ICD codes is still "
-                  "required before reporting this as a true KFRE benchmark.")
+                  "kidney failure; NephroQ contributes a SCORE, not a probability (so no Brier/"
+                  "calibration/decision-curve). Report this as an 'exploratory KFRE score "
+                  "comparison', never as a KFRE validation. See docs/KNOWN_ISSUES.md.")
         else:
             print("[diagnostics] MODE C (KFRE benchmark) skipped -- too few eligible patients "
                   "or no outcome variation in the held-out set.")
