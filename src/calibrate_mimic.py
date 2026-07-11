@@ -20,10 +20,12 @@ patient data. It is not pushed to git (see .gitignore). It is the file that:
 METHODOLOGY NOTES (see docs/KNOWN_ISSUES.md for full detail):
   - Uses the SAME model_core simulator as the app (no more duplicated,
     silently-diverging integrators).
-  - Covariates (HbA1c/UACR/SBP) are still a per-patient scalar (median),
-    NOT a proper baseline-at-index-date or time-varying covariate. This is
-    a known simplification -- see docs/KNOWN_ISSUES.md item on temporal
-    covariate handling.
+  - Covariates (HbA1c/UACR/SBP) are TIME-VARYING series (one value per visit,
+    from mimic_loader.py's three-tier model: per-visit measurement > patient
+    baseline > population imputation). What is still NOT enforced is a strict
+    baseline-at-index-date definition, and the index date itself is simply the
+    first available creatinine -- with no AKI exclusion. See docs/KNOWN_ISSUES.md
+    ("temporal covariate handling" and "index date is not an AKI-free baseline").
   - Observations are weighted so that no single heavily-monitored patient
     dominates the fit (each patient contributes ~equal total weight,
     regardless of how many creatinine measurements they have).
@@ -102,6 +104,12 @@ def load_cohort(csv_path):
                   hba1c_series=g["hba1c"].values.astype(float),
                   uacr_series=g["uacr"].values.astype(float),
                   sbp_series=g["sbp"].values.astype(float))
+        # KFRE demographics (MODE C). Exported by mimic_loader; absent in older
+        # CSVs / non-MIMIC sources, in which case the KFRE benchmark is skipped.
+        for col in ("age_at_index", "sex", "baseline_egfr"):
+            if col in g.columns:
+                v = g[col].iloc[0]
+                pat[col] = (float(v) if col != "sex" else str(v)) if pd.notna(v) else None
         if has_flags:
             # patient-level flag = ALL rows imputed (no real measurement anywhere
             # in the trajectory) -- with time-varying covariates, a patient with
@@ -167,7 +175,7 @@ def bootstrap_calibrate(patients, point_estimate, n_boot=15, max_patients=None, 
 
     This runs ONCE, offline, during calibration -- the app then just
     RE-SIMULATES (cheap) a patient's projection under each of these
-    parameter sets to get a prediction interval, instead of running any
+    parameter sets to get a parameter-uncertainty band, instead of running any
     fitting at request time. See docs/KNOWN_ISSUES.md "uncertainty
     intervals" and app_web.py.
     """
@@ -198,18 +206,150 @@ def bootstrap_calibrate(patients, point_estimate, n_boot=15, max_patients=None, 
 
 def filter_kfre_comparable(patients):
     """
-    The cohort for a genuine, KFRE-comparable baseline forecast: patients
-    whose HbA1c AND UACR were REALLY observed at or before their index
-    date (see mimic_loader.py's flag_baseline_observed) -- not the more
-    permissive "not all rows imputed" criterion used for the primary/
-    sensitivity split (which allows a real measurement anywhere in the
-    trajectory, including well after baseline). KFRE itself is a baseline
-    model (age, sex, eGFR, UACR at an index date), so the comparison cohort
-    must satisfy the same "known at time zero" standard.
+    Cohort for the MODE C head-to-head benchmark against KFRE.
+
+    KFRE is a 4-variable baseline model: age, sex, eGFR, UACR at an index date.
+    It does NOT use HbA1c. So the eligibility criteria here are exactly those
+    four, all known at/before the index date -- previously this function also
+    required an observed baseline HbA1c, which needlessly shrank the cohort and
+    made it "the cohort NephroQ happens to need" rather than "the cohort KFRE
+    is defined on".
+
+    NephroQ additionally needs HbA1c. Both models are therefore scored on
+    EXACTLY these same patients, and NephroQ's handling of a missing baseline
+    HbA1c (population-median fallback) is recorded per patient in
+    `hba1c_imputed_for_benchmark`, so the comparison stays like-for-like and the
+    handling is documented rather than hidden.
     """
-    if not patients or "hba1c_baseline_observed" not in patients[0]:
+    if not patients or "uacr_baseline_observed" not in patients[0]:
         return []   # baseline flags not available (e.g. older CSV / non-MIMIC source)
-    return [p for p in patients if p.get("hba1c_baseline_observed") and p.get("uacr_baseline_observed")]
+    out = []
+    for p in patients:
+        if not p.get("uacr_baseline_observed"):
+            continue
+        if p.get("age_at_index") is None or p.get("sex") is None:
+            continue          # KFRE demographics not exported (older CSV)
+        if not np.isfinite(p.get("baseline_egfr") or np.nan):
+            continue
+        u = p.get("uacr_baseline_strict")
+        if u is None or not np.isfinite(u) or u <= 0:
+            continue
+        p = dict(p)
+        p["hba1c_imputed_for_benchmark"] = not bool(p.get("hba1c_baseline_observed"))
+        out.append(p)
+    return out
+
+
+# ------------------------------------------------------------------------------
+# MODE C -- direct KFRE benchmark
+# ------------------------------------------------------------------------------
+# 4-variable Kidney Failure Risk Equation (Tangri et al., JAMA 2011; the
+# North-American-calibrated baseline survivals are used below). Predicts the
+# probability of TREATED kidney failure (dialysis or transplant) within 2 and 5
+# years from age, sex, eGFR and UACR at an index date.
+#
+# !! VERIFY BEFORE PUBLICATION: these coefficients and baseline survivals are
+# transcribed from the published equation and are NOT independently validated
+# here. Check them against the source paper before reporting any number.
+KFRE_COEF = dict(age=-0.2201, male=0.2467, egfr=-0.5567, log_acr=0.4510)
+KFRE_CENTER = dict(age=7.036, male=0.5642, egfr=7.222, log_acr=5.137)
+KFRE_S0 = {2.0: 0.9832, 5.0: 0.9365}   # baseline survival at 2 and 5 years
+
+
+def kfre_risk(age, sex, egfr, uacr_mg_g, horizon_years=2.0):
+    """Probability of treated kidney failure within `horizon_years`.
+    uacr in mg/g; sex 'M'/'F'; egfr in mL/min/1.73m2."""
+    if horizon_years not in KFRE_S0:
+        raise ValueError(f"KFRE baseline survival only defined for {list(KFRE_S0)}")
+    male = 1.0 if str(sex).upper().startswith("M") else 0.0
+    acr = max(float(uacr_mg_g), 1e-6)
+    xb = (KFRE_COEF["age"]     * (age / 10.0        - KFRE_CENTER["age"]) +
+          KFRE_COEF["male"]    * (male              - KFRE_CENTER["male"]) +
+          KFRE_COEF["egfr"]    * (egfr / 5.0        - KFRE_CENTER["egfr"]) +
+          KFRE_COEF["log_acr"] * (np.log(acr)       - KFRE_CENTER["log_acr"]))
+    return float(1.0 - KFRE_S0[horizon_years] ** np.exp(xb))
+
+
+def _auc(scores, labels):
+    """AUC via the Mann-Whitney rank statistic (no sklearn dependency)."""
+    scores = np.asarray(scores, dtype=float)
+    labels = np.asarray(labels, dtype=int)
+    pos, neg = scores[labels == 1], scores[labels == 0]
+    if len(pos) == 0 or len(neg) == 0:
+        return None
+    ranks = np.argsort(np.argsort(np.concatenate([pos, neg]))) + 1
+    r_pos = ranks[:len(pos)].sum()
+    return float((r_pos - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))
+
+
+def evaluate_kfre_benchmark(params, patients, horizons=(2.0, 5.0)):
+    """
+    MODE C -- the actual head-to-head risk comparison against KFRE, on the
+    filter_kfre_comparable() cohort (same patients for both models).
+
+    Both models are reduced to a RISK SCORE and compared by discrimination (AUC)
+    against the same outcome:
+      - KFRE     : P(treated kidney failure by horizon) from age/sex/eGFR/UACR.
+      - NephroQ  : mechanistic projection from baseline covariates held constant;
+                   the score is -eGFR(horizon), i.e. the lower the projected
+                   eGFR, the higher the risk (a monotone transform of risk, which
+                   is all AUC needs).
+
+    !! PROXY OUTCOME -- READ THIS. The true KFRE outcome is treated kidney
+    failure (dialysis/transplant). That is NOT reliably recoverable from the
+    labs alone, so the outcome used here is a PROXY: the patient's OBSERVED eGFR
+    falling below 15 mL/min/1.73m2 at any observed visit within the horizon.
+    This proxy will disagree with real KRT initiation, so the resulting AUCs
+    describe discrimination for "reaching a modeled eGFR threshold", not for
+    dialysis initiation. Extracting real KRT status from MIMIC-IV procedure/ICD
+    codes is the outstanding piece of work before this can be reported as a true
+    KFRE benchmark. See docs/KNOWN_ISSUES.md.
+    """
+    if not patients:
+        return None
+    q, khf = params["q"], params["k_hf"]
+    w = np.array([params["w_a1c"], params["w_uacr"], params["w_sbp"]])
+    out = {}
+    for h in horizons:
+        if h not in KFRE_S0:
+            continue
+        kfre_scores, nq_scores, labels = [], [], []
+        n_hba1c_imputed = 0
+        for pac in patients:
+            t, e = pac["t"], pac["e"]
+            within = t <= h
+            if not within.any() or t.max() < h * 0.5:
+                continue      # not enough follow-up to know the outcome
+            label = int(np.nanmin(e[within]) < core.DIALYSIS_eGFR)
+
+            a1c = pac.get("hba1c_baseline_strict")
+            if a1c is None or not np.isfinite(a1c):
+                a1c = float(np.nanmedian(pac["hba1c_series"]))   # documented fallback
+                n_hba1c_imputed += 1
+            uacr_b = float(pac["uacr_baseline_strict"])
+            sbp_b = pac.get("sbp_baseline_strict")
+            if sbp_b is None or not np.isfinite(sbp_b):
+                sbp_b = float(np.nanmedian(pac["sbp_series"]))
+            egfr0 = float(pac["baseline_egfr"])
+
+            insult = core.metabolic_hazard(a1c, uacr_b, sbp_b, w[0], w[1], w[2])
+            egfr_h = core.predict_egfr_at(K0_FIX, khf, q, 1.0, insult,
+                                          N_of_egfr(egfr0), np.array([h]))[0]
+            nq_scores.append(-float(egfr_h))     # lower projected eGFR = higher risk
+            kfre_scores.append(kfre_risk(pac["age_at_index"], pac["sex"], egfr0, uacr_b, h))
+            labels.append(label)
+
+        if len(labels) < 10 or len(set(labels)) < 2:
+            continue    # AUC undefined / meaningless
+        out[f"year_{h}"] = dict(
+            n_patients=len(labels),
+            n_events=int(sum(labels)),
+            auc_kfre=_auc(kfre_scores, labels),
+            auc_nephroq=_auc(nq_scores, labels),
+            n_hba1c_imputed_for_nephroq=n_hba1c_imputed,
+            outcome="PROXY: observed eGFR<15 within horizon (NOT treated kidney failure)",
+        )
+    return out or None
 
 
 def evaluate_baseline_forecast(params, patients, horizons=(2.0, 5.0), tolerance_years=0.5):
@@ -218,8 +358,17 @@ def evaluate_baseline_forecast(params, patients, horizons=(2.0, 5.0), tolerance_
     "three evaluation modes". Uses ONLY each patient's BASELINE (first
     observed) HbA1c/UACR/SBP, held CONSTANT from the index date forward
     (via model_core's constant-insult engine, NOT the dynamic one), and
-    predicts eGFR at fixed horizons. This is what should be compared
-    against KFRE -- unlike evaluate_holdout() above (MODE A, dynamic
+    predicts eGFR at fixed horizons.
+
+    IMPORTANT -- this is NOT a KFRE benchmark. KFRE predicts the PROBABILITY of
+    treated kidney failure (dialysis/transplant) by 2 and 5 years from
+    age+sex+eGFR+UACR. Mode B answers a different question: how close is the
+    predicted eGFR(2y)/eGFR(5y) to the observed eGFR. Both are useful, but they
+    are not interchangeable, and Mode B must never be reported as "KFRE-
+    comparable". The actual head-to-head risk benchmark is MODE C
+    (kfre_risk() / evaluate_kfre_benchmark() below).
+
+    Unlike evaluate_holdout() above (MODE A, dynamic
     reconstruction), which uses each patient's full observed covariate
     history and therefore measures a different, easier task (reconstructing
     a trajectory given knowledge of how it evolved, not forecasting it
@@ -575,7 +724,7 @@ def main():
                          "iteration; not recommended for a result you plan to report.")
     ap.add_argument("--n-bootstrap", type=int, default=15,
                     help="Number of patient-level bootstrap resamples for the app's "
-                         "prediction interval. 0 disables (app falls back to a point "
+                         "parameter-uncertainty band. 0 disables (app falls back to a point "
                          "estimate only). Each replicate is a cheap 1-multistart refit "
                          "seeded at the point estimate.")
     a = ap.parse_args()
@@ -600,17 +749,21 @@ def main():
         return
 
     diagnostics = diagnose_cohort(patients)
-    # Empirical measurement-noise estimate: the assumed 3.5 mL/min is an
-    # instrument-only floor, but the median within-patient volatility (scatter
-    # around each patient's own straight-line trend) is the honest estimate of
-    # how noisy these trajectories actually are. Using it makes chi2/n
-    # interpretable (chi2/n = (rmse/sigma)^2); reporting chi2/n against an
-    # unrealistically small 3.5 inflates it ~6x for no reason. Floored at 3.5 so
-    # we never claim MORE precision than the instrument. See docs/KNOWN_ISSUES.md.
+    # LONGITUDINAL RESIDUAL SCALE (NOT "measurement noise").
+    # This is the median within-patient dispersion around each patient's own
+    # straight-line trend. It is deliberately NOT called a measurement-noise
+    # estimate, because it conflates several sources: analytical error, biological
+    # variability, genuine clinical change, AKI episodes, irregular sampling, eGFR
+    # equation error, and the structural error of the straight line used as the
+    # reference. It is a residual SCALE, useful for making chi2/n interpretable
+    # (chi2/n = (rmse/scale)^2) -- reporting chi2/n against the 3.5 mL/min
+    # instrument-only floor inflates it several-fold for no good reason. Floored
+    # at 3.5 so we never claim more precision than the instrument itself.
+    # See docs/KNOWN_ISSUES.md.
     _mv = diagnostics.get("median_volatility_mL_min")
-    noise_sd_emp = float(max(_mv, 3.5)) if (_mv and np.isfinite(_mv)) else 3.5
-    print(f"[diagnostics] Empirical measurement-noise estimate sigma={noise_sd_emp:.1f} mL/min "
-         f"(median within-patient volatility, floored at 3.5) used for chi2/n reporting "
+    resid_scale = float(max(_mv, 3.5)) if (_mv and np.isfinite(_mv)) else 3.5
+    print(f"[diagnostics] Empirical longitudinal residual scale = {resid_scale:.1f} mL/min "
+         f"(within-patient dispersion; NOT pure measurement noise) used for chi2/n reporting "
          f"and the quality gate. The fitted parameters are unaffected by this choice "
          f"(a global residual scale does not move the optimum); only the reported chi2/n is.")
     if missingness:
@@ -657,9 +810,9 @@ def main():
              "faster fit with essentially the same precision for 5 parameters.")
 
     print("\n      --- PRIMARY analysis ---")
-    result = calibrate(train, max_patients=a.max_patients, noise_sd=noise_sd_emp)
+    result = calibrate(train, max_patients=a.max_patients, noise_sd=resid_scale)
     result["diagnostics"] = diagnostics
-    result["noise_sd_empirical"] = noise_sd_emp
+    result["resid_scaleirical"] = resid_scale
     result["missingness"] = missingness
     result["chronic_only_filter"] = bool(a.chronic_only)
     result["max_patients_subsample"] = a.max_patients
@@ -678,8 +831,8 @@ def main():
     if sensitivity_patients is not None and len(sensitivity_patients) > len(primary_patients):
         print("\n      --- SENSITIVITY analysis (full cohort, imputation included) ---")
         sens_train, sens_test = split_train_test(sensitivity_patients, test_frac=a.test_frac)
-        sens_result = calibrate(sens_train, max_patients=a.max_patients, seed=1, noise_sd=noise_sd_emp)
-        sens_holdout = evaluate_holdout(sens_result, sens_test, noise_sd=noise_sd_emp)
+        sens_result = calibrate(sens_train, max_patients=a.max_patients, seed=1, noise_sd=resid_scale)
+        sens_holdout = evaluate_holdout(sens_result, sens_test, noise_sd=resid_scale)
         result["sensitivity_analysis"] = dict(
             q=sens_result["q"], k_hf=sens_result["k_hf"],
             w_a1c=sens_result["w_a1c"], w_uacr=sens_result["w_uacr"], w_sbp=sens_result["w_sbp"],
@@ -691,7 +844,7 @@ def main():
              f"w_uacr={sens_result['w_uacr']:.4f}  (n={sens_result['n_patients']}) "
              f"-- compare against the primary result printed below.")
 
-    holdout = evaluate_holdout(result, test, noise_sd=noise_sd_emp)
+    holdout = evaluate_holdout(result, test, noise_sd=resid_scale)
     if holdout:
         result["holdout_dynamic_reconstruction"] = holdout
         print(f"\n[diagnostics] Held-out, MODE A (dynamic reconstruction, uses full covariate "
@@ -702,15 +855,32 @@ def main():
     if kfre_test:
         baseline_forecast = evaluate_baseline_forecast(result, kfre_test)
         result["holdout_baseline_forecast"] = baseline_forecast
-        print(f"[diagnostics] Held-out, MODE B (baseline forecast, baseline covariates held "
-             f"constant -- THIS is the KFRE-comparable metric): "
-             f"{kfre_test and len(kfre_test)}/{len(test)} held-out patients have observed "
-             f"baseline HbA1c+UACR.")
+        print(f"[diagnostics] Held-out, MODE B (baseline eGFR forecast, baseline covariates "
+             f"held constant -- an eGFR-accuracy metric, NOT a KFRE benchmark; see MODE C): "
+             f"{kfre_test and len(kfre_test)}/{len(test)} held-out patients are KFRE-eligible.")
         for h in (2.0, 5.0):
             key = f"year_{h}"
             if key in baseline_forecast:
                 print(f"      Year {h}: n={baseline_forecast[key]['n_patients']}  "
                      f"rmse={baseline_forecast[key]['rmse_mL_min']:.1f} mL/min")
+
+        # ---- MODE C: direct head-to-head against KFRE (same patients) ----
+        kfre_bench = evaluate_kfre_benchmark(result, kfre_test)
+        result["holdout_kfre_benchmark"] = kfre_bench
+        if kfre_bench:
+            print("[diagnostics] Held-out, MODE C (DIRECT KFRE BENCHMARK -- discrimination, "
+                  "same patients for both models):")
+            for key, v in kfre_bench.items():
+                a_k = v["auc_kfre"]; a_n = v["auc_nephroq"]
+                print(f"      {key}: n={v['n_patients']} ({v['n_events']} events)  "
+                     f"AUC KFRE={a_k:.3f}  AUC NephroQ={a_n:.3f}  "
+                     f"(HbA1c imputed for NephroQ in {v['n_hba1c_imputed_for_nephroq']} patients)")
+            print("      NOTE: outcome is a PROXY (observed eGFR<15 within horizon), NOT treated "
+                  "kidney failure. Real KRT status from MIMIC procedure/ICD codes is still "
+                  "required before reporting this as a true KFRE benchmark.")
+        else:
+            print("[diagnostics] MODE C (KFRE benchmark) skipped -- too few eligible patients "
+                  "or no outcome variation in the held-out set.")
     else:
         print("[diagnostics] MODE B (baseline forecast, KFRE-comparable) skipped -- no "
              "held-out patients have a strictly observed baseline HbA1c AND UACR. See "
