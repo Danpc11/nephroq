@@ -279,19 +279,47 @@ def test_bootstrap_disabled_returns_empty_list():
     assert cal.bootstrap_calibrate([{}], point, n_boot=0) == []
 
 def test_filter_kfre_comparable():
-    """Only patients with BOTH hba1c_baseline_observed and uacr_baseline_observed
-    True should pass the KFRE-comparable filter."""
+    """The KFRE cohort is defined by KFRE's OWN four variables -- age, sex,
+    baseline eGFR and baseline UACR -- and must NOT require HbA1c, which KFRE
+    does not use. Requiring HbA1c (the old behavior) shrank the cohort to "the
+    patients NephroQ happens to need" rather than the patients KFRE is defined
+    on. Patients lacking a baseline HbA1c are still eligible; NephroQ's
+    population fallback for them is recorded via hba1c_imputed_for_benchmark."""
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
     import calibrate_mimic as cal
 
+    def p(pid, uacr_obs, hba1c_obs, **kw):
+        base = dict(patient_id=pid, uacr_baseline_observed=uacr_obs,
+                    hba1c_baseline_observed=hba1c_obs, uacr_baseline_strict=200.0,
+                    age_at_index=65.0, sex="M", baseline_egfr=40.0)
+        base.update(kw)
+        return base
+
     patients = [
-        dict(patient_id="both_observed", hba1c_baseline_observed=True, uacr_baseline_observed=True),
-        dict(patient_id="only_hba1c", hba1c_baseline_observed=True, uacr_baseline_observed=False),
-        dict(patient_id="only_uacr", hba1c_baseline_observed=False, uacr_baseline_observed=True),
-        dict(patient_id="neither", hba1c_baseline_observed=False, uacr_baseline_observed=False),
+        p("both_observed", True, True),
+        p("uacr_only", True, False),          # eligible: KFRE does not need HbA1c
+        p("no_uacr", False, True),            # ineligible: UACR is a KFRE variable
+        p("no_demographics", True, True, age_at_index=None),   # cannot compute KFRE
     ]
     kept = cal.filter_kfre_comparable(patients)
-    assert [p["patient_id"] for p in kept] == ["both_observed"]
+    assert [x["patient_id"] for x in kept] == ["both_observed", "uacr_only"]
+    # the HbA1c fallback must be recorded, not silently hidden
+    flags = {x["patient_id"]: x["hba1c_imputed_for_benchmark"] for x in kept}
+    assert flags == {"both_observed": False, "uacr_only": True}
+
+
+def test_kfre_risk_is_monotone():
+    """KFRE risk must increase as eGFR falls and as albuminuria rises, and the
+    5-year risk must never be below the 2-year risk."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+
+    by_egfr = [cal.kfre_risk(60, "M", g, 300, 2.0) for g in (60, 45, 30, 15)]
+    by_acr = [cal.kfre_risk(60, "M", 30, u, 2.0) for u in (30, 100, 300, 1000)]
+    assert all(b > a for a, b in zip(by_egfr, by_egfr[1:]))
+    assert all(b > a for a, b in zip(by_acr, by_acr[1:]))
+    assert cal.kfre_risk(60, "M", 30, 300, 5.0) >= cal.kfre_risk(60, "M", 30, 300, 2.0)
+    assert 0.0 <= cal.kfre_risk(60, "F", 90, 5, 2.0) <= 1.0
 
 def test_filter_kfre_comparable_missing_flags_returns_empty():
     """If the CSV predates the baseline_observed flags (e.g. an older run),
