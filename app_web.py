@@ -189,15 +189,25 @@ p_reach_threshold = None
 # "optimizer scaling"), every bootstrap replicate returns essentially the SAME
 # parameters. Their spread would then be ~0 and the band would collapse onto the
 # central line -- rendering as a *falsely precise* projection, which is worse
-# than showing no band at all. Detect that and suppress the band instead.
+# than showing no band at all.
+#
+# The check is done on the TRAJECTORIES, not on q/k_hf alone: the metabolic
+# weights (w_a1c/w_uacr/w_sbp) can carry real variability even when q and k_hf
+# look frozen, and it is the spread of the projected curve -- what the user
+# actually sees -- that decides whether a band is meaningful.
 _boot_degenerate = False
+_boot_traj = None
 if BOOTSTRAP_PARAMS and len(BOOTSTRAP_PARAMS) >= 2:
-    _q = np.array([bp["q"] for bp in BOOTSTRAP_PARAMS], dtype=float)
-    _k = np.array([bp["k_hf"] for bp in BOOTSTRAP_PARAMS], dtype=float)
-    # relative spread: a real patient-level bootstrap moves q by ~1e-2 or more;
-    # ~1e-6 is floating-point noise around a frozen optimum.
-    _rel = max(_q.std() / max(abs(_q.mean()), 1e-12), _k.std() / max(abs(_k.mean()), 1e-12))
-    _boot_degenerate = _rel < 1e-4
+    _traj = []
+    for bp in BOOTSTRAP_PARAMS:
+        _bw = np.array([bp["w_a1c"], bp["w_uacr"], bp["w_sbp"]])
+        _, _e_b, _ = project(hba1c, sbp, uacr, egfr0, treated,
+                             q=bp["q"], khf=bp["k_hf"], w=_bw)
+        _traj.append(_e_b)
+    _boot_traj = np.array(_traj)
+    # max over time of the across-resample std, in mL/min/1.73m2
+    _spread = float(np.nanmax(np.std(_boot_traj, axis=0)))
+    _boot_degenerate = _spread < 1e-3
 
 if BOOTSTRAP_PARAMS and _boot_degenerate:
     BOOTSTRAP_PARAMS = None   # fall through to the point-estimate-only path below
