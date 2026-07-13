@@ -89,18 +89,40 @@ app mostrará una advertencia roja — eso es intencional, ver
 Estos perfiles se cargan **con un clic** desde la barra lateral (app) o desde los
 botones (notebook). Son perfiles **ilustrativos, no pacientes reales**.
 
-Salidas esperadas con la calibración pública (q=1.52, k_hf=0.0141):
+Salidas esperadas con la **calibración v2 anclada a ensayos** (progresión fijada por
+los brazos placebo de CREDENCE y EMPA-KIDNEY; DAPA-CKD predicho fuera de muestra):
 
-| Paciente | Edad/Sexo | Cr (mg/dL) | HbA1c | UACR (mg/g) | PAS | **eGFR basal** | **KDIGO** | **Sin tx** | **Con reno** | Δ |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 🔴 Progresor rápido | 58 F | 1.3 | 8.1 % | 145 | 142 | **47.7** | G3a | 5.0 años | 7.9 años | **+3.0 a** |
-| 🟠 eGFR normal, riesgo oculto | 49 M | 0.95 | 9.2 % | 280 | 150 | **98.1** | **G1** | 10.4 años | **>15 años** | — |
-| 🟢 Bien controlado, bajo riesgo | 55 F | 1.0 | 6.6 % | 15 | 125 | **66.5** | G2 | 12.6 años | >15 años | — |
-| 🟣 Avanzado (G3b–G4) | 63 M | 2.1 | 8.8 % | 600 | 155 | **34.7** | G3b | 2.4 años | 3.9 años | **+1.5 a** |
+| Paciente | Edad/Sexo | Cr | HbA1c | UACR | PAS | **eGFR basal** | **KDIGO** | **Sin tx** | **Con reno** |
+|---|---|---|---|---|---|---|---|---|---|
+| 🔴 Progresor rápido | 58 F | 1.3 | 8.1 % | 145 | 142 | **47.7** | G3a | 13.4 años | >15 años |
+| 🟠 eGFR normal, riesgo oculto | 49 M | 0.95 | 9.2 % | 280 | 150 | **98.1** | **G1** | >15 años | >15 años |
+| 🟢 Bien controlado, bajo riesgo | 55 F | 1.0 | 6.6 % | 15 | 125 | **66.5** | G2 | >15 años | >15 años |
+| 🟣 Avanzado (G3b–G4) | 63 M | 2.1 | 8.8 % | 600 | 155 | **34.7** | G3b | 7.2 años | >15 años |
 
-*"Sin tx" / "Con reno" = tiempo modelado hasta el umbral eGFR<15, sin tratamiento
-vs. añadiendo un escenario renoprotector ilustrativo (efecto combinado
-iSGLT2/IECA-ARA). Horizonte de proyección: 15 años.*
+### 🆕 La albuminuria predicha (el nuevo panel de la app)
+
+En v2 la UACR es una **salida del modelo**, no una entrada fija. La app ahora
+grafica su trayectoria — y para varios pacientes **esta es la historia principal**,
+más que el tiempo al umbral:
+
+| Paciente | UACR sin tratamiento (0 → 15 a) | UACR con renoprotección |
+|---|---|---|
+| 🔴 Progresor rápido | 145 → **760** | 104 → 183 |
+| 🟠 **eGFR normal, riesgo oculto** | 280 → **1636** | 200 → 341 |
+| 🟢 Bien controlado | 15 → 27 | 11 → 14 |
+| 🟣 Avanzado | 600 → **6693** | 428 → 984 |
+
+El modelo predice además una **caída inmediata de ~29 %** en la UACR al iniciar
+tratamiento — los ensayos de iSGLT2 publicaron **31–35 %**. Ese número **no es un
+ajuste**: sale de parámetros anclados en CREDENCE y verificados fuera de muestra
+en DAPA-CKD.
+
+> **⚠️ Cambio importante respecto a versiones previas de esta guía.** Con el modelo
+> v1 el "progresor rápido" cruzaba el umbral en 5.0 años y el de "riesgo oculto" en
+> 10.4. Esos números eran **demasiado agresivos**: la validación in-silico mostró que
+> v1 hacía declinar a los pacientes **~2× más rápido** que los brazos placebo reales
+> de los ensayos. Las cifras de v2 son las clínicamente plausibles (≈2–3 mL/min/año
+> en un G3a). **Si tenías memorizado el guion viejo, actualízalo.**
 
 > **Ojo con el lenguaje:** eGFR<15 es un **umbral modelado de función renal**, no
 > una predicción de cuándo iniciaría realmente la diálisis. El inicio real
@@ -120,11 +142,14 @@ obvio** — empieza por el caso que una foto puntual no ve.
   en un laboratorio de rutina. Pero HbA1c 9.2 %, UACR 280 mg/g, PAS 150.
 - **Pausa aquí.** Deja que el clínico note que el eGFR está normal. Pregúntale:
   *"¿este paciente te preocupa?"*
-- **Luego enseña la curva.** No es plana. La hiperfiltración, empujada por el mal
-  control glucémico y la albuminuria, proyecta el cruce del umbral en ~10 años
-  sin tratamiento — y lo saca del horizonte de 15 años con renoprotección.
-- **El mensaje:** *una sola medición de eGFR lo habría tranquilizado.* Esta es la
-  utilidad central: modelar el **mecanismo**, no solo el número de hoy.
+- **Luego baja al panel de albuminuria.** Ahí está la historia: sin tratamiento el
+  modelo proyecta la UACR de **280 → 1636 mg/g**; con renoprotección, 200 → 341.
+  La curva de eGFR desciende pero no cruza el umbral en 15 años — **y eso está
+  bien**: el daño se manifiesta primero como albuminuria progresiva, años antes de
+  que el eGFR se desplome.
+- **El mensaje:** *una sola medición de eGFR lo habría tranquilizado.* El mecanismo
+  ya está en marcha y es visible en la albuminuria. Esta es la utilidad central:
+  modelar el **mecanismo**, no solo el número de hoy.
 
 ### 🔴 Paso 2 — "Progresor rápido"
 
