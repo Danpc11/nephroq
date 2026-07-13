@@ -259,6 +259,54 @@ STRINGS = {
               "jerárquico de la calibración pública sintética. **No ha sido validado en una "
               "cohorte clínica prospectiva** — ver `docs/KNOWN_ISSUES.md`.",
     },
+    "uacr_plot_title": {
+        "en": "Predicted albuminuria (UACR) — a model OUTPUT, not an input",
+        "es": "Albuminuria (UACR) predicha — una SALIDA del modelo, no una entrada",
+    },
+    "uacr_y": {"en": "predicted UACR (mg/g)", "es": "UACR predicha (mg/g)"},
+    "uacr_note": {
+        "en": "In this version albuminuria is **endogenous**: it rises as nephrons are lost "
+              "(it is a readout of glomerular hypertension) and falls when renoprotective "
+              "therapy lowers intraglomerular pressure. The model predicts a **{drop:.0f}%** "
+              "immediate reduction on treatment; SGLT2i trials published 31–35%. This endpoint "
+              "was structurally inexpressible in the previous model version.",
+        "es": "En esta versión la albuminuria es **endógena**: sube al perderse nefronas (es un "
+              "reflejo de la hipertensión glomerular) y baja cuando la terapia renoprotectora "
+              "reduce la presión intraglomerular. El modelo predice una reducción inmediata de "
+              "**{drop:.0f}%**; los ensayos de iSGLT2 publicaron 31–35%. Este desenlace era "
+              "estructuralmente inexpresable en la versión anterior del modelo.",
+    },
+    "expander_body_v2": {
+        "en": "This model simulates the progressive loss of functional nephrons using: "
+              "**hyperfiltration** (as nephrons are lost, the survivors are overloaded and "
+              "damaged faster — but with a *saturating*, physiologically bounded ceiling), "
+              "**compensation** (eGFR holds while reserve remains, then falls faster), and "
+              "**endogenous albuminuria** (UACR is a consequence of glomerular hypertension, "
+              "not a fixed input).\n\n"
+              "The active parameters are **anchored to published trial data**: progression is "
+              "fixed by the placebo arms of CREDENCE and EMPA-KIDNEY, treatment effects by "
+              "CREDENCE — and **DAPA-CKD is then predicted out-of-sample**, with both its "
+              "chronic eGFR slope and its UACR reduction landing inside the published 95% CI.\n\n"
+              "**It has still not been validated on a prospective clinical cohort**, and there "
+              "is no acute haemodynamic dip term. See `docs/KNOWN_ISSUES.md`.",
+        "es": "Este modelo simula la pérdida progresiva de nefronas mediante: "
+              "**hiperfiltración** (al perderse nefronas, las restantes se sobrecargan y se "
+              "dañan más rápido — pero con un techo *saturante*, acotado fisiológicamente), "
+              "**compensación** (el eGFR se mantiene mientras hay reserva y luego cae más "
+              "rápido) y **albuminuria endógena** (la UACR es consecuencia de la hipertensión "
+              "glomerular, no una entrada fija).\n\n"
+              "Los parámetros activos están **anclados a datos de ensayos publicados**: la "
+              "progresión queda fijada por los brazos placebo de CREDENCE y EMPA-KIDNEY, y los "
+              "efectos del tratamiento por CREDENCE — y luego **DAPA-CKD se predice fuera de "
+              "muestra**, cayendo tanto su pendiente crónica como su reducción de UACR dentro "
+              "del IC 95% publicado.\n\n"
+              "**Sigue sin estar validado en una cohorte clínica prospectiva** y no incluye el "
+              "dip hemodinámico agudo. Ver `docs/KNOWN_ISSUES.md`.",
+    },
+    "src_trial": {
+        "en": "trial-anchored v2 (CREDENCE + EMPA-KIDNEY; DAPA-CKD predicted out-of-sample)",
+        "es": "v2 anclada a ensayos (CREDENCE + EMPA-KIDNEY; DAPA-CKD predicho fuera de muestra)",
+    },
     "footer": {
         "en": "Source code and full documentation: "
               "[github.com/Danpc11/nephroq](https://github.com/Danpc11/nephroq)",
