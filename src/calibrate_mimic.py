@@ -12,19 +12,19 @@ That JSON contains only AGGREGATE PARAMETERS (q, k_hf, weights) -- never
 patient data. It is not pushed to git (see .gitignore). It is the file that:
   - the web app (app_web.py) uses automatically if present, as the
     research/demo calibration -- but ONLY if quality_status == "pass"
-    (see docs/KNOWN_ISSUES.md for what that means and why).
+    (see the README (Limitations) for what that means and why).
   - you can share "upon reasonable request" in the publication, consistent
     with the MIMIC-IV license (see docs/MIMIC_COMPLIANCE.md) -- the
     aggregate parameters are not PHI, but you control who receives them.
 
-METHODOLOGY NOTES (see docs/KNOWN_ISSUES.md for full detail):
+METHODOLOGY NOTES (see the README (Limitations) for full detail):
   - Uses the SAME model_core simulator as the app (no more duplicated,
     silently-diverging integrators).
   - Covariates (HbA1c/UACR/SBP) are TIME-VARYING series (one value per visit,
     from mimic_loader.py's three-tier model: per-visit measurement > patient
     baseline > population imputation). What is still NOT enforced is a strict
     baseline-at-index-date definition, and the index date itself is simply the
-    first available creatinine -- with no AKI exclusion. See docs/KNOWN_ISSUES.md
+    first available creatinine -- with no AKI exclusion. See the README (Limitations)
     ("temporal covariate handling" and "index date is not an AKI-free baseline").
   - Observations are weighted so that no single heavily-monitored patient
     dominates the fit (each patient contributes ~equal total weight,
@@ -54,26 +54,38 @@ sys.path.insert(0, HERE)
 from mimic_loader import main as build_mimic_csv  # reuses the already-tested loader
 import model_core as core
 
-# ---- SINGLE canonical model implementation -- see docs/KNOWN_ISSUES.md for why
+# ---- SINGLE canonical model implementation -- for why
 # this used to be a second, independent simulator that silently diverged from
-# the app's (mechanistic_twin.py) by up to ~11 mL/min/1.73m2 near collapse.
+# the app's (model_core.py) by up to ~11 mL/min/1.73m2 near collapse.
 G_MAX, ALPHA, N_FLOOR, K0_FIX = core.G_MAX, core.ALPHA, core.N_FLOOR, core.K0_DEFAULT
 N_of_egfr = core.N_of_egfr
 egfr_of_N = core.egfr_of_N
 
 def predict_egfr(q, khf, pac, w, t_query):
     """
-    Delegates to model_core.predict_egfr_at_dynamic -- builds a TIME-VARYING
-    insult from the patient's own HbA1c/UACR/SBP series (one value per
-    visit, from mimic_loader.py's three-tier covariate model: per-visit
-    measurement > patient baseline > population imputation), instead of a
-    single constant value for their whole trajectory. See docs/KNOWN_ISSUES.md
-    "dynamic covariates".
+    v2 predictor: saturating hyperfiltration + ENDOGENOUS albuminuria.
+
+    Only BASELINE covariates are used. In v2 the UACR trajectory is an OUTPUT of
+    the model, so per-visit UACR values are not fed in -- which also removes the
+    dependence on imputed albuminuria, the least reliable input in any hospital
+    dataset. Missing baseline covariates fall back to the patient's first
+    observed value, never to a future one.
     """
-    N0 = N_of_egfr(pac["egfr0"])
-    insult_v = core.metabolic_hazard_series(pac["hba1c_series"], pac["uacr_series"],
-                                            pac["sbp_series"], w[0], w[1], w[2])
-    return core.predict_egfr_at_dynamic(K0_FIX, khf, q, 1.0, pac["t"], insult_v, N0, t_query)
+    p = dict(core.TRIAL_CALIBRATION_V2)
+    p.update(q=q, k_hf=khf, w_a1c=w[0], w_uacr=w[1], w_sbp=w[2])
+
+    def _base(key, series):
+        v = pac.get(key)
+        if v is not None and np.isfinite(v):
+            return float(v)
+        arr = np.asarray(pac[series], dtype=float)
+        arr = arr[np.isfinite(arr)]
+        return float(arr[0]) if len(arr) else np.nan
+
+    a1c = _base("hba1c_baseline_strict", "hba1c_series")
+    uacr0 = _base("uacr_baseline_strict", "uacr_series")
+    sbp = _base("sbp_baseline_strict", "sbp_series")
+    return core.predict_egfr_at_v2(pac["egfr0"], a1c, uacr0, sbp, 0.0, p, t_query)
 
 
 def load_cohort(csv_path):
@@ -87,7 +99,7 @@ def load_cohort(csv_path):
 
     missingness is the fraction of patients with NO real (non-imputed)
     measurement anywhere in their trajectory for a covariate -- important
-    context for how much to trust w_uacr etc. (see docs/KNOWN_ISSUES.md).
+    context for how much to trust w_uacr etc..
     """
     df = pd.read_csv(csv_path)
     has_flags = {"hba1c_imputed", "uacr_imputed", "sbp_imputed"}.issubset(df.columns)
@@ -180,7 +192,7 @@ def bootstrap_calibrate(patients, point_estimate, n_boot=15, max_patients=None, 
     This runs ONCE, offline, during calibration -- the app then just
     RE-SIMULATES (cheap) a patient's projection under each of these
     parameter sets to get a parameter-uncertainty band, instead of running any
-    fitting at request time. See docs/KNOWN_ISSUES.md "uncertainty
+    fitting at request time. See the README (Limitations) "uncertainty
     intervals" and app_web.py.
     """
     if n_boot <= 0:
@@ -372,7 +384,7 @@ def nephroq_risk_from_bootstrap(bootstrap_params, a1c, uacr, sbp, egfr0, horizon
     calibration slope/intercept, which a bare score (-eGFR) cannot support.
 
     CAVEAT: this propagates ONLY calibration-parameter uncertainty (the same
-    limitation as the app's uncertainty band -- see docs/KNOWN_ISSUES.md). It
+    limitation as the app's uncertainty band --). It
     does not include measurement noise, individual random effects, or unknown
     future covariates, so it will tend to be UNDER-dispersed (too confident).
     Read the calibration slope with that in mind.
@@ -426,7 +438,7 @@ def evaluate_kfre_benchmark(params, patients, horizons=(2.0, 5.0),
     outcome misclassification. The methodologically correct treatment is
     survival analysis with censoring (time-dependent AUC, IPCW, Brier, and --
     with real KRT -- death as a competing risk); this simple complete-follow-up
-    restriction is a stopgap, not a substitute. See docs/KNOWN_ISSUES.md.
+    restriction is a stopgap, not a substitute.
     """
     if not patients:
         return None
@@ -538,7 +550,7 @@ def evaluate_kfre_benchmark(params, patients, horizons=(2.0, 5.0),
 
 def evaluate_baseline_forecast(params, patients, horizons=(2.0, 5.0), tolerance_years=0.5):
     """
-    MODE B (prospective baseline forecast) -- see docs/KNOWN_ISSUES.md
+    MODE B (prospective baseline forecast) --
     "three evaluation modes". Uses ONLY each patient's BASELINE (first
     observed) HbA1c/UACR/SBP, held CONSTANT from the index date forward
     (via model_core's constant-insult engine, NOT the dynamic one), and
@@ -602,7 +614,7 @@ def evaluate_baseline_forecast(params, patients, horizons=(2.0, 5.0), tolerance_
 
 def evaluate_holdout(params, patients, noise_sd=3.5):
     """
-    MODE A (dynamic reconstruction) -- see docs/KNOWN_ISSUES.md "three
+    MODE A (dynamic reconstruction) -- "three
     evaluation modes". Unweighted RMSE/chi2 of the ALREADY-FITTED params on
     a patient set that was not used for fitting. Uses each patient's FULL
     observed covariate history (via predict_egfr's dynamic insult), so this
@@ -639,7 +651,7 @@ def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True,
     1/noise_sd) so that a patient with 100 creatinine measurements does not
     dominate the objective over one with 4 -- both are one person. This
     matters a lot in MIMIC-IV, where critically ill patients can have labs
-    drawn many times a day (see docs/KNOWN_ISSUES.md).
+    drawn many times a day.
 
     n_multistarts / init_guess: used to make bootstrap refits (see
     bootstrap_calibrate below) cheap -- 1 multistart, seeded at the primary
@@ -675,7 +687,7 @@ def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True,
     # least-squares objective. (Because residuals are also weighted 1/sqrt(n_i)
     # per patient, a single global f_scale maps to a slightly different raw-error
     # threshold per patient; that is an accepted approximation.) See
-    # docs/KNOWN_ISSUES.md "acute-event contamination".
+    # the README (Limitations) "acute-event contamination".
     r0 = residuals(pack(base))
     mad = float(np.median(np.abs(r0 - np.median(r0))))
     f_scale = max(1.4826 * mad, 1e-6)
@@ -790,7 +802,7 @@ def diagnose_cohort(patients, noise_sd=3.5):
           f"a straight line): {median_volatility:.1f} mL/min/1.73m² "
           f"(assumed measurement noise: {noise_sd})")
     print(f"[diagnostics] Observations per patient: median={median_obs:.0f}, max={max_obs} "
-          f"(per-patient weighting is applied during fitting -- see docs/KNOWN_ISSUES.md)")
+          f"(per-patient weighting is applied during fitting --)")
     if median_volatility > 3 * noise_sd:
         print("[diagnostics] WARNING: within-patient volatility is much larger than the "
               "assumed measurement noise -- trajectories look ACUTE/fluctuating rather "
@@ -951,7 +963,7 @@ def main():
     # (chi2/n = (rmse/scale)^2) -- reporting chi2/n against the 3.5 mL/min
     # instrument-only floor inflates it several-fold for no good reason. Floored
     # at 3.5 so we never claim more precision than the instrument itself.
-    # See docs/KNOWN_ISSUES.md.
+    #
     _mv = diagnostics.get("median_volatility_mL_min")
     resid_scale = float(max(_mv, 3.5)) if (_mv and np.isfinite(_mv)) else 3.5
     print(f"[diagnostics] Empirical longitudinal residual scale = {resid_scale:.1f} mL/min "
@@ -1109,7 +1121,7 @@ def main():
     else:
         print("[diagnostics] MODE B (baseline forecast, KFRE-comparable) skipped -- no "
              "held-out patients have a strictly observed baseline HbA1c AND UACR. See "
-             "docs/KNOWN_ISSUES.md 'three evaluation modes'.")
+             "the README (Limitations) 'three evaluation modes'.")
         result["holdout_baseline_forecast"] = None
 
     quality_status, quality_reasons = assess_quality(result, diagnostics)
@@ -1158,7 +1170,7 @@ def main():
     if quality_reasons:
         print(f"\nWARNING: quality_status='warning' -- reasons: {quality_reasons}. "
              "The app will display this warning if it loads this calibration. "
-             "See docs/KNOWN_ISSUES.md before treating this as a trustworthy calibration.")
+             "See the README (Limitations) before treating this as a trustworthy calibration.")
 
     print("\nThis JSON is NOT pushed to git (see .gitignore). It is the file that:")
     print("  - the web app uses automatically as the research/demo calibration.")
