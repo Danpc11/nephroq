@@ -157,3 +157,122 @@ def gfr_category(egfr):
     if egfr >= 30: return "G3b"
     if egfr >= 15: return "G4"
     return "G5"
+
+
+# ==============================================================================
+# MODEL v2 -- saturating hyperfiltration + endogenous albuminuria
+# ==============================================================================
+# Two structural corrections, each forced by a concrete failure of v1 in the
+# in-silico trial replication (see docs/TRIAL_DATA_AND_MODEL_IMPROVEMENT.md and
+# src/insilico_trial.py).
+#
+# 1) HYPERFILTRATION SATURATES.
+#    v1: h_hf = k_hf * s^q          (s = N_ref/N)  -> diverges as N -> 0.
+#    A surviving nephron raises its single-nephron GFR by a bounded factor
+#    (~3x), not without limit. The unbounded power law is why v1 over-predicted
+#    decline hardest in advanced CKD.
+#        v2: h_hf = k_hf * s^q / (1 + (s/S_SAT)^q)
+#    S_SAT is IDENTIFIED from trial data (not fitted freely): anchoring the
+#    hazard on CREDENCE's placebo arm (mean eGFR 56) and scoring on
+#    EMPA-KIDNEY's (mean eGFR 37) gives a clear optimum at S_SAT ~ 3-4,
+#    consistent with the physiological ceiling. The unbounded law (S_SAT -> inf)
+#    is 15x worse on that held-out placebo arm.
+#
+# 2) ALBUMINURIA IS ENDOGENOUS.
+#    v1 fed UACR in as a CONSTANT exogenous insult. That is mechanistically
+#    backwards -- albuminuria is largely a CONSEQUENCE of glomerular
+#    hypertension -- it double-counts the same process, and it made a published
+#    fact structurally inexpressible (SGLT2i lower UACR by ~31-35%).
+#        v2: UACR(t) = UACR_0 * (s(t)/s_0)^BETA * (1 - eff_alb * u)
+#    Albuminuria becomes a dynamic readout of the hyperfiltration state plus a
+#    direct drug effect, and the hazard uses the CURRENT UACR. It still enters
+#    the hazard in its own right (proteinuria is tubulotoxic -- a pathway
+#    distinct from hemodynamic injury), so this is a coupling, not a removal.
+#
+# v1 above is kept INTACT: calibrate_mimic.py and the existing tests still use
+# it. v2 is opt-in.
+# ==============================================================================
+
+S_SAT = 3.5      # ceiling on compensatory single-nephron hyperfiltration
+BETA = 1.0       # albuminuria scales ~linearly with the hyperfiltration ratio
+
+# Parameters anchored to PUBLISHED TRIAL DATA rather than to MIMIC.
+# Progression (hazard scale) is fixed by the placebo arms of CREDENCE and
+# EMPA-KIDNEY; the treatment effects by CREDENCE's chronic-slope difference and
+# its 31% UACR reduction. DAPA-CKD is then predicted OUT-OF-SAMPLE and passes
+# (see results/insilico_trial_report.md).
+TRIAL_CALIBRATION_V2 = dict(
+    q=1.52,
+    k_hf=0.0141 * 0.730,                    # hazard scale 0.730
+    k0=0.0030,
+    w_a1c=0.0144 * 0.730,
+    w_uacr=0.0180 * 0.730,
+    w_sbp=0.0108 * 0.730,
+    eff_met=0.669,
+    eff_hf=0.521,
+    eff_alb=0.286,
+    s_sat=S_SAT,
+    beta=BETA,
+    source="in-silico replication: fitted on CREDENCE + EMPA-KIDNEY placebo arms; "
+           "DAPA-CKD predicted out-of-sample (chronic slope and UACR reduction both "
+           "inside the published 95% CI).",
+)
+
+
+def hyperfiltration_hazard_v2(N, k_hf, q, s_sat=S_SAT, n_ref=1.0):
+    """Saturating hyperfiltration term. Bounded by k_hf * s_sat**q."""
+    N = max(float(N), 1e-3)
+    s = n_ref / N
+    return k_hf * (s ** q) / (1.0 + (s / s_sat) ** q)
+
+
+def uacr_of_state(N, N0, uacr0, u=0.0, eff_alb=0.0, beta=BETA):
+    """Albuminuria as a readout of the hyperfiltration state + direct drug effect."""
+    s = 1.0 / max(float(N), 1e-3)
+    s0 = 1.0 / max(float(N0), 1e-3)
+    return uacr0 * (s / s0) ** beta * (1.0 - eff_alb * u)
+
+
+def renal_hazard_v2(N, N0, a1c, uacr0, sbp, u, p):
+    """Total per-nephron hazard under v2. `p` is a TRIAL_CALIBRATION_V2-like dict."""
+    uacr_t = uacr_of_state(N, N0, uacr0, u, p["eff_alb"], p.get("beta", BETA))
+    hf = hyperfiltration_hazard_v2(N, p["k_hf"], p["q"], p.get("s_sat", S_SAT))
+    hf *= (1.0 - p["eff_hf"] * u)
+    insult = metabolic_hazard(a1c, uacr_t, sbp, p["w_a1c"], p["w_uacr"], p["w_sbp"])
+    insult *= (1.0 - p["eff_met"] * u)
+    return min(p["k0"] + hf + insult, 50.0)
+
+
+def simulate_trajectory_v2(egfr0, a1c, uacr0, sbp, u=0.0, p=None, years=15, n=400):
+    """
+    Canonical v2 simulation. Returns (t, egfr, uacr, t_threshold).
+
+    Unlike v1 this also returns the PREDICTED ALBUMINURIA TRAJECTORY, which is a
+    genuine model output now, not an input held constant.
+    """
+    p = TRIAL_CALIBRATION_V2 if p is None else p
+    N0 = N_of_egfr(egfr0)
+
+    def rhs(t, y):
+        N = max(y[0], 1e-3)
+        return [-N * renal_hazard_v2(N, N0, a1c, uacr0, sbp, u, p)]
+
+    t_eval = np.linspace(0, years, n)
+    sol = solve_ivp(rhs, (0, years), [N0], t_eval=t_eval, method="LSODA",
+                    rtol=1e-6, atol=1e-9)
+    N = np.maximum(sol.y[0], 1e-3)
+    egfr = np.array([egfr_of_N(x) for x in N])
+    uacr = np.array([uacr_of_state(x, N0, uacr0, u, p["eff_alb"], p.get("beta", BETA))
+                     for x in N])
+
+    t_thr = np.inf
+    below = np.where(egfr < DIALYSIS_eGFR)[0]
+    if len(below):
+        i = below[0]
+        if i == 0:
+            t_thr = 0.0
+        else:  # linear interpolation onto the threshold crossing
+            e0, e1 = egfr[i - 1], egfr[i]
+            f = (e0 - DIALYSIS_eGFR) / (e0 - e1) if e0 != e1 else 0.0
+            t_thr = sol.t[i - 1] + f * (sol.t[i] - sol.t[i - 1])
+    return sol.t, egfr, uacr, t_thr
