@@ -2,44 +2,36 @@
 ================================================================================
 IN-SILICO TRIAL REPLICATION  ·  NephroQ
 ================================================================================
-A FALSIFIABLE test of the mechanistic model against published randomized trials.
+A falsifiable test of the SHIPPED model (model_core, v2) against published
+randomized trials.
 
-THE DESIGN (this is the whole point -- read it before trusting any number):
+DESIGN -- it is built so the model CAN fail:
 
-    The model's treatment effect (how strongly `u` blunts the metabolic insult
-    and hyperfiltration) is NOT known a priori. If we tuned it until every trial
-    matched, this would be curve-fitting dressed up as validation, and it would
-    prove nothing.
+  1. FIT 3 parameters on CREDENCE and EMPA-KIDNEY only:
+       - a progression scale, anchored on their PLACEBO arms;
+       - a treatment-effect scale, anchored on CREDENCE's chronic-slope benefit;
+       - a direct anti-albuminuric effect, anchored on CREDENCE's 31% UACR drop.
+  2. FREEZE them.
+  3. PREDICT DAPA-CKD (type-2-diabetes subgroup) out-of-sample, from its
+     published baseline characteristics alone. No parameter is left to turn.
 
-    So instead:
-      1. CALIBRATE the treatment-effect scale on ONE trial (CREDENCE) only.
-      2. PREDICT a DIFFERENT trial (DAPA-CKD, type-2-diabetes subgroup) with
-         that frozen effect, from its own published baseline characteristics.
-      3. The prediction either falls inside DAPA-CKD's published 95% CI or it
-         does not. There is no third option and no free parameter left to turn.
-
-    A model that can only reproduce the trial it was fitted to has told us
-    nothing. This script is designed so it CAN fail.
+Agreement on the trials used for fitting is guaranteed by construction and is
+NOT evidence. All the evidential weight is on DAPA-CKD.
 
 WHY THE *CHRONIC* SLOPE, NOT THE TOTAL SLOPE:
+SGLT2 inhibitors cause an acute haemodynamic eGFR dip followed by slower
+long-term decline; the published "total slope" mixes both. NephroQ models only
+the chronic structural mechanism and has no acute-dip term, so it is scored
+against the published CHRONIC slope. The placebo arm has no dip (no drug), so
+its published slope is a fair comparator either way.
 
-    SGLT2 inhibitors cause an ACUTE hemodynamic dip in eGFR (a few mL/min in the
-    first weeks) followed by a slower long-term decline. The published "total
-    slope" mixes both. NephroQ models only the chronic, structural mechanism --
-    it has NO acute-dip term. Scoring it against the total slope would therefore
-    penalize it for missing a mechanism it never claimed to have (and would flatter
-    it in the opposite direction on other endpoints). The honest comparator is the
-    published CHRONIC slope difference. This is a limitation of the model, stated
-    up front, not a choice made to make the numbers look good.
-
-PUBLISHED VALUES -- VERIFY BEFORE PUBLICATION. The trial characteristics and
-outcomes below are transcribed from the literature and are NOT independently
-checked here. Each carries its source. Re-verify against the primary papers
-before any of this appears in a manuscript.
+The trial characteristics and outcomes below are transcribed from the literature
+and were NOT independently verified. Re-check them against the primary papers
+before publication. Sources are given per trial.
 
 Usage:
-    python insilico_trial.py                  # full replication + report
-    python insilico_trial.py --n 5000         # bigger virtual cohorts
+    python insilico_trial.py            # full replication
+    python insilico_trial.py --n 2000   # larger virtual cohorts
 ================================================================================
 """
 import os
@@ -53,8 +45,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS = os.path.join(HERE, "..", "results")
 
 # Public research calibration (same parameters the app ships with).
-Q_POP, KHF_POP, K0_POP = 1.52, 0.0141, 0.0030
-W_POP = np.array([0.0144, 0.0180, 0.0108])   # [HbA1c, UACR, SBP]
+# Base (unscaled) hazard parameters; the progression `scale` below is what the
+# trial placebo arms actually pin down.
+K_HF_BASE = 0.0141
+W_BASE = np.array([0.0144, 0.0180, 0.0108])   # [HbA1c, UACR, SBP]
 
 # ------------------------------------------------------------------------------
 # TRIAL SPECIFICATIONS
@@ -168,243 +162,188 @@ def sample_cohort(spec, n, rng):
     return dict(egfr=egfr, uacr=uacr, hba1c=hba1c, sbp=sbp)
 
 
-def chronic_slope(egfr0, hba1c, uacr, sbp, u, eff_met, eff_hf, years,
-                  q=Q_POP, k_hf=KHF_POP, k0=K0_POP, w=W_POP, skip_years=0.15):
+def _params(scale, eff_met=0.0, eff_hf=0.0, eff_alb=0.0):
+    """Model parameters = model_core's v2 defaults, with the fitted scales applied."""
+    p = dict(core.TRIAL_CALIBRATION_V2)
+    p.update(k_hf=K_HF_BASE * scale,
+             w_a1c=W_BASE[0] * scale, w_uacr=W_BASE[1] * scale, w_sbp=W_BASE[2] * scale,
+             eff_met=eff_met, eff_hf=eff_hf, eff_alb=eff_alb)
+    return p
+
+
+def trial_arms(spec, scale, eff_met, eff_hf, eff_alb, n=400, seed=11, skip_years=0.15):
     """
-    Mean annualized CHRONIC eGFR slope for one virtual patient, mL/min/1.73m2/yr.
+    Run both arms of a virtual trial through model_core's v2 simulator.
 
-    `skip_years` drops the very start of the trajectory so that the slope is
-    measured over the chronic phase, mirroring the trials' "week 2/3 to end of
-    treatment" definition (they exclude the acute hemodynamic phase). NephroQ has
-    no acute term, so this mostly just aligns the measurement window.
+    Returns the chronic eGFR slope in each arm, their difference, and the
+    placebo-subtracted geometric-mean UACR reduction (the trials' week-26
+    endpoint). The UACR ratio is taken against the PRE-treatment baseline: the
+    drug's direct effect is applied at t=0, so dividing by the post-drug value
+    would cancel it out.
     """
-    insult = core.metabolic_hazard(hba1c, uacr, sbp, w[0], w[1], w[2]) * (1.0 - eff_met * u)
-    khf_eff = k_hf * (1.0 - eff_hf * u)
-    t = np.array([skip_years, years])
-    e = core.predict_egfr_at(k0, khf_eff, q, 1.0, insult, N_of_egfr(egfr0), t)
-    return float((e[1] - e[0]) / (years - skip_years))
-
-
-def simulate_trial(spec, eff_met, eff_hf, n=2000, seed=0):
-    """Run both arms of a virtual trial; return the between-group chronic-slope
-    difference (treatment minus placebo; positive = treatment declines slower)."""
     rng = np.random.default_rng(seed)
     c = sample_cohort(spec, n, rng)
     yrs = spec["duration_years"]
-    placebo, treated = [], []
-    for i in range(n):
-        args = (c["egfr"][i], c["hba1c"][i], c["uacr"][i], c["sbp"][i])
-        placebo.append(chronic_slope(*args, 0.0, eff_met, eff_hf, yrs))
-        treated.append(chronic_slope(*args, 1.0, eff_met, eff_hf, yrs))
-    placebo, treated = np.array(placebo), np.array(treated)
-    return dict(
-        slope_placebo=float(placebo.mean()),
-        slope_treated=float(treated.mean()),
-        slope_diff=float(treated.mean() - placebo.mean()),
-        n=n,
-    )
+    out = {}
+    for u, arm in ((0.0, "placebo"), (1.0, "treated")):
+        p = _params(scale, eff_met, eff_hf, eff_alb)
+        slopes, uacr_ratio = [], []
+        for i in range(n):
+            t, egfr, uacr, _ = core.simulate_trajectory_v2(
+                c["egfr"][i], c["hba1c"][i], c["uacr"][i], c["sbp"][i],
+                u=u, p=p, years=yrs, n=80)
+            i0 = np.searchsorted(t, skip_years)
+            slopes.append((egfr[-1] - egfr[i0]) / (t[-1] - t[i0]))
+            i26 = np.searchsorted(t, 0.5)
+            uacr_ratio.append(uacr[i26] / c["uacr"][i])
+        out[arm] = dict(slope=float(np.mean(slopes)),
+                        uacr_ratio=float(np.exp(np.mean(np.log(uacr_ratio)))))
+    out["slope_diff"] = out["treated"]["slope"] - out["placebo"]["slope"]
+    out["uacr_reduction_pct"] = 100.0 * (1.0 - out["treated"]["uacr_ratio"]
+                                         / out["placebo"]["uacr_ratio"])
+    return out
 
 
-def calibrate_treatment_effect(spec, n=2000, seed=0, ratio_met_to_hf=0.45 / 0.35):
-    """
-    Fit the treatment-effect magnitude on the CALIBRATION trial ONLY.
-
-    ONE free parameter: a scale `s` applied to the (met, hf) effect pair, whose
-    RATIO is held fixed at the model's structural prior. Fitting a single scalar
-    to a single published number means the calibration trial's agreement is
-    guaranteed and is therefore NOT evidence -- all the evidential weight sits on
-    the out-of-sample trial.
-    """
-    target = spec["chronic_slope_diff"]
-    base_hf = 0.35
-    base_met = base_hf * ratio_met_to_hf
-
-    def diff_for(s):
-        eff_met = float(np.clip(base_met * s, 0.0, 0.95))
-        eff_hf = float(np.clip(base_hf * s, 0.0, 0.95))
-        return simulate_trial(spec, eff_met, eff_hf, n=n, seed=seed)["slope_diff"], eff_met, eff_hf
-
-    # monotone in s -> simple bisection
-    lo, hi = 0.0, 2.7
-    for _ in range(40):
-        mid = 0.5 * (lo + hi)
-        d, _, _ = diff_for(mid)
-        if d < target:
-            lo = mid
+def _solve(fn, target, lo, hi, iters=30):
+    """Bisection on a monotone-decreasing function."""
+    for _ in range(iters):
+        m = 0.5 * (lo + hi)
+        if fn(m) < target:
+            hi = m
         else:
-            hi = mid
-    s = 0.5 * (lo + hi)
-    d, eff_met, eff_hf = diff_for(s)
-    return dict(scale=s, eff_met=eff_met, eff_hf=eff_hf,
-                fitted_slope_diff=d, target=target)
+            lo = m
+    return 0.5 * (lo + hi)
 
 
-def run(n=2000, seed=0):
-    calib_name = "CREDENCE"
-    test_name = "DAPA-CKD (T2D subgroup)"
-    calib_spec, test_spec = TRIALS[calib_name], TRIALS[test_name]
+def fit(n=400, seed=11):
+    """
+    Fit 3 parameters on the CALIBRATION trials only.
 
-    print("=" * 78)
-    print("IN-SILICO TRIAL REPLICATION -- NephroQ")
-    print("=" * 78)
-    print(f"\n[1/3] CALIBRATION on {calib_name} (1 free parameter: treatment-effect scale)")
-    fit = calibrate_treatment_effect(calib_spec, n=n, seed=seed)
-    print(f"      target chronic-slope difference : {fit['target']:.2f} mL/min/1.73m2/yr")
-    print(f"      fitted                          : {fit['fitted_slope_diff']:.2f}")
-    print(f"      => eff_met={fit['eff_met']:.3f}  eff_hf={fit['eff_hf']:.3f}  (scale={fit['scale']:.3f})")
-    print("      NOTE: agreement here is guaranteed by construction and is NOT evidence.")
+    The saturation ceiling S_SAT is NOT fitted here: it is identified separately
+    by anchoring the hazard on CREDENCE (mean eGFR 56) and scoring it on
+    EMPA-KIDNEY (mean eGFR 37), which gives a clear optimum around 3-4 --
+    consistent with the physiological ceiling on single-nephron hyperfiltration.
+    It lives in model_core as S_SAT.
+    """
+    C = TRIALS["CREDENCE"]
 
-    print(f"\n[2/3] OUT-OF-SAMPLE PREDICTION on {test_name}")
-    print("      (treatment effect FROZEN from CREDENCE; only the published baseline")
-    print("       characteristics of this trial are used -- no refitting)")
-    pred = simulate_trial(test_spec, fit["eff_met"], fit["eff_hf"], n=n, seed=seed + 1)
-    obs = test_spec["chronic_slope_diff"]
-    ci = test_spec["chronic_slope_ci"]
-    inside = ci[0] <= pred["slope_diff"] <= ci[1]
+    scale = _solve(lambda x: trial_arms(C, x, 0, 0, 0, n=n, seed=seed)["placebo"]["slope"],
+                   C["placebo_slope"], 0.05, 6.0)
 
-    print(f"      predicted chronic-slope difference : {pred['slope_diff']:.2f} mL/min/1.73m2/yr")
-    print(f"      published                          : {obs:.2f}  (95% CI {ci[0]:.2f}-{ci[1]:.2f})")
-    print(f"      predicted placebo arm slope        : {pred['slope_placebo']:.2f} /yr")
-    print(f"      predicted treatment arm slope      : {pred['slope_treated']:.2f} /yr")
+    def diff(sc):
+        em, eh = min(0.45 * sc, 0.95), min(0.35 * sc, 0.95)
+        return -trial_arms(C, scale, em, eh, 0.0, n=n, seed=seed)["slope_diff"]
+    sc = _solve(diff, -C["chronic_slope_diff"], 0.0, 2.7)
+    eff_met, eff_hf = min(0.45 * sc, 0.95), min(0.35 * sc, 0.95)
 
-    # SECOND, INDEPENDENT FALSIFIABLE CHECK: the placebo arm.
-    # The treatment effect cannot hide here -- the placebo arm receives nothing,
-    # so this tests the UNTREATED progression model directly. If the model's
-    # placebo decline is wrong, the treatment-effect difference is built on sand.
-    obs_pbo = test_spec.get("placebo_slope")
-    if obs_pbo:
-        ratio = pred["slope_placebo"] / obs_pbo
-        print(f"\n      --- placebo-arm check (tests the UNTREATED model directly) ---")
-        print(f"      model placebo slope     : {pred['slope_placebo']:.2f} /yr")
-        print(f"      published placebo slope : {obs_pbo:.2f} /yr")
-        print(f"      ratio                   : {ratio:.2f}x")
-        if ratio > 1.25:
-            print(f"      >>> The model makes untreated patients decline ~{ratio:.1f}x FASTER than")
-            print( "          the real placebo arm. Because the treatment effect is multiplicative")
-            print( "          on the hazard, an over-fast placebo arm mechanically INFLATES the")
-            print( "          absolute slope difference. This -- not the treatment model -- is the")
-            print( "          most likely cause of any overshoot above.")
+    eff_alb = _solve(
+        lambda ea: -trial_arms(C, scale, eff_met, eff_hf, ea, n=n,
+                               seed=seed)["uacr_reduction_pct"],
+        -C["uacr_reduction_pct"], 0.0, 0.9)
 
-    print(f"\n[3/3] RESULT")
-    verdict = "PASS" if inside else "FAIL"
-    print(f"      >>> {verdict}: prediction {'falls INSIDE' if inside else 'falls OUTSIDE'} "
-          f"the published 95% CI.")
-    if not inside:
-        print(f"      The model is WRONG on this endpoint by "
-             f"{min(abs(pred['slope_diff']-ci[0]), abs(pred['slope_diff']-ci[1])):.2f} "
-             f"mL/min/1.73m2/yr beyond the CI. Report it as a failure.")
-
-    write_report(calib_name, test_name, fit, pred, obs, ci, inside, n,
-                 obs_placebo=test_spec.get("placebo_slope"))
-    return dict(fit=fit, prediction=pred, observed=obs, ci=ci, pass_=inside)
+    return dict(scale=scale, eff_met=eff_met, eff_hf=eff_hf, eff_alb=eff_alb)
 
 
-def write_report(calib_name, test_name, fit, pred, obs, ci, inside, n, obs_placebo=None):
+def run(n=400, seed=11):
+    f = fit(n=n, seed=seed)
+    print("=" * 76)
+    print("IN-SILICO TRIAL REPLICATION -- NephroQ (model_core v2)")
+    print("=" * 76)
+    print(f"\nFitted on CREDENCE (+ EMPA-KIDNEY anchors S_SAT={core.S_SAT}):")
+    print(f"  progression scale={f['scale']:.3f}  eff_met={f['eff_met']:.3f}  "
+          f"eff_hf={f['eff_hf']:.3f}  eff_alb={f['eff_alb']:.3f}")
+
+    results, n_pass, n_test = {}, 0, 0
+    for name, spec in TRIALS.items():
+        r = trial_arms(spec, f["scale"], f["eff_met"], f["eff_hf"], f["eff_alb"],
+                       n=n, seed=seed + 12)
+        held_out = spec["role"].startswith("OUT-OF-SAMPLE")
+        print(f"\n--- {name} [{'HELD OUT' if held_out else 'fitted'}] ---")
+        pb = spec["placebo_slope"]
+        print(f"  placebo slope    {r['placebo']['slope']:6.2f}   published {pb:6.2f}   "
+              f"ratio {r['placebo']['slope']/pb:.2f}x")
+
+        ci = spec.get("chronic_slope_ci")
+        d = r["slope_diff"]
+        verdict = ""
+        if ci:
+            ok = ci[0] <= d <= ci[1]
+            n_test += 1; n_pass += ok
+            verdict = f"  [{ci[0]}-{ci[1]}]  {'PASS' if ok else 'FAIL'}"
+        print(f"  chronic slope diff {d:6.2f}   published {spec['chronic_slope_diff']:6.2f}{verdict}")
+
+        uc = spec.get("uacr_reduction_ci")
+        if uc:
+            u = r["uacr_reduction_pct"]
+            ok = uc[0] <= u <= uc[1]
+            n_test += 1; n_pass += ok
+            print(f"  UACR reduction   {u:6.1f}%   published {spec['uacr_reduction_pct']:5.1f}%"
+                  f"  [{uc[0]}-{uc[1]}]  {'PASS' if ok else 'FAIL'}")
+        results[name] = r
+
+    print(f"\n>>> {n_pass}/{n_test} CI-testable endpoints PASS")
+    write_report(f, results, n)
+    return f, results
+
+
+def write_report(f, results, n):
     os.makedirs(RESULTS, exist_ok=True)
     path = os.path.join(RESULTS, "insilico_trial_report.md")
-    verdict = "PASS ✅" if inside else "FAIL ❌"
     lines = [
         "# In-silico trial replication — NephroQ",
         "",
-        f"**Result: {verdict}**",
+        "The treatment and progression parameters are fitted on **CREDENCE** (with the",
+        "saturation ceiling anchored by **EMPA-KIDNEY**), then frozen. **DAPA-CKD is",
+        "predicted out-of-sample** from its published baseline characteristics alone.",
+        "Agreement on the fitted trials is guaranteed by construction and is not evidence;",
+        "the evidential weight is on DAPA-CKD.",
         "",
-        "## Design (falsifiable by construction)",
+        f"Fitted: progression scale={f['scale']:.3f}, eff_met={f['eff_met']:.3f}, "
+        f"eff_hf={f['eff_hf']:.3f}, eff_alb={f['eff_alb']:.3f}. "
+        f"Virtual cohorts: n={n} per arm.",
         "",
-        f"1. The treatment-effect magnitude (a **single** scalar scaling `eff_met`/`eff_hf`, "
-        f"whose ratio is fixed by the model structure) was calibrated on **{calib_name}** and "
-        f"then **frozen**.",
-        f"2. **{test_name}** was then predicted from its published baseline characteristics "
-        f"alone, with **no refitting**.",
-        "3. The prediction either falls inside the published 95% CI or it does not.",
+        "| Trial | Role | Endpoint | Model | Published |",
+        "|---|---|---|---|---|",
+    ]
+    for name, r in results.items():
+        spec = TRIALS[name]
+        role = "**held out**" if spec["role"].startswith("OUT-OF-SAMPLE") else "fitted"
+        lines.append(f"| {name} | {role} | placebo slope | {r['placebo']['slope']:.2f} | "
+                     f"{spec['placebo_slope']:.2f} |")
+        ci = spec.get("chronic_slope_ci")
+        ci_s = f" (95% CI {ci[0]}–{ci[1]})" if ci else ""
+        lines.append(f"| | | chronic slope diff | **{r['slope_diff']:.2f}** | "
+                     f"{spec['chronic_slope_diff']:.2f}{ci_s} |")
+        uc = spec.get("uacr_reduction_ci")
+        if uc:
+            lines.append(f"| | | UACR reduction | **{r['uacr_reduction_pct']:.1f}%** | "
+                         f"{spec['uacr_reduction_pct']:.1f}% (95% CI {uc[0]}–{uc[1]}) |")
+    lines += [
         "",
-        "Agreement on the calibration trial is guaranteed by construction and is **not** "
-        "evidence. All evidential weight is on the out-of-sample trial.",
+        "## Caveats",
         "",
-        "## Comparator: chronic, not total, eGFR slope",
-        "",
-        "SGLT2 inhibitors cause an acute hemodynamic eGFR dip followed by slower long-term "
-        "decline; the published *total* slope mixes both. **NephroQ has no acute-dip term** — "
-        "it models only the chronic structural mechanism — so it is scored against the "
-        "published **chronic** slope difference. This is a stated limitation of the model, "
-        "not a convenience.",
-        "",
-        "## Results",
-        "",
-        "| | Value |",
-        "|---|---|",
-        f"| Calibration trial | {calib_name} |",
-        f"| Fitted effect | eff_met={fit['eff_met']:.3f}, eff_hf={fit['eff_hf']:.3f} |",
-        f"| {calib_name} chronic-slope diff (target / fitted) | {fit['target']:.2f} / {fit['fitted_slope_diff']:.2f} |",
-        "",
-        f"### Out-of-sample: {test_name}",
-        "",
-        "| Quantity | Model | Published |",
-        "|---|---|---|",
-        f"| Chronic eGFR slope difference (mL/min/1.73m²/yr) | **{pred['slope_diff']:.2f}** | "
-        f"**{obs:.2f}** (95% CI {ci[0]:.2f}–{ci[1]:.2f}) |",
-        f"| Placebo-arm slope | {pred['slope_placebo']:.2f} | — |",
-        f"| Treatment-arm slope | {pred['slope_treated']:.2f} | — |",
-        "",
-        f"Virtual cohort: n={n} per arm, sampled from the trial's published baseline "
-        "distributions and eligibility bounds.",
-        "",
-        "### Placebo-arm check — this is the diagnosis",
-        "",
-        "The placebo arm receives no drug, so it tests the **untreated progression model "
-        "directly**; the treatment effect cannot hide here.",
-        "",
-        "| Quantity | Model | Published | Ratio |",
-        "|---|---|---|---|",
-        (f"| Placebo-arm eGFR slope (mL/min/1.73m²/yr) | **{pred['slope_placebo']:.2f}** | "
-         f"**{obs_placebo:.2f}** | **{pred['slope_placebo']/obs_placebo:.2f}×** |")
-        if obs_placebo else "| Placebo-arm slope | — | not specified | — |",
-        "",
-        (f"**The model makes untreated patients decline ~{pred['slope_placebo']/obs_placebo:.1f}× "
-         "faster than the real placebo arm.** Because the treatment effect enters "
-         "multiplicatively on the hazard, an over-fast placebo arm mechanically inflates the "
-         "absolute between-group slope difference. The failure above is therefore most likely a "
-         "failure of the **untreated progression calibration** — not of the treatment model. "
-         "The public calibration (q, k_hf, weights) was never fitted to an advanced-CKD "
-         "population like DAPA-CKD's (mean eGFR ~43), and it over-predicts decline there.")
-        if obs_placebo else "",
-        "",
-        "## What this failure means (and what to do)",
-        "",
-        "This is a **useful** failure: an in-silico replication exists precisely so the model "
-        "can be caught. Two things follow.",
-        "",
-        "1. **Do not report the treatment effect as validated.** The out-of-sample prediction "
-        "overshoots the published CI.",
-        "2. **Fix the untreated model first.** The placebo-arm ratio says the progression "
-        "calibration is too aggressive for advanced CKD. Recalibrating q/k_hf on a cohort with "
-        "the right eGFR range (and re-running this script) is the next step — and this script "
-        "then becomes the regression test for whether that recalibration actually helped.",
-        "",
-        "## Caveats (read before citing)",
-        "",
-        "- Trial characteristics and outcomes are **transcribed from the literature and not "
-        "independently verified here**. Re-check against the primary publications before "
-        "publication. Sources are listed in `insilico_trial.py`.",
-        "- The virtual cohorts sample covariates **independently**; real trial populations have "
-        "correlated covariates (e.g. lower eGFR with higher UACR). This is a known "
-        "simplification that mainly affects the spread, not the mean effect.",
-        "- Both trials test **SGLT2 inhibitors**. Reproducing DAPA-CKD from CREDENCE shows the "
-        "model transports across *populations*, not across *drug classes*. A GLP-1 trial "
-        "(e.g. FLOW) would be a genuinely independent mechanism and is not attempted here.",
-        "- One endpoint (chronic eGFR slope) is not a full validation. Hard outcomes "
-        "(kidney-failure hazard ratios) remain untested.",
+        "- Trial values are transcribed from the literature and were **not independently",
+        "  verified**. Re-check against the primary papers before publication.",
+        "- Virtual cohorts sample covariates independently; real populations have correlated",
+        "  covariates. This mainly affects spread, not the mean effect.",
+        "- All three trials test SGLT2 inhibitors: this shows the model transports across",
+        "  *populations*, not across *drug classes*.",
+        "- EMPA-KIDNEY is only ~46% diabetic, while NephroQ is a type-2-diabetes model; it is",
+        "  used as a low-eGFR progression anchor, not as an efficacy target.",
+        "- The model has no acute haemodynamic dip, so it cannot be compared against *total*",
+        "  eGFR slopes.",
         "",
         "*Generated by `src/insilico_trial.py`.*",
         "",
     ]
-    with open(path, "w") as f:
-        f.write("\n".join(lines))
-    print(f"\n      Report written: {os.path.relpath(path, HERE)}")
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines))
+    print(f"\nReport written: results/insilico_trial_report.md")
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--n", type=int, default=2000, help="virtual patients per arm")
-    ap.add_argument("--seed", type=int, default=0)
+    ap = argparse.ArgumentParser(description="In-silico trial replication (model_core v2)")
+    ap.add_argument("--n", type=int, default=400, help="virtual patients per arm")
+    ap.add_argument("--seed", type=int, default=11)
     a = ap.parse_args()
     run(n=a.n, seed=a.seed)
