@@ -20,8 +20,8 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 from egfr_measurement import egfr_cr, egfr_cr_cys
-from mechanistic_twin import MechanisticRenalModel, N_of_egfr, DIALYSIS_eGFR, gfr_category
 import model_core as core
+from model_core import DIALYSIS_eGFR, gfr_category
 from i18n import t as _t, PRESETS, LANGUAGES, preset_by_id
 
 # ------------------------------------------------------------------------------
@@ -166,27 +166,23 @@ col2.metric(_("kdigo"), gfr_category(egfr0))
 # ---- projection ----
 def project(a1c, sbp, uacr, egfr0, treated, q=None, khf=None, w=None, years=15):
     """
-    Project a trajectory.
+    Project a trajectory with the model (v2: saturating hyperfiltration +
+    endogenous albuminuria). Returns (t, eGFR, time_to_threshold, UACR).
 
-    PUBLIC / DEFAULT TIER -> MODEL v2 (saturating hyperfiltration + endogenous
-    albuminuria), with parameters anchored to PUBLISHED TRIAL DATA: progression
-    fixed by the CREDENCE and EMPA-KIDNEY placebo arms, treatment effects by
-    CREDENCE, and DAPA-CKD predicted out-of-sample (it passes). See
-    docs/TRIAL_DATA_AND_MODEL_IMPROVEMENT.md.
-
-    MIMIC TIER -> the v1 model, because that is the structure those parameters
-    were actually calibrated under. Feeding v1 parameters into the v2 structure
-    would be invalid, so the two are never mixed.
+    There is ONE model. The calibration tiers only change its parameters:
+    the default parameters are anchored to published trials, and a local
+    MIMIC calibration (if present) overrides q / k_hf / the covariate weights.
     """
-    if CALIB_TIER == "mimic" and q is not None:
-        m = MechanisticRenalModel(a1c=a1c, sbp=sbp, uacr=uacr, u=1.0 if treated else 0.0,
-                                  k_hf=khf, q=q, w_a1c=w[0], w_uacr=w[1], w_sbp=w[2])
-        t, N, egfr, t_dial = m.simulate(N_of_egfr(egfr0), years=years)
-        return t, egfr, t_dial, None
+    p = dict(core.TRIAL_CALIBRATION_V2)
+    if q is not None:
+        p.update(q=q, k_hf=khf, w_a1c=w[0], w_uacr=w[1], w_sbp=w[2])
+    elif CALIB_TIER != "public":
+        p.update(q=Q_POP, k_hf=KHF_POP, w_a1c=W_POP[0], w_uacr=W_POP[1], w_sbp=W_POP[2])
     t, egfr, uacr_t, t_thr = core.simulate_trajectory_v2(
         egfr0=egfr0, a1c=a1c, uacr0=uacr, sbp=sbp,
-        u=1.0 if treated else 0.0, years=years)
+        u=1.0 if treated else 0.0, p=p, years=years)
     return t, egfr, t_thr, uacr_t
+
 
 t_a, e_a, td_a, ua_a = project(hba1c, sbp, uacr, egfr0, treated)
 t_b, e_b, td_b, ua_b = project(hba1c, sbp, uacr, egfr0, not treated)
@@ -199,7 +195,7 @@ e_a_lo = e_a_hi = td_a_lo = td_a_hi = None
 p_reach_threshold = None
 
 # DEGENERATE-BOOTSTRAP GUARD.
-# If the calibration's optimizer terminated prematurely (see docs/KNOWN_ISSUES.md
+# If the calibration's optimizer terminated prematurely (see the README (Limitations)
 # "optimizer scaling"), every bootstrap replicate returns essentially the SAME
 # parameters. Their spread would then be ~0 and the band would collapse onto the
 # central line -- rendering as a *falsely precise* projection, which is worse
