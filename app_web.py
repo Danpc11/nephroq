@@ -10,8 +10,6 @@ source of truth, shared with the Colab notebook).
 Run locally:            streamlit run app_web.py
 Deploys for free from GitHub on Streamlit Community Cloud or HF Spaces
 (see docs/WEB_DEPLOYMENT.md).
-
-NOT a diagnostic tool. Research prototype (TRL4).
 ================================================================================
 """
 import sys, os
@@ -23,6 +21,7 @@ import matplotlib.pyplot as plt
 
 from egfr_measurement import egfr_cr, egfr_cr_cys
 from mechanistic_twin import MechanisticRenalModel, N_of_egfr, DIALYSIS_eGFR, gfr_category
+import model_core as core
 from i18n import t as _t, PRESETS, LANGUAGES, preset_by_id
 
 # ------------------------------------------------------------------------------
@@ -76,7 +75,7 @@ st.title(_("title"))
 st.caption(_("disclaimer"))
 st.caption(_("research_use"))
 
-src_display = _("src_public") if CALIB_TIER == "public" else CALIBRATION_SOURCE
+src_display = _("src_trial") if CALIB_TIER == "public" else CALIBRATION_SOURCE
 st.caption(_("active_calibration", src=src_display))
 if CALIB_TIER == "public":
     st.warning(_("demo_mode"))
@@ -166,16 +165,31 @@ col2.metric(_("kdigo"), gfr_category(egfr0))
 
 # ---- projection ----
 def project(a1c, sbp, uacr, egfr0, treated, q=None, khf=None, w=None, years=15):
-    q = Q_POP if q is None else q
-    khf = KHF_POP if khf is None else khf
-    w = W_POP if w is None else w
-    m = MechanisticRenalModel(a1c=a1c, sbp=sbp, uacr=uacr, u=1.0 if treated else 0.0,
-                              k_hf=khf, q=q, w_a1c=w[0], w_uacr=w[1], w_sbp=w[2])
-    t, N, egfr, t_dial = m.simulate(N_of_egfr(egfr0), years=years)
-    return t, egfr, t_dial
+    """
+    Project a trajectory.
 
-t_a, e_a, td_a = project(hba1c, sbp, uacr, egfr0, treated)
-t_b, e_b, td_b = project(hba1c, sbp, uacr, egfr0, not treated)
+    PUBLIC / DEFAULT TIER -> MODEL v2 (saturating hyperfiltration + endogenous
+    albuminuria), with parameters anchored to PUBLISHED TRIAL DATA: progression
+    fixed by the CREDENCE and EMPA-KIDNEY placebo arms, treatment effects by
+    CREDENCE, and DAPA-CKD predicted out-of-sample (it passes). See
+    docs/TRIAL_DATA_AND_MODEL_IMPROVEMENT.md.
+
+    MIMIC TIER -> the v1 model, because that is the structure those parameters
+    were actually calibrated under. Feeding v1 parameters into the v2 structure
+    would be invalid, so the two are never mixed.
+    """
+    if CALIB_TIER == "mimic" and q is not None:
+        m = MechanisticRenalModel(a1c=a1c, sbp=sbp, uacr=uacr, u=1.0 if treated else 0.0,
+                                  k_hf=khf, q=q, w_a1c=w[0], w_uacr=w[1], w_sbp=w[2])
+        t, N, egfr, t_dial = m.simulate(N_of_egfr(egfr0), years=years)
+        return t, egfr, t_dial, None
+    t, egfr, uacr_t, t_thr = core.simulate_trajectory_v2(
+        egfr0=egfr0, a1c=a1c, uacr0=uacr, sbp=sbp,
+        u=1.0 if treated else 0.0, years=years)
+    return t, egfr, t_thr, uacr_t
+
+t_a, e_a, td_a, ua_a = project(hba1c, sbp, uacr, egfr0, treated)
+t_b, e_b, td_b, ua_b = project(hba1c, sbp, uacr, egfr0, not treated)
 label_a = _("label_current_tx") if treated else _("label_no_tx")
 label_b = _("label_reno_added") if not treated else _("label_tx_stopped")
 horizon = int(t_a[-1])
@@ -201,8 +215,8 @@ if BOOTSTRAP_PARAMS and len(BOOTSTRAP_PARAMS) >= 2:
     _traj = []
     for bp in BOOTSTRAP_PARAMS:
         _bw = np.array([bp["w_a1c"], bp["w_uacr"], bp["w_sbp"]])
-        _, _e_b, _ = project(hba1c, sbp, uacr, egfr0, treated,
-                             q=bp["q"], khf=bp["k_hf"], w=_bw)
+        _, _e_b, _, _ = project(hba1c, sbp, uacr, egfr0, treated,
+                                q=bp["q"], khf=bp["k_hf"], w=_bw)
         _traj.append(_e_b)
     _boot_traj = np.array(_traj)
     # max over time of the across-resample std, in mL/min/1.73m2
@@ -216,8 +230,8 @@ if BOOTSTRAP_PARAMS:
     boot_e_a, boot_td_a = [], []
     for bp in BOOTSTRAP_PARAMS:
         bw = np.array([bp["w_a1c"], bp["w_uacr"], bp["w_sbp"]])
-        _, e_boot, td_boot = project(hba1c, sbp, uacr, egfr0, treated,
-                                     q=bp["q"], khf=bp["k_hf"], w=bw)
+        _, e_boot, td_boot, _ = project(hba1c, sbp, uacr, egfr0, treated,
+                                       q=bp["q"], khf=bp["k_hf"], w=bw)
         boot_e_a.append(e_boot); boot_td_a.append(td_boot)
     boot_e_a = np.array(boot_e_a)
     e_a_lo, e_a_hi = np.percentile(boot_e_a, [5, 95], axis=0)
@@ -264,6 +278,22 @@ plt.close(fig)   # Streamlit reruns on every widget change; without this, figure
 if np.isfinite(td_a) and np.isfinite(td_b):
     st.info(_("diff_info", label=label_b, d=abs(td_b - td_a)))
 
+# --- NEW IN v2: albuminuria is a model OUTPUT, so we can plot it ---------------
+if ua_a is not None and ua_b is not None:
+    ua_treated = ua_a if treated else ua_b
+    ua_untreated = ua_b if treated else ua_a
+    drop = 100.0 * (1.0 - ua_treated[0] / ua_untreated[0]) if ua_untreated[0] > 0 else 0.0
+    fig2, ax2 = plt.subplots(figsize=(9, 3.2), constrained_layout=True)
+    ax2.plot(t_a, ua_a, lw=2.2, color="#E24B4A", label=label_a)
+    ax2.plot(t_b, ua_b, lw=2.2, color="#1D9E75", label=label_b)
+    ax2.set_xlabel(_("plot_x")); ax2.set_ylabel(_("uacr_y"))
+    ax2.set_title(_("uacr_plot_title"))
+    ax2.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=1, fontsize=9, frameon=False)
+    ax2.grid(alpha=0.15)
+    st.pyplot(fig2, use_container_width=True)
+    plt.close(fig2)
+    st.caption(_("uacr_note", drop=drop))
+
 if not use_cystatin:
     st.warning(_("cystatin_warning"))
 
@@ -271,7 +301,7 @@ with st.expander(_("expander_title")):
     # The description must match the ACTIVE calibration: the public tier really is a
     # hierarchical Bayesian fit on synthetic data, but a MIMIC calibration produced by
     # calibrate_mimic.py is robust nonlinear least squares + patient-level bootstrap.
-    st.markdown(_("expander_body_mimic" if CALIB_TIER == "mimic" else "expander_body"))
+    st.markdown(_("expander_body_mimic" if CALIB_TIER == "mimic" else "expander_body_v2"))
 
 st.divider()
 st.caption(_("footer"))
