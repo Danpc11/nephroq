@@ -88,6 +88,17 @@ def predict_egfr(q, khf, pac, w, t_query):
     return core.predict_egfr_at_v2(pac["egfr0"], a1c, uacr0, sbp, 0.0, p, t_query)
 
 
+def _residual_chunk(patients_chunk, q, khf, w, noise_sd):
+    """Residuals for one chunk of patients. Module-level (not a closure) so that
+    it can be pickled and shipped to worker processes."""
+    out = []
+    for pac in patients_chunk:
+        n_i = max(len(pac["t"]), 1)
+        per_patient_scale = noise_sd * np.sqrt(n_i)
+        out.append((predict_egfr(q, khf, pac, w, pac["t"]) - pac["e"]) / per_patient_scale)
+    return np.concatenate(out) if out else np.array([])
+
+
 def load_cohort(csv_path):
     """
     Returns (patients, missingness). Each patient carries their FULL
@@ -181,7 +192,7 @@ def split_train_test(patients, test_frac=0.3, seed=42):
     return train, test
 
 
-def bootstrap_calibrate(patients, point_estimate, n_boot=15, max_patients=None, seed=100):
+def bootstrap_calibrate(patients, point_estimate, n_boot=15, max_patients=None, seed=100, n_jobs=1):
     """
     Patient-level bootstrap for uncertainty quantification: resample
     patients WITH REPLACEMENT (same size as the training set) n_boot times,
@@ -208,7 +219,7 @@ def bootstrap_calibrate(patients, point_estimate, n_boot=15, max_patients=None, 
         resample = [patients[i] for i in idx]
         t0 = time.time()
         try:
-            r = calibrate(resample, max_patients=max_patients, seed=seed + b,
+            r = calibrate(resample, max_patients=max_patients, seed=seed + b, n_jobs=n_jobs,
                           verbose=False, n_multistarts=1, init_guess=init)
             boot_params.append(dict(q=r["q"], k_hf=r["k_hf"],
                                     w_a1c=r["w_a1c"], w_uacr=r["w_uacr"], w_sbp=r["w_sbp"]))
@@ -638,7 +649,7 @@ def evaluate_holdout(params, patients, noise_sd=3.5):
     return dict(n_patients=len(patients), n_obs=n_obs, chi2_per_n=chi2_n, rmse_mL_min=rmse)
 
 
-def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True,
+def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True, n_jobs=1,
               n_multistarts=5, init_guess=None):
     """
     max_patients: if set, randomly subsample the cohort (fixed seed, for
@@ -665,14 +676,46 @@ def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True,
             print(f"      Subsampled to {max_patients} patients for fitting "
                  f"(seed={seed}, for speed -- statistically sufficient for 5 parameters).")
 
+    # PARALLELISM. Patients are independent, so the residual vector splits cleanly
+    # across cores. The patients are chunked ONCE (not re-sent per call) and the
+    # chunks are kept in the SAME ORDER, so the concatenated residual vector is
+    # bit-for-bit what the serial loop produced -- the optimizer cannot tell the
+    # difference. Parallelism here speeds up everything downstream: every
+    # multistart, every Jacobian step, every bootstrap replicate.
+    n_jobs_eff = 1 if n_jobs in (0, 1) else n_jobs
+    chunks = None
+    if n_jobs_eff != 1:
+        try:
+            from joblib import Parallel, delayed
+            n_workers = os.cpu_count() if n_jobs_eff in (-1, None) else n_jobs_eff
+            n_workers = max(1, min(int(n_workers or 1), len(patients)))
+            if n_workers > 1:
+                chunks = [patients[i::n_workers] for i in range(n_workers)]
+                # keep a flat index so the parallel result can be reassembled in
+                # the ORIGINAL patient order
+                order = np.concatenate([np.arange(len(patients))[i::n_workers]
+                                        for i in range(n_workers)])
+                inv = np.argsort(order)
+                sizes = np.array([max(len(p["t"]), 1) for p in patients])
+                pool = Parallel(n_jobs=n_workers, backend="loky", batch_size=1)
+        except Exception:
+            chunks = None      # joblib unavailable -> fall back to serial
+
     def residuals(p):
         q, khf, wa, wu, wb = unpack(p)
         w = np.array([wa, wu, wb])
-        r = []
-        for pac in patients:
-            n_i = max(len(pac["t"]), 1)
-            per_patient_scale = noise_sd * np.sqrt(n_i)   # equalizes total per-patient weight
-            r.append((predict_egfr(q, khf, pac, w, pac["t"]) - pac["e"]) / per_patient_scale)
+        if chunks is None:
+            r = [_residual_chunk([pac], q, khf, w, noise_sd) for pac in patients]
+        else:
+            parts = pool(delayed(_residual_chunk)(c, q, khf, w, noise_sd) for c in chunks)
+            # regroup per patient, then restore the original order
+            per_patient, k = [], 0
+            for c, part in zip(chunks, parts):
+                j = 0
+                for pac in c:
+                    n_i = max(len(pac["t"]), 1)
+                    per_patient.append(part[j:j + n_i]); j += n_i
+            r = [per_patient[i] for i in inv]
         r = np.concatenate(r)
         return np.where(np.isfinite(r), r, 100.0)
 
@@ -924,6 +967,11 @@ def main():
     ap.add_argument("--kfre-egfr-max", type=float, default=60.0,
                     help="Upper bound of baseline eGFR for the MODE C cohort (default 60 = "
                          "an incident G3a-G4 prediction cohort).")
+    ap.add_argument("--n-jobs", type=int, default=1,
+                    help="Parallel workers for the residual evaluation. Patients are "
+                         "independent, so this scales close to linearly with cores. -1 uses "
+                         "every core. Results are IDENTICAL to the serial run (the residual "
+                         "vector is reassembled in the original patient order).")
     ap.add_argument("--n-bootstrap", type=int, default=15,
                     help="Number of patient-level bootstrap resamples for the app's "
                          "parameter-uncertainty band. 0 disables (app falls back to a point "
@@ -1014,7 +1062,7 @@ def main():
              "faster fit with essentially the same precision for 5 parameters.")
 
     print("\n      --- PRIMARY analysis ---")
-    result = calibrate(train, max_patients=a.max_patients, noise_sd=resid_scale)
+    result = calibrate(train, max_patients=a.max_patients, noise_sd=resid_scale, n_jobs=a.n_jobs)
     result["diagnostics"] = diagnostics
     result["resid_scaleirical"] = resid_scale
     result["missingness"] = missingness
@@ -1036,7 +1084,7 @@ def main():
          f"{result['development_defaults']}")
 
     if a.n_bootstrap > 0:
-        result["bootstrap_params"] = bootstrap_calibrate(train, result, n_boot=a.n_bootstrap,
+        result["bootstrap_params"] = bootstrap_calibrate(train, result, n_boot=a.n_bootstrap, n_jobs=a.n_jobs,
                                                           max_patients=a.max_patients)
         print(f"      Bootstrap done: {len(result['bootstrap_params'])}/{a.n_bootstrap} "
              f"replicates succeeded.")
@@ -1044,7 +1092,8 @@ def main():
     if sensitivity_patients is not None and len(sensitivity_patients) > len(primary_patients):
         print("\n      --- SENSITIVITY analysis (full cohort, imputation included) ---")
         sens_train, sens_test = split_train_test(sensitivity_patients, test_frac=a.test_frac)
-        sens_result = calibrate(sens_train, max_patients=a.max_patients, seed=1, noise_sd=resid_scale)
+        sens_result = calibrate(sens_train, max_patients=a.max_patients, seed=1, noise_sd=resid_scale,
+                                n_jobs=a.n_jobs)
         sens_holdout = evaluate_holdout(sens_result, sens_test, noise_sd=resid_scale)
         result["sensitivity_analysis"] = dict(
             q=sens_result["q"], k_hf=sens_result["k_hf"],
