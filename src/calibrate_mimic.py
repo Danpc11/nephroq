@@ -99,6 +99,20 @@ def _residual_chunk(patients_chunk, q, khf, w, noise_sd):
     return np.concatenate(out) if out else np.array([])
 
 
+def _sniff_delimiter(path):
+    """The cohort file is TAB-separated. Older runs produced a comma-separated
+    one, so the delimiter is read off the header rather than assumed."""
+    import csv as _csv
+    with open(path, "r", newline="") as fh:
+        head = fh.readline()
+    if "\t" in head:
+        return "\t"
+    try:
+        return _csv.Sniffer().sniff(head, delimiters="\t,;|").delimiter
+    except Exception:
+        return ","
+
+
 def load_cohort(csv_path):
     """
     Returns (patients, missingness). Each patient carries their FULL
@@ -112,7 +126,7 @@ def load_cohort(csv_path):
     measurement anywhere in their trajectory for a covariate -- important
     context for how much to trust w_uacr etc..
     """
-    df = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path, sep=_sniff_delimiter(csv_path))
     has_flags = {"hba1c_imputed", "uacr_imputed", "sbp_imputed"}.issubset(df.columns)
     has_baseline_flags = {"hba1c_baseline_observed", "uacr_baseline_observed",
                           "sbp_baseline_observed"}.issubset(df.columns)
@@ -1089,12 +1103,19 @@ def main():
     ap.add_argument("--max-patients", type=int, default=None,
                     help="Randomly subsample the (post-filter) TRAINING cohort to at most "
                          "this many patients before fitting, for speed. Fixed seed.")
-    ap.add_argument("--keep-csv", action="store_true",
-                    help="Do not delete the intermediate per-patient CSV after fitting. "
-                         "Reuse it with --from-csv to skip re-reading labevents.csv.gz.")
-    ap.add_argument("--from-csv", default=None,
-                    help="Skip rebuilding the cohort from raw MIMIC-IV and calibrate "
-                         "directly from a CSV previously produced with --keep-csv.")
+    ap.add_argument("--keep-cohort", "--keep-csv", dest="keep_csv", action="store_true",
+                    help="KEEP the intermediate per-patient cohort file (TAB-separated) "
+                         "after fitting, instead of deleting it. Rebuilding it means reading "
+                         "labevents.csv.gz again, which is the slowest step of the whole run "
+                         "-- so if you intend to re-fit at all, pass this. Reuse it with "
+                         "--from-cohort.")
+    ap.add_argument("--cohort-out", default=None,
+                    help="Where to write the intermediate cohort file. Default: "
+                         "data/_mimic_cohort.tsv")
+    ap.add_argument("--from-cohort", "--from-csv", dest="from_csv", default=None,
+                    help="Skip rebuilding the cohort from raw MIMIC-IV and calibrate directly "
+                         "from a cohort file previously kept with --keep-cohort. The delimiter "
+                         "is sniffed, so an older comma-separated file still works.")
     ap.add_argument("--test-frac", type=float, default=0.3,
                     help="Fraction of patients held out (by patient, not by row) for the "
                          "reported holdout metrics. Never used to choose parameters/filters.")
@@ -1130,7 +1151,8 @@ def main():
     if not a.from_csv and not a.mimic_dir:
         ap.error("--mimic-dir is required unless --from-csv is given.")
 
-    tmp_csv = a.from_csv if a.from_csv else os.path.join(HERE, "..", "data", "_mimic_tmp.csv")
+    tmp_csv = (a.from_csv if a.from_csv
+               else (a.cohort_out or os.path.join(HERE, "..", "data", "_mimic_cohort.tsv")))
     os.makedirs(os.path.dirname(os.path.abspath(tmp_csv)), exist_ok=True)
 
     if a.from_csv:
