@@ -37,12 +37,16 @@ STRINGS = {
         "es": "Calibración activa: **{src}**",
     },
     "demo_mode": {
-        "en": "**Demonstration mode** — projections are generated from a synthetic "
-              "research calibration and must not be interpreted as individualized "
-              "clinical predictions.",
-        "es": "**Modo demostración** — las proyecciones provienen de una calibración "
-              "sintética de investigación y no deben interpretarse como predicciones "
-              "clínicas individualizadas.",
+        "en": "**Demonstration mode** — projections use a research calibration anchored to "
+              "PUBLISHED AGGREGATE TRIAL DATA (the placebo arms of CREDENCE and EMPA-KIDNEY; "
+              "DAPA-CKD is held out and predicted). This is NOT patient-level clinical "
+              "validation, and projections must not be read as individualized clinical "
+              "predictions.",
+        "es": "**Modo demostración** — las proyecciones usan una calibración de investigación "
+              "anclada a DATOS AGREGADOS PUBLICADOS DE ENSAYOS (los brazos placebo de CREDENCE "
+              "y EMPA-KIDNEY; DAPA-CKD se retiene y se predice). Esto NO es una validación "
+              "clínica a nivel de paciente, y las proyecciones no deben leerse como "
+              "predicciones clínicas individualizadas.",
     },
     "quality_warning": {
         "en": "**Calibration quality warning** — the active MIMIC-IV calibration was "
@@ -98,9 +102,9 @@ STRINGS = {
     "sbp": {"en": "Systolic blood pressure (mmHg)", "es": "Presión arterial sistólica (mmHg)"},
     "treated": {
         "en": "Already receiving a renoprotective therapy "
-              "(illustrative: SGLT2i/ACEi-ARB combined effect)",
+              "(illustrative SGLT2i-like intervention scenario)",
         "es": "Ya recibe terapia renoprotectora "
-              "(ilustrativo: efecto combinado iSGLT2/IECA-ARA)",
+              "(escenario ilustrativo de una intervención tipo iSGLT2)",
     },
     # ---- main panel ----------------------------------------------------------
     "method_cr_cys": {
@@ -170,18 +174,20 @@ STRINGS = {
               "mejor como '>{horizon} años' para la mayoría de los remuestreos.",
     },
     "boot_degenerate": {
-        "en": "**Uncertainty band suppressed.** All bootstrap resamples of this calibration "
-              "returned effectively identical parameters (zero spread), which indicates the "
-              "calibration's optimizer did not converge properly rather than a genuinely "
-              "precise estimate. Showing a band here would look falsely precise. Point "
-              "estimate only — ('optimizer scaling').",
-        "es": "**Banda de incertidumbre suprimida.** Todos los remuestreos bootstrap de esta "
-              "calibración devolvieron parámetros prácticamente idénticos (dispersión cero), "
-              "lo que indica que el optimizador de la calibración no convergió correctamente, "
-              "no que la estimación sea realmente precisa. Mostrar una banda aquí se vería "
-              "falsamente precisa. Solo estimación puntual — ver the README (Limitations) "
-              "('optimizer scaling').",
+        "en": "**Uncertainty band hidden — this calibration is not trustworthy.** Every "
+              "bootstrap resample returned the *same* parameters. That is not precision: it "
+              "means the fitting procedure never actually moved, so its numbers carry no "
+              "information. Drawing a narrow band here would look confident while being "
+              "meaningless. A point estimate is shown instead. Re-run the calibration before "
+              "relying on it.",
+        "es": "**Banda de incertidumbre oculta — esta calibración no es confiable.** Todos los "
+              "remuestreos bootstrap devolvieron los *mismos* parámetros. Eso no es precisión: "
+              "significa que el procedimiento de ajuste nunca se movió, así que sus números no "
+              "aportan información. Dibujar una banda estrecha aquí parecería seguro pero no "
+              "significaría nada. Se muestra sólo la estimación puntual. Vuelve a correr la "
+              "calibración antes de confiar en ella.",
     },
+
     "boot_none": {
         "en": "No bootstrap parameter-uncertainty band available for this calibration — "
               "point estimate only.",
@@ -239,18 +245,18 @@ STRINGS = {
               "mechanisms: **hyperfiltration** (as nephrons are lost, the remaining ones "
               "become overloaded and are damaged faster) and **compensation** (eGFR stays "
               "stable while there is reserve, and drops faster near the end).\n\n"
-              "The model parameters were calibrated with hierarchical Bayesian inference on "
-              "verified synthetic data and a first face-validity check against real "
-              "published data. **It has not been validated on a prospective clinical "
-              "cohort** — see `docs/MODEL_DOCUMENTATION.md` for the full project status.",
+              "The parameters are anchored to **published aggregate trial data** (the placebo "
+              "arms of CREDENCE and EMPA-KIDNEY; DAPA-CKD is predicted out-of-sample). **It "
+              "has not been validated on a prospective clinical cohort** — see "
+              "`docs/MODEL_DOCUMENTATION.md` for the full project status.",
         "es": "Este modelo simula la pérdida progresiva de nefronas funcionales con dos "
               "mecanismos: **hiperfiltración** (al perderse nefronas, las restantes se "
               "sobrecargan y se dañan más rápido) y **compensación** (el eGFR se mantiene "
               "estable mientras hay reserva y cae más rápido cerca del final).\n\n"
-              "Los parámetros se calibraron con inferencia bayesiana jerárquica sobre datos "
-              "sintéticos verificados y una primera comprobación de validez aparente contra "
-              "datos reales publicados. **No ha sido validado en una cohorte clínica "
-              "prospectiva** — ver `docs/MODEL_DOCUMENTATION.md` para el estado completo.",
+              "Los parámetros están anclados a **datos agregados de ensayos publicados** (los "
+              "brazos placebo de CREDENCE y EMPA-KIDNEY; DAPA-CKD se predice fuera de "
+              "muestra). **No ha sido validado en una cohorte clínica prospectiva** — ver "
+              "`docs/MODEL_DOCUMENTATION.md` para el estado completo.",
     },
     "expander_body_mimic": {
         "en": "This model simulates the progressive loss of functional nephrons using two "
@@ -259,18 +265,17 @@ STRINGS = {
               "stable while there is reserve, and drops faster near the end).\n\n"
               "The ACTIVE parameters come from a **population mechanistic calibration on "
               "MIMIC-IV using robust nonlinear least squares, with patient-level bootstrap "
-              "for parameter uncertainty** — not the hierarchical Bayesian workflow used for "
-              "the public synthetic calibration. **It has not been validated on a prospective "
-              "clinical cohort** — see `the README (Limitations)`.",
+              "for parameter uncertainty** — not the trial-anchored default calibration. **It "
+              "has not been validated on a prospective clinical cohort** — see the "
+              "*Limitations* section of the README.",
         "es": "Este modelo simula la pérdida progresiva de nefronas funcionales con dos "
               "mecanismos: **hiperfiltración** (al perderse nefronas, las restantes se "
               "sobrecargan y se dañan más rápido) y **compensación** (el eGFR se mantiene "
               "estable mientras hay reserva y cae más rápido cerca del final).\n\n"
-              "Los parámetros ACTIVOS provienen de una **calibración mecanística poblacional "
-              "sobre MIMIC-IV con mínimos cuadrados no lineales robustos y bootstrap a nivel "
-              "paciente para la incertidumbre de parámetros** — no del flujo bayesiano "
-              "jerárquico de la calibración pública sintética. **No ha sido validado en una "
-              "cohorte clínica prospectiva** — ver `the README (Limitations)`.",
+              "Los parámetros ACTIVOS provienen de una **calibración poblacional sobre "
+              "MIMIC-IV** (mínimos cuadrados no lineales robustos, bootstrap por paciente), "
+              "no de la calibración por defecto anclada a ensayos. **No ha sido validado en "
+              "una cohorte clínica prospectiva** — ver la sección *Limitations* del README.",
     },
     "uacr_plot_title": {
         "en": "Predicted albuminuria (UACR) — a model OUTPUT, not an input",
@@ -334,18 +339,43 @@ STRINGS = {
         "es": "Agrega creatininas anteriores para PERSONALIZAR el modelo a este paciente. "
               "Requiere al menos 3 mediciones que abarquen al menos 9 meses.",
     },
+    "history_load_example": {
+        "en": "Load an example history",
+        "es": "Cargar un historial de ejemplo",
+    },
+    "history_example_notice": {
+        "en": "Example measurement history — NOT patient data.",
+        "es": "Historial de ejemplo — NO son datos de un paciente.",
+    },
     "history_years_ago": {"en": "Years ago", "es": "Hace (años)"},
     "history_creat": {"en": "Creatinine (mg/dL)", "es": "Creatinina (mg/dL)"},
     "personalized_on": {
         "en": "**Personalized to this patient.** From their measurement history, the model "
               "infers an individual injury rate of **{scale:.2f}×** the population average "
-              "(±{scale_sd:.2f}) and a collapse exponent **q = {q:.2f}** (±{q_sd:.2f}). The "
-              "projection below uses these, not the population defaults.",
+              "(90% interval {scale_lo:.2f}–{scale_hi:.2f}). The projection below uses this, "
+              "not the population default.\n\n"
+              "*Experimental:* collapse exponent q = {q:.2f} (90% interval {q_lo:.2f}–"
+              "{q_hi:.2f}). q is close to unidentifiable from routine data — treat it as "
+              "indicative, not as an estimate.",
         "es": "**Personalizado a este paciente.** A partir de su historial, el modelo infiere "
               "una tasa de daño individual de **{scale:.2f}×** el promedio poblacional "
-              "(±{scale_sd:.2f}) y un exponente de colapso **q = {q:.2f}** (±{q_sd:.2f}). La "
-              "proyección de abajo usa estos valores, no los poblacionales.",
+              "(intervalo 90% {scale_lo:.2f}–{scale_hi:.2f}). La proyección de abajo usa este "
+              "valor, no el poblacional.\n\n"
+              "*Experimental:* exponente de colapso q = {q:.2f} (intervalo 90% {q_lo:.2f}–"
+              "{q_hi:.2f}). q es casi inidentificable con datos rutinarios — tómalo como "
+              "indicativo, no como una estimación.",
     },
+    "interval_note": {
+        "en": "The 90% intervals are **conformalized**: the raw ensemble spread is badly "
+              "over-confident (a naive 90% band covered the truth only ~33% of the time), so "
+              "it is rescaled against held-out virtual patients until its coverage is "
+              "actually 90%.",
+        "es": "Los intervalos 90% están **conformalizados**: la dispersión cruda del ensamble "
+              "es muy sobreconfiada (una banda 90% ingenua cubría la verdad sólo ~33% de las "
+              "veces), así que se reescala contra pacientes virtuales retenidos hasta que su "
+              "cobertura sea realmente del 90%.",
+    },
+
     "personalized_off": {
         "en": "Using **population** parameters (anchored to published trials). To personalize, "
               "add at least 3 past creatinine measurements spanning at least 9 months in the "
@@ -369,8 +399,8 @@ STRINGS = {
               "[github.com/Danpc11/nephroq](https://github.com/Danpc11/nephroq)",
     },
     "src_public": {
-        "en": "public (synthetic + Al-Shamsi 2018 validation)",
-        "es": "pública (sintética + validación Al-Shamsi 2018)",
+        "en": "public (trial-anchored: CREDENCE + EMPA-KIDNEY)",
+        "es": "pública (anclada a ensayos: CREDENCE + EMPA-KIDNEY)",
     },
 }
 
