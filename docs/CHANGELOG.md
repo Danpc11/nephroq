@@ -2,11 +2,76 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 9 — calibration speed, a calibration auditor, and one model everywhere
+
+### Fixed — three bugs, one of them capable of killing a running calibration
+
+- 🔴 **`predict_egfr_at_v2` crashed on same-day lab draws.** The Round 9 speedup (below)
+  integrates straight onto the visit times, and `solve_ivp` requires `t_eval` to be
+  **strictly increasing**. Real data is not: hospital records routinely contain several
+  creatinines drawn on the **same day**, and callers may pass times in any order. The result
+  was `ValueError: Values in t_eval are not properly sorted` on perfectly valid patients.
+  The predictor now deduplicates and sorts internally, then scatters the results back to the
+  requested order.
+
+- 🔴 **`mvp_calibration.py` was fitting a DIFFERENT model from the one the app projects
+  with.** It carried its own fixed-step Euler integrator and the **old unbounded hazard**,
+  bypassing `model_core` entirely. On the same patient with the same parameters it drifted by
+  up to **13 mL/min at 10 years** (10.9 vs 24.0). Since this is the path the README recommends
+  for calibrating on your *own* data, users were fitting one model and projecting with
+  another. It now calls `model_core`; the two agree to **0.0000 mL/min**. This is the same
+  class of bug as the two diverging integrators fixed in an earlier round, and it is now
+  locked down by a test.
+
+- 🟠 **Temporal leakage in the own-data loader.** Covariates were taken as the **median over
+  each patient's whole trajectory**, which feeds a patient's own future into a supposedly
+  baseline forecast. They are now taken at **baseline**, and a missing baseline is filled from
+  the **cohort's baseline median** — never from that patient's later visits. The imputed
+  fraction is reported.
+
+### Changed
+
+- **Input files for `mvp_calibration.py` are now TAB-separated (`.tsv`).** Clinical exports
+  routinely contain commas inside fields (free-text sites, `"Apellido, Nombre"`), which
+  silently corrupt a CSV. The delimiter is sniffed from the header, so an existing
+  comma-separated file still works; `CKD_DATA` is the new environment variable and `CKD_CSV`
+  is still honoured.
+
+### Added — the calibration is now fast enough to iterate on
+
+- **~7× algorithmic speedup, for free.** `predict_egfr_at_v2` used to build a dense grid (up
+  to 580 points for a patient with 29 visits) and then interpolate onto the visit times. It
+  now integrates **straight onto those times**: 3.62 ms → **0.49 ms** per patient, agreeing
+  with the canonical simulator to <10⁻⁶ mL/min. This applies everywhere, with no flags — even
+  the test suite dropped from 48 s to 23 s.
+- **`--n-jobs`: parallel residual evaluation.** Patients are independent, so the residual
+  vector splits cleanly across cores. The chunks are reassembled in the **original patient
+  order**, so the optimizer sees bit-for-bit what it would have seen serially — verified, and
+  locked by a regression test asserting serial and parallel agree to 10⁻⁹. Combined with the
+  algorithmic speedup, a run that was heading for 5–15 hours becomes minutes.
+  `joblib` is now declared explicitly rather than relied on as a transitive dependency of
+  scikit-learn.
+
+- **`src/audit_calibration.py` — do not trust a calibration until it has been audited.** Run
+  it on the JSON that `calibrate_mimic.py` produces. Three checks, in order of severity:
+  1. **Did the optimizer actually move?** A frozen fit returns round-number parameters and a
+     bootstrap with ~zero variance. If that happened, nothing else means anything, and the
+     script refuses to interpret the rest.
+  2. **How far is MIMIC from the trial-anchored reference?** Reported as a hazard ratio. A
+     ratio > 1 means MIMIC thinks patients decline faster than real trial placebo arms do —
+     most likely because the MIMIC index date is the first available hospital creatinine,
+     often drawn during an acute episode. The ratio *quantifies that bias* rather than
+     estimating progression better.
+  3. **Can the MIMIC parameters reproduce the published PLACEBO arms** of CREDENCE, DAPA-CKD
+     and EMPA-KIDNEY? The placebo arm receives no drug, so nothing can hide there. This is an
+     external judge, independent of the internal chi²/n: **an internally consistent fit to a
+     biased cohort is still biased.**
+
 ## Round 8 — per-patient personalization (amortized inference)
 
-### Addeda
+### Added
 
-- **`src/personalize.py` — the model is now personalized per patient.** Until now everya
+- **`src/personalize.py` — the model is now personalized per patient.** Until now every
   patient was projected with the same population parameters: two patients with an identical
   eGFR today got an identical future, even if one had been collapsing for three years and
   the other was flat. Given a few past creatinine values, an **amortized (simulation-based)
