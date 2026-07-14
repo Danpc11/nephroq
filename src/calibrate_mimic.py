@@ -43,6 +43,32 @@ Requires: numpy, pandas, scipy (already in requirements.txt). No network needed.
 ================================================================================
 """
 import argparse, json, os, subprocess, sys, datetime, time
+
+# ------------------------------------------------------------------------------
+# THREAD CONTROL -- must run BEFORE numpy/scipy are imported.
+#
+# OpenBLAS/MKL read these variables at IMPORT time, not at call time, so setting
+# them further down the file would do nothing at all.
+#
+# Why they matter: --n-jobs spawns worker PROCESSES. Inside each one, BLAS would
+# by default open one thread per core. On a 64-core node with --n-jobs 20 that is
+# 1280 threads competing for 64 cores, and the run can end up SLOWER than serial.
+# The work here is a scalar ODE, so BLAS threads buy nothing anyway.
+#
+# An explicit environment variable always wins: if the user (or a SLURM script)
+# already exported OMP_NUM_THREADS, we do not override it.
+# ------------------------------------------------------------------------------
+def _pin_blas_threads(n="1"):
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ.setdefault(var, n)
+
+
+if "--blas-threads" in sys.argv:
+    _pin_blas_threads(sys.argv[sys.argv.index("--blas-threads") + 1])
+else:
+    _pin_blas_threads("1")
+
 import numpy as np
 import pandas as pd
 from scipy.optimize import least_squares
@@ -852,7 +878,14 @@ def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True, n
                                         for i in range(n_workers)])
                 inv = np.argsort(order)
                 sizes = np.array([max(len(p["t"]), 1) for p in patients])
-                pool = Parallel(n_jobs=n_workers, backend="loky", batch_size=1)
+                # inner_max_num_threads=1: each worker is a separate PROCESS, and
+                # OpenBLAS/MKL would otherwise each spawn one thread per core inside
+                # it (20 workers x 64 cores = 1280 threads fighting for 64 cores).
+                # The work here is a scalar ODE, so BLAS threads buy nothing and
+                # oversubscription only thrashes the scheduler. Pinning to 1 is the
+                # standard hygiene for process-level parallelism on a cluster.
+                pool = Parallel(n_jobs=n_workers, backend="loky", batch_size=1,
+                                inner_max_num_threads=1)
         except Exception:
             chunks = None      # joblib unavailable -> fall back to serial
 
@@ -1135,6 +1168,13 @@ def main():
                          "not identifiable from the cohort, which a bootstrap cannot reveal "
                          "because it resamples the same patients. 5 is a reasonable value; 0 "
                          "disables it.")
+    ap.add_argument("--blas-threads", default="1",
+                    help="Threads each worker's BLAS may use. Default 1, which is what you "
+                         "want with --n-jobs: the workers are separate processes, and BLAS "
+                         "would otherwise open one thread per core INSIDE each of them "
+                         "(20 workers x 64 cores = 1280 threads for 64 cores). This is read "
+                         "before numpy is imported. An OMP_NUM_THREADS you exported yourself "
+                         "always wins.")
     ap.add_argument("--n-jobs", type=int, default=1,
                     help="Parallel workers for the residual evaluation. Patients are "
                          "independent, so this scales close to linearly with cores. -1 uses "
