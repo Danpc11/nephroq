@@ -15,7 +15,20 @@ by up to ~11 mL/min/1.73m² near the terminal collapse region -- exactly where
 time-to-eGFR<15 decisions are made. See the README (Limitations) for the
 before/after numeric comparison that caught this.
 
-    dN/dt = -N * [ k0 + k_hf*(N_ref/N)^q + insult ]
+    dN/dt = -N * h(N)
+
+    h(N) = k0
+         + k_hf * s^q / (1 + (s/S_SAT)^q)        <- SATURATING hyperfiltration
+         + insult(HbA1c, UACR(t), SBP)           <- UACR(t) is ENDOGENOUS
+
+    with s = N_ref/N, and  UACR(t) = UACR_0 * (s(t)/s_0)^BETA * (1 - eff_alb*u).
+
+    THIS is the production model (v2) -- the equation that produced every figure,
+    every calibration and every validation in the repository. The unbounded power
+    law k_hf*(N_ref/N)^q was v1: it diverged as nephrons were lost, over-predicted
+    decline in advanced CKD, and FAILED the in-silico trial replication. It is
+    retained below only because a few historical helpers still reference it; it is
+    NOT used by the app, the calibration or the tests.
     eGFR  = G_max * N^alpha
 ================================================================================
 """
@@ -48,96 +61,6 @@ def metabolic_hazard(a1c, uacr, sbp, w_a1c, w_uacr, w_sbp):
     return (w_a1c * max(a1c - 6.5, 0.0)
             + w_uacr * np.log1p(uacr / 30.0)
             + w_sbp * max(sbp - 130.0, 0.0) / 10.0)
-
-
-def metabolic_hazard_series(a1c, uacr, sbp, w_a1c, w_uacr, w_sbp):
-    """Vectorized counterpart of metabolic_hazard, for a patient's whole
-    covariate time series at once (used to build a time-varying insult)."""
-    a1c, uacr, sbp = np.asarray(a1c, dtype=float), np.asarray(uacr, dtype=float), np.asarray(sbp, dtype=float)
-    return (w_a1c * np.maximum(a1c - 6.5, 0.0)
-            + w_uacr * np.log1p(uacr / 30.0)
-            + w_sbp * np.maximum(sbp - 130.0, 0.0) / 10.0)
-
-
-def literature_metabolic_hazard(a1c, uacr, sbp):
-    """Original fixed-literature-weight insult (0.40, 0.50, 0.30), for the
-    default (non-calibrated) physiological parameterization."""
-    return (0.40 * max(a1c - 6.5, 0.0)
-            + 0.50 * np.log1p(uacr / 30.0)
-            + 0.30 * max(sbp - 130.0, 0.0) / 10.0)
-
-
-def renal_hazard(N, k0, k_hf, q, N_ref, insult):
-    """Hazard per nephron (1/year). Grows as N falls (hyperfiltration)."""
-    N = max(N, N_FLOOR)
-    return min(k0 + k_hf * (N_ref / N) ** q + insult, 50.0)
-
-
-def simulate_trajectory(k0, k_hf, q, N_ref, insult, N0, years, n=600):
-    """
-    THE canonical trajectory simulator (adaptive-step solve_ivp). Both the
-    app (via simulate_trajectory_v2) and calibrate_mimic.py call this same
-    function -- there is no second implementation of the integration anymore.
-
-    Returns: (t_eval, N, egfr, t_dialysis)
-    """
-    def rhs(t, y):
-        N = y[0]
-        return [-N * renal_hazard(N, k0, k_hf, q, N_ref, insult)]
-
-    t_eval = np.linspace(0, years, n)
-    sol = solve_ivp(rhs, [0, years], [N0], t_eval=t_eval, rtol=1e-8, atol=1e-10)
-    N = np.clip(sol.y[0], N_FLOOR, 1.0)
-    egfr = egfr_of_N(N)
-    below = np.where(N < N_DIALYSIS)[0]
-    t_dial = t_eval[below[0]] if len(below) else np.inf
-    return t_eval, N, egfr, t_dial
-
-
-def predict_egfr_at(k0, k_hf, q, N_ref, insult, N0, t_query, dt_max=0.05):
-    """
-    Convenience wrapper for calibration: simulate once up to max(t_query) and
-    interpolate at the requested query times. Used by calibrate_mimic.py's
-    residual function (called many times per optimizer iteration).
-    """
-    t_max = float(np.max(t_query)) + dt_max
-    n = max(int(t_max / dt_max), 50)
-    t_eval, N, egfr, _ = simulate_trajectory(k0, k_hf, q, N_ref, insult, N0, t_max, n=n)
-    return np.clip(np.interp(t_query, t_eval, egfr), 0, G_MAX)
-
-
-def simulate_trajectory_dynamic(k0, k_hf, q, N_ref, insult_t, insult_v, N0, years, n=600):
-    """
-    Same as simulate_trajectory, but with a TIME-VARYING insult instead of a
-    constant one: insult_t/insult_v are the (years-since-t0, insult value)
-    pairs at each of a patient's actual visits, linearly interpolated
-    between them (and held constant before the first / after the last visit
-    -- np.interp's natural clamping behavior). This lets a patient's real
-    HbA1c/UACR/SBP trajectory drive the model instead of one fixed baseline
-    value for their whole follow-up. See the README (Limitations) "dynamic
-    covariates" and mimic_loader.py's three-tier covariate model.
-    """
-    def rhs(t, y):
-        N = y[0]
-        I_t = np.interp(t, insult_t, insult_v)
-        return [-N * renal_hazard(N, k0, k_hf, q, N_ref, I_t)]
-
-    t_eval = np.linspace(0, years, n)
-    sol = solve_ivp(rhs, [0, years], [N0], t_eval=t_eval, rtol=1e-8, atol=1e-10)
-    N = np.clip(sol.y[0], N_FLOOR, 1.0)
-    egfr = egfr_of_N(N)
-    below = np.where(N < N_DIALYSIS)[0]
-    t_dial = t_eval[below[0]] if len(below) else np.inf
-    return t_eval, N, egfr, t_dial
-
-
-def predict_egfr_at_dynamic(k0, k_hf, q, N_ref, insult_t, insult_v, N0, t_query, dt_max=0.05):
-    """Dynamic-insult counterpart of predict_egfr_at."""
-    t_max = float(np.max(t_query)) + dt_max
-    n = max(int(t_max / dt_max), 50)
-    t_eval, N, egfr, _ = simulate_trajectory_dynamic(k0, k_hf, q, N_ref, insult_t, insult_v,
-                                                      N0, t_max, n=n)
-    return np.clip(np.interp(t_query, t_eval, egfr), 0, G_MAX)
 
 
 def gfr_category(egfr):
@@ -189,12 +112,17 @@ def gfr_category(egfr):
 #    the hazard in its own right (proteinuria is tubulotoxic -- a pathway
 #    distinct from hemodynamic injury), so this is a coupling, not a removal.
 #
-# v1 above is kept INTACT: calibrate_mimic.py and the existing tests still use
-# it. v2 is opt-in.
+# WHAT IS ACTUALLY USED: v2 (below) is THE production model. The app, the
+# calibration (calibrate_mimic.py), the own-data path (mvp_calibration.py), the
+# personalizer and the in-silico validation all route through
+# simulate_trajectory_v2 / predict_egfr_at_v2. The v1 helpers above are legacy and
+# are NOT on any live path -- do not read the v1 equation as the one behind the
+# results.
 # ==============================================================================
 
 S_SAT = 3.5      # ceiling on compensatory single-nephron hyperfiltration
 BETA = 1.0       # albuminuria scales ~linearly with the hyperfiltration ratio
+HAZARD_CAP = 50.0   # 1/yr; numerical guard only (see renal_hazard_v2), never biology
 
 # Parameters anchored to PUBLISHED TRIAL DATA rather than to MIMIC.
 # Progression (hazard scale) is fixed by the placebo arms of CREDENCE and
@@ -240,7 +168,12 @@ def renal_hazard_v2(N, N0, a1c, uacr0, sbp, u, p):
     hf *= (1.0 - p["eff_hf"] * u)
     insult = metabolic_hazard(a1c, uacr_t, sbp, p["w_a1c"], p["w_uacr"], p["w_sbp"])
     insult *= (1.0 - p["eff_met"] * u)
-    return min(p["k0"] + hf + insult, 50.0)
+    # HAZARD CAP. 50/yr is a numerical guard, not biology: at that rate a nephron
+    # population halves roughly every 5 days, which no patient survives. It exists
+    # so the integrator cannot blow up while an optimizer explores an absurd corner
+    # of parameter space. It should never bind for a plausible patient -- if it
+    # does, the parameters are wrong, not the patient.
+    return min(p["k0"] + hf + insult, HAZARD_CAP)
 
 
 def simulate_trajectory_v2(egfr0, a1c, uacr0, sbp, u=0.0, p=None, years=15, n=400):
