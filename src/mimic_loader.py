@@ -298,7 +298,7 @@ def main(mimic_dir, out_path, min_span_days=180, min_points=4):
     #      assumption, a small local window, not a whole-trajectory summary).
     #      This makes the metabolic insult genuinely time-varying across a
     #      patient's follow-up instead of one fixed value for their whole
-    #      trajectory -- see docs/KNOWN_ISSUES.md "dynamic covariates".
+    #      trajectory -- "dynamic covariates".
     #
     #   2) BASELINE (per-patient, Round 3 fix): for rows with no nearby
     #      measurement, fall back to the value nearest the patient's INDEX
@@ -369,7 +369,7 @@ def main(mimic_dir, out_path, min_span_days=180, min_points=4):
         This is stricter than attach_baseline() above (which allows a small
         forward grace period, defensible for RETROSPECTIVE reconstruction
         but not for a genuine prospective baseline forecast) -- see
-        docs/KNOWN_ISSUES.md "three evaluation modes".
+        the README (Limitations) "three evaluation modes".
 
         Returns (observed_flag_dict, value_dict) -- both patient_id -> value.
         The VALUE (not just the flag) matters: evaluate_baseline_forecast in
@@ -426,7 +426,7 @@ def main(mimic_dir, out_path, min_span_days=180, min_points=4):
     # all) -- for prospective/KFRE-comparable use (calibrate_mimic.py's
     # filter_kfre_comparable + evaluate_baseline_forecast). Distinct from
     # the more permissive attach_baseline() tier used above for retrospective
-    # dynamic reconstruction. See docs/KNOWN_ISSUES.md "three evaluation modes".
+    # dynamic reconstruction. See the README (Limitations) "three evaluation modes".
     hba1c_obs_map, hba1c_strict_map = get_strict_baseline(a1c.rename(columns={"valuenum": "value"}))
     uacr_obs_map, uacr_strict_map = get_strict_baseline(uacr.rename(columns={"valuenum": "value"}))
     df["hba1c_baseline_observed"] = df["patient_id"].map(hba1c_obs_map).fillna(False)
