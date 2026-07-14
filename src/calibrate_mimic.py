@@ -218,15 +218,73 @@ LO = np.array([0.5, 1e-4, 1e-4, 1e-4, 1e-4])
 HI = np.array([3.0, 0.06, 0.06, 0.06, 0.06])
 
 
+PARAM_KEYS = ("q", "k_hf", "w_a1c", "w_uacr", "w_sbp")
+WEIGHT_KEYS = ("w_a1c", "w_uacr", "w_sbp")
+
+# Which entries of the 5-vector the optimizer is allowed to move.
+FREE_IDX_ALL = (0, 1, 2, 3, 4)          # default: everything is fitted from MIMIC
+FREE_IDX_ANCHORED = (0, 1)              # --anchor-weights: only q and k_hf
+
+
+def anchored_base(base_params=None):
+    """
+    Base parameter dict for a HYBRID (`--anchor-weights`) calibration.
+
+    Each parameter is estimated from the data that actually CONTAIN it:
+
+      q, k_hf                  <- MIMIC (identified: k-fold CV 3% and 13%)
+      w_a1c, w_uacr, w_sbp     <- the trials (core.TRIAL_CALIBRATION_V2)
+
+    WHY THE WEIGHTS CANNOT COME FROM THIS COHORT. MIMIC's median UACR is
+    ~23 mg/g; CREDENCE's is 927. The cohort is essentially normoalbuminuric, so
+    there is no albuminuria signal to learn: the insult weights are fitted on
+    noise (k-fold CV: w_a1c 20%, w_sbp 54%) and the model ends up attributing
+    ~87% of the hazard to hyperfiltration. The trial placebo arms, by contrast,
+    are exactly where the albuminuric insult IS observable.
+
+    WHY THE WEIGHTS ARE FIXED *BEFORE* FITTING, NOT OVERWRITTEN AFTER. Fitting
+    all five and then substituting the trial weights is incoherent: q and k_hf
+    were optimized to compensate for the weights they were fitted alongside, and
+    replacing those weights leaves a fit that is optimal for no parameter set at
+    all. Here the weights enter the objective as CONSTANTS and (q, k_hf) are
+    re-optimized under that constraint -- the free vector shrinks from 5 to 2.
+    A side benefit: the q <-> k_hf <-> weights degeneracy simply cannot arise
+    with the weights held fixed.
+    """
+    base = dict(base_params or core.TRIAL_CALIBRATION_V2)
+    for k in WEIGHT_KEYS:
+        base[k] = float(core.TRIAL_CALIBRATION_V2[k])
+    return base
+
+
+def free_indices(anchor_weights=False):
+    return FREE_IDX_ANCHORED if anchor_weights else FREE_IDX_ALL
+
+
+def free_keys(anchor_weights=False):
+    return tuple(PARAM_KEYS[i] for i in free_indices(anchor_weights))
+
+
 def set_q_max(q_max):
     """Widen (or narrow) the upper bound on q. Used to test whether an estimate
     sitting at q = 3.000 is a real optimum or just the ceiling."""
     HI[0] = float(q_max)
 # expit is the numerically stable logistic: 1/(1+exp(-p)) overflows in exp for
 # very negative p (harmless here, but it emits RuntimeWarnings during fitting).
-def unpack(p): return LO + (HI - LO) * expit(p)
-def pack(th):
-    z = np.clip((th - LO) / (HI - LO), 1e-4, 1 - 1e-4)
+#
+# free_idx selects a SUBSET of the 5 parameters for the optimizer to move (see
+# anchored_base). With free_idx=None the behaviour is exactly the old one, so
+# every existing caller is unaffected.
+def unpack(p, free_idx=None):
+    if free_idx is None:
+        return LO + (HI - LO) * expit(p)
+    fi = np.asarray(free_idx, dtype=int)
+    return LO[fi] + (HI[fi] - LO[fi]) * expit(np.asarray(p, dtype=float))
+
+
+def pack(th, free_idx=None):
+    lo, hi = (LO, HI) if free_idx is None else (LO[list(free_idx)], HI[list(free_idx)])
+    z = np.clip((np.asarray(th, dtype=float) - lo) / (hi - lo), 1e-4, 1 - 1e-4)
     return np.log(z / (1 - z))
 
 
@@ -284,9 +342,16 @@ def profile_s_sat(patients, values=(2.0, 2.5, 3.0, 3.5, 4.5, 6.0), noise_sd=8.7,
 
 
 def cross_validate(patients, k=5, seed=42, noise_sd=8.7, n_jobs=1, max_patients=None,
-                   verbose=True):
+                   verbose=True, anchor_weights=False):
     """
     K-fold cross-validation, split BY PATIENT.
+
+    anchor_weights: each fold is refit as a HYBRID (weights fixed at the trial
+    values, only q and k_hf free). The stability report then covers ONLY the
+    free parameters -- an anchored weight is a constant, and reporting a
+    coefficient of variation of 0.00 for it would be exactly the "looks like
+    perfect stability, is actually no information" artifact this function was
+    written to catch.
 
     The point is NOT a slightly better RMSE estimate. It is a STABILITY /
     IDENTIFIABILITY check on the parameters themselves:
@@ -318,7 +383,8 @@ def cross_validate(patients, k=5, seed=42, noise_sd=8.7, n_jobs=1, max_patients=
             continue
 
         fit = calibrate(train, noise_sd=noise_sd, seed=seed + f, verbose=False,
-                        n_jobs=n_jobs, max_patients=max_patients, n_multistarts=3)
+                        n_jobs=n_jobs, max_patients=max_patients, n_multistarts=3,
+                        anchor_weights=anchor_weights)
 
         # out-of-fold error: these patients were never seen during this fit
         w = np.array([fit["w_a1c"], fit["w_uacr"], fit["w_sbp"]])
@@ -349,8 +415,12 @@ def cross_validate(patients, k=5, seed=42, noise_sd=8.7, n_jobs=1, max_patients=
         cv = abs(sd / mean) if mean != 0 else np.inf
         return dict(mean=mean, sd=sd, cv=cv, min=float(v.min()), max=float(v.max()))
 
-    summary = {key: spread(key) for key in ("q", "k_hf", "w_a1c", "w_uacr", "w_sbp",
-                                            "oof_rmse")}
+    # Only FREE parameters are candidates for an identifiability verdict. Under
+    # --anchor-weights the three weights are constants imported from the trials;
+    # they have zero spread by construction, and scoring them would manufacture a
+    # reassuring "CV = 0.00" out of an assumption.
+    KEYS = free_keys(anchor_weights)
+    summary = {key: spread(key) for key in KEYS + ("oof_rmse",)}
 
     # Two ways a parameter can fail to be identifiable, and they look OPPOSITE:
     #
@@ -362,9 +432,8 @@ def cross_validate(patients, k=5, seed=42, noise_sd=8.7, n_jobs=1, max_patients=
     # parameter, the optimizer slams it into the boundary in every fold, and a
     # spread-based check reports it as rock-solid. A parameter sitting on its
     # bound is degenerate, not identified. Both are flagged.
-    KEYS = ("q", "k_hf", "w_a1c", "w_uacr", "w_sbp")
-    bound_lo = dict(zip(KEYS, LO))
-    bound_hi = dict(zip(KEYS, HI))
+    bound_lo = dict(zip(PARAM_KEYS, LO))
+    bound_hi = dict(zip(PARAM_KEYS, HI))
 
     at_bound = {}
     for j, key in enumerate(KEYS):
@@ -413,12 +482,20 @@ def cross_validate(patients, k=5, seed=42, noise_sd=8.7, n_jobs=1, max_patients=
                 print("          boundary every time. This is the failure mode most likely to")
                 print("          be mistaken for a good result.")
         else:
-            print("\n      >>> All parameters stable across folds (CV <= 20%).")
+            print(f"\n      >>> All FREE parameters stable across folds (CV <= 20%)."
+                  if anchor_weights else
+                  "\n      >>> All parameters stable across folds (CV <= 20%).")
+        if anchor_weights:
+            print("      (weights anchored to the trials -- not fitted here, so not scored)")
 
     return dict(k=k, folds=rows, summary=summary, unstable=unstable, at_bound=at_bound,
+                anchor_weights=bool(anchor_weights),
+                free_parameters=list(KEYS),
                 interpretation="K-fold refits on genuinely different patient subsets. A "
                                "parameter with a large across-fold CV is not identifiable "
-                               "from this cohort, regardless of its bootstrap interval.")
+                               "from this cohort, regardless of its bootstrap interval."
+                               + (" Only the free parameters (q, k_hf) are scored: the "
+                                  "weights are trial-anchored constants." if anchor_weights else ""))
 
 
 def split_train_test(patients, test_frac=0.3, seed=42):
@@ -434,13 +511,19 @@ def split_train_test(patients, test_frac=0.3, seed=42):
     return train, test
 
 
-def bootstrap_calibrate(patients, point_estimate, n_boot=15, max_patients=None, seed=100, n_jobs=1):
+def bootstrap_calibrate(patients, point_estimate, n_boot=15, max_patients=None, seed=100,
+                        n_jobs=1, anchor_weights=False):
     """
     Patient-level bootstrap for uncertainty quantification: resample
     patients WITH REPLACEMENT (same size as the training set) n_boot times,
     refit on each resample (1 multistart, seeded at the point estimate --
     a bootstrap resample is similar data, so this converges fast), and
     return the list of fitted parameter sets.
+
+    anchor_weights: each replicate is refit as a hybrid (only q, k_hf free). The
+    returned parameter sets still carry the (constant) trial weights, so the app's
+    re-simulation code needs no special case; the band simply has no width in the
+    weight directions, which is correct -- they were not estimated.
 
     This runs ONCE, offline, during calibration -- the app then just
     RE-SIMULATES (cheap) a patient's projection under each of these
@@ -462,7 +545,8 @@ def bootstrap_calibrate(patients, point_estimate, n_boot=15, max_patients=None, 
         t0 = time.time()
         try:
             r = calibrate(resample, max_patients=max_patients, seed=seed + b, n_jobs=n_jobs,
-                          verbose=False, n_multistarts=1, init_guess=init)
+                          verbose=False, n_multistarts=1, init_guess=init,
+                          anchor_weights=anchor_weights)
             boot_params.append(dict(q=r["q"], k_hf=r["k_hf"],
                                     w_a1c=r["w_a1c"], w_uacr=r["w_uacr"], w_sbp=r["w_sbp"]))
         except Exception as e:
@@ -991,8 +1075,14 @@ def evaluate_holdout(params, patients, noise_sd=3.5):
 
 
 def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True, n_jobs=1,
-              n_multistarts=5, init_guess=None, base_params=None):
+              n_multistarts=5, init_guess=None, base_params=None, anchor_weights=False):
     """
+    anchor_weights: HYBRID calibration. The three insult weights are FIXED at the
+    trial-anchored values (see anchored_base) and only (q, k_hf) are fitted from
+    MIMIC. The free vector shrinks 5 -> 2 and the fit is RE-OPTIMIZED under that
+    constraint -- which is the whole point, and is not the same thing as fitting
+    five parameters and then overwriting three of them.
+
     max_patients: if set, randomly subsample the cohort (fixed seed, for
     reproducibility) before fitting. 5 parameters need nowhere near tens of
     thousands of patients to be well identified -- subsampling to a few
@@ -1049,8 +1139,23 @@ def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True, n
         except Exception:
             chunks = None      # joblib unavailable -> fall back to serial
 
+    # FREE VECTOR. With --anchor-weights the weights are constants of the
+    # objective, not unknowns: the optimizer never sees them.
+    fi = list(free_indices(anchor_weights))
+    if anchor_weights:
+        base_params = anchored_base(base_params)
+    w_fixed = (np.array([base_params[k] for k in WEIGHT_KEYS], dtype=float)
+               if anchor_weights else None)
+
+    def theta_full(p):
+        """Free vector -> the full 5-vector (q, k_hf, w_a1c, w_uacr, w_sbp)."""
+        vals = unpack(p, fi)
+        if not anchor_weights:
+            return vals
+        return np.concatenate([vals, w_fixed])
+
     def residuals(p):
-        q, khf, wa, wu, wb = unpack(p)
+        q, khf, wa, wu, wb = theta_full(p)
         w = np.array([wa, wu, wb])
         if chunks is None:
             r = [_residual_chunk([pac], q, khf, w, noise_sd, base_params) for pac in patients]
@@ -1069,7 +1174,13 @@ def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True, n
         return np.where(np.isfinite(r), r, 100.0)
 
     rng = np.random.default_rng(seed)
-    base = init_guess if init_guess is not None else np.array([1.5, 0.012, 0.014, 0.018, 0.011])
+    # The initial guess is always given as a full 5-vector (callers such as
+    # bootstrap_calibrate seed it from a point estimate); it is then RESTRICTED to
+    # the free coordinates, so the same caller code works anchored or not.
+    init_full = (np.asarray(init_guess, dtype=float) if init_guess is not None
+                 else np.array([1.5, 0.012, 0.014, 0.018, 0.011]))
+    base = init_full[fi]
+    lo_f, hi_f = LO[fi], HI[fi]
 
     # Robust-loss scale for soft_l1: calibrate f_scale to the SPREAD of the
     # residuals at the initial guess (robust MAD estimate). soft_l1 then
@@ -1080,14 +1191,16 @@ def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True, n
     # per patient, a single global f_scale maps to a slightly different raw-error
     # threshold per patient; that is an accepted approximation.) See
     # the README (Limitations) "acute-event contamination".
-    r0 = residuals(pack(base))
+    r0 = residuals(pack(base, fi))
     mad = float(np.median(np.abs(r0 - np.median(r0))))
     f_scale = max(1.4826 * mad, 1e-6)
 
     best = None
     for s in range(n_multistarts):
         t0 = time.time()
-        p_init = pack(base) if s == 0 else pack(np.clip(base*rng.uniform(0.5, 1.8, 5), LO*1.01, HI*0.99))
+        p_init = (pack(base, fi) if s == 0 else
+                  pack(np.clip(base * rng.uniform(0.5, 1.8, len(fi)),
+                               lo_f * 1.01, hi_f * 0.99), fi))
         # x_scale="jac" is essential here: the logit reparameterization gives the
         # Jacobian columns very different magnitudes (the q column is ~60x steeper
         # than the k_hf / weight columns near the initial guess), so with the
@@ -1101,8 +1214,8 @@ def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True, n
                             xtol=1e-10, ftol=1e-10, gtol=1e-12)
         dt = time.time() - t0
         if verbose:
-            q_s, khf_s, *_ = unpack(sol.x)
-            moved = float(np.max(np.abs(unpack(sol.x) - base)))
+            q_s, khf_s, *_ = unpack(sol.x, fi)
+            moved = float(np.max(np.abs(unpack(sol.x, fi) - base)))
             print(f"      [fit {s+1}/{n_multistarts}] {dt:5.1f}s  cost={sol.cost:.1f}  "
                  f"nfev={sol.nfev}  status={sol.status}  q={q_s:.3f}  k_hf={khf_s:.4f}  "
                  f"|Δparam|max={moved:.3g}"
@@ -1113,13 +1226,13 @@ def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True, n
     if verbose and best is not None:
         # Explicit freeze check: if the optimum still equals the initial guess to
         # working precision, the optimizer did not move -- the fit is not trustworthy.
-        moved_best = float(np.max(np.abs(unpack(best.x) - base)))
+        moved_best = float(np.max(np.abs(unpack(best.x, fi) - base)))
         msg = (best.message or "").strip()
         print(f"      [fit] best status={best.status} ({msg}); nfev={best.nfev}; "
              f"|Δparam|max from x0 = {moved_best:.3g}"
              f"{'   *** WARNING: optimizer did not move off the initial guess ***' if moved_best < 1e-6 else ''}")
 
-    q, khf, wa, wu, wb = unpack(best.x)
+    q, khf, wa, wu, wb = theta_full(best.x)
     params = dict(q=float(q), k_hf=float(khf), w_a1c=float(wa), w_uacr=float(wu), w_sbp=float(wb))
 
     # Report UNWEIGHTED rmse/chi2 (on the fitting set) for an interpretable
@@ -1129,6 +1242,17 @@ def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True, n
     result = dict(params)
     result.update(n_patients=fit_eval["n_patients"], n_obs=fit_eval["n_obs"],
                   chi2_per_n=fit_eval["chi2_per_n"], rmse_mL_min=fit_eval["rmse_mL_min"])
+    # PROVENANCE. Which numbers in this dict were estimated from MIMIC and which
+    # were imported from the trials. Without this the JSON is ambiguous: a
+    # w_uacr of 0.01314 looks like a fitted estimate when it is in fact an
+    # assumption, and no reader could tell the difference.
+    result.update(
+        anchor_weights=bool(anchor_weights),
+        free_parameters=[PARAM_KEYS[i] for i in fi],
+        anchored_parameters=(list(WEIGHT_KEYS) if anchor_weights else []),
+        anchored_weight_source=("model_core.TRIAL_CALIBRATION_V2 (CREDENCE + "
+                                "EMPA-KIDNEY placebo arms)" if anchor_weights else None),
+    )
     return result
 
 
@@ -1335,6 +1459,16 @@ def main():
                          "not determined by the data -- widen it (e.g. --q-max 8) and refit. "
                          "If q then runs to the new ceiling too, the functional form itself is "
                          "wrong for this cohort, which is a finding, not a nuisance.")
+    ap.add_argument("--anchor-weights", action="store_true",
+                    help="HYBRID calibration. Fix the three metabolic-insult weights "
+                         "(w_a1c, w_uacr, w_sbp) at their trial-anchored values "
+                         "(model_core.TRIAL_CALIBRATION_V2) and fit ONLY q and k_hf from "
+                         "MIMIC. Rationale: q and k_hf are identified in this cohort (k-fold "
+                         "CV 3%% and 13%%), but the weights are not -- MIMIC's median UACR is "
+                         "~23 mg/g vs 927 in CREDENCE, so there is no albuminuria signal to "
+                         "learn and the free weights fit noise. The weights are held fixed "
+                         "BEFORE fitting (the free vector is 2, not 5), so q and k_hf are "
+                         "re-optimized under the constraint -- NOT fitted at 5 and overwritten.")
     ap.add_argument("--index-strategy", choices=["confirmed", "first"], default="confirmed",
                     help="How the patient's BASELINE is chosen. 'confirmed' (default) is the "
                          "KDIGO rule: the index eGFR must still hold at >=90 days (not have "
@@ -1447,11 +1581,19 @@ def main():
              "engine may take a long time to fit. Consider --max-patients 2000-3000 for a much "
              "faster fit with essentially the same precision for 5 parameters.")
 
+    if a.anchor_weights:
+        print("[diagnostics] --anchor-weights: HYBRID calibration. Weights "
+              f"{list(WEIGHT_KEYS)} are FIXED at the trial-anchored values "
+              f"{[round(float(core.TRIAL_CALIBRATION_V2[k]), 5) for k in WEIGHT_KEYS]} "
+              "and only (q, k_hf) are fitted from MIMIC (free vector: 5 -> 2).")
+
     print("\n      --- PRIMARY analysis ---")
-    result = calibrate(train, max_patients=a.max_patients, noise_sd=resid_scale, n_jobs=a.n_jobs)
+    result = calibrate(train, max_patients=a.max_patients, noise_sd=resid_scale,
+                       n_jobs=a.n_jobs, anchor_weights=a.anchor_weights)
     result["diagnostics"] = diagnostics
     result["resid_scaleirical"] = resid_scale
     result["missingness"] = missingness
+    result["anchor_weights"] = bool(a.anchor_weights)
     result["chronic_only_filter"] = bool(a.chronic_only)
     result["max_patients_subsample"] = a.max_patients
     result["primary_analysis"] = dict(
@@ -1474,11 +1616,11 @@ def main():
               f"parameter STABILITY, not just accuracy:")
         result["cross_validation"] = cross_validate(
             train, k=a.cv_folds, noise_sd=resid_scale, n_jobs=a.n_jobs,
-            max_patients=a.max_patients)
+            max_patients=a.max_patients, anchor_weights=a.anchor_weights)
 
     if a.n_bootstrap > 0:
         _boot = bootstrap_calibrate(train, result, n_boot=a.n_bootstrap, n_jobs=a.n_jobs,
-                                    max_patients=a.max_patients)
+                                    max_patients=a.max_patients, anchor_weights=a.anchor_weights)
         result["bootstrap_params"] = _boot["params"]
         # Surfaced in the JSON: a band built from 3 surviving replicates out of 15 is
         # NOT the band that was asked for, and the reader must be able to see that.
@@ -1492,7 +1634,7 @@ def main():
         print("\n      --- SENSITIVITY analysis (full cohort, imputation included) ---")
         sens_train, sens_test = split_train_test(sensitivity_patients, test_frac=a.test_frac)
         sens_result = calibrate(sens_train, max_patients=a.max_patients, seed=1, noise_sd=resid_scale,
-                                n_jobs=a.n_jobs)
+                                n_jobs=a.n_jobs, anchor_weights=a.anchor_weights)
         sens_holdout = evaluate_holdout(sens_result, sens_test, noise_sd=resid_scale)
         result["sensitivity_analysis"] = dict(
             q=sens_result["q"], k_hf=sens_result["k_hf"],
