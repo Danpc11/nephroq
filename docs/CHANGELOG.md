@@ -2,63 +2,67 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
-## Round 11 — three critical bugs found by external review
+## Round 14 — vectorisation where it actually costs, and two coefficients that were wrong
 
-### Fixed — critical
+### Fixed
 
-- **The app personalized every patient from a FICTITIOUS history.** The measurement editor
-  shipped pre-filled with example creatinines (`1.05, 1.15, 1.22`). A user who entered only
-  today's markers and never typed a single historical value still saw **"Personalized to this
-  patient"** — computed from invented data. The editor now starts **empty**, and the example
-  history is behind an explicit button labelled *"Example measurement history — NOT patient
-  data."*
+- **A code review proposed CKD-EPI equations with two WRONG coefficients.** Both errors are
+  the kind that survive a glance, and adopting them would have silently changed every eGFR the
+  app shows a clinician:
+  - `eGFRcys` with a leading **135** and age base **0.9946** — those belong to the
+    creatinine-cystatin equation. eGFRcys is **133** and **0.996**.
+  - `eGFRcr-cys` with a male α of **−0.291** — the published value is **−0.144**. (−0.302 is
+    the male α of the *creatinine-only* equation, which is presumably where −0.291 drifted in
+    from.)
 
-- **Personalization was silently discarded whenever a MIMIC or private calibration was
-  loaded.** `project()` overwrote the personalized `q`/`k_hf`/weights with population values
-  for any tier that was not `public`, while the interface went on announcing "Personalized to
-  this patient". The inferred injury rate is a **multiplier relative to the population model**,
-  so the fix is structural: the personalizer is now parameterized by the *active* population
-  calibration, trained against it, and its estimator is cached per tier. An estimator built
-  around the trial-anchored model cannot be transplanted onto a MIMIC calibration whose hazard
-  is twice as fast.
+  Verified against NKF, NIDDK and Inker et al. NEJM 2021/2012. **The existing implementation
+  was correct and was NOT changed.** A test now pins the exact published coefficients, so a
+  well-meaning "refactor" cannot move them.
 
-- **The calibration fitted v2 but EVALUATED with v1.** Not in the review — found while
-  checking it. `calibrate_mimic.py` still called the old unbounded `predict_egfr_at` in three
-  places: the bootstrap-derived risk, Mode B (baseline forecast) and Mode C (KFRE comparison).
-  Parameters were being estimated under one set of dynamics and scored under another. All
-  three now use `predict_egfr_at_v2`. **No live path uses v1 any more.**
+### Added
 
-### Fixed — high
+- **Vectorised the CKD-EPI equations** (the review's other, valid point): they now accept whole
+  cohort columns instead of raising the classic "truth value of an array is ambiguous". Honest
+  accounting: ~20× faster per row, but that is **2.1 s → 0.11 s** across 1.5M MIMIC
+  creatinines. It is a correctness and ergonomics win, not a performance one.
 
-- **Historical creatinines were converted with the patient's CURRENT age.** A sample drawn
-  ten years ago was run through CKD-EPI with today's age, which systematically *understates*
-  the historical eGFR and makes the decline look flatter than it was. The bias grows with the
-  length of the history — precisely the histories that carry the most information. Each value
-  is now converted with the age the patient had at the time.
+- **Batched the bootstrap ODEs — the vectorisation that *does* pay.** The review proposed
+  vectorising `P_NQ = (egfr < 15).mean(axis=1)`. Measured: that operation is **0.0042 %** of
+  the cost. The expensive part is *generating* the projections — B separate `solve_ivp` calls
+  per patient, whose per-call overhead dominates a 1-D problem. Those B replicates are
+  independent trajectories, so they stack into a single B-dimensional system:
+  `predict_egfr_at_v2_batched` does one solve instead of B. **66.5 ms → 3.47 ms (≈19×)**,
+  agreeing with the per-replicate loop to 1e-4 mL/min, locked by a test.
 
-### Changed — honesty of the claims
+  The reviewer's instinct — *vectorise* — was right. It was aimed at the wrong line.
 
-- **`q` is described as what it is.** The README opened by presenting `q` as the central
-  parameter "estimated from clinical trajectories", while the repository's own experiments
-  show it is close to unidentifiable from routine data. It is now stated as a
-  **population-level structural parameter**, with individual heterogeneity carried by the
-  **injury-rate multiplier** — which is the recoverable quantity, and the more interesting
-  claim.
-- **Ensemble spread is no longer dressed up as a confidence interval.** The app reported
-  `q = 1.72 ± 0.13`. That ± is the disagreement between the networks in the ensemble, not an
-  interval with known coverage. It is now labelled "ensemble spread", and `q` is marked
-  *experimental*.
-- **The therapy toggle no longer claims a combined SGLT2i/ACEi-ARB effect.** Both the
-  calibration (CREDENCE) and the out-of-sample validation (DAPA-CKD) are SGLT2 inhibitor
-  trials. The scenario is now an "illustrative SGLT2i-like intervention".
-- **The demo banner no longer says "synthetic calibration".** The public tier has been
-  trial-anchored since Round 7; the banner had not caught up.
-- **`model_core.py`'s header showed the v1 equation** and stated that "v2 is opt-in" — neither
-  was true any more. A reviewer opening the central file would not have known which equation
-  produced the figures. The header now carries the v2 equation, and the legacy v1 helpers are
-  explicitly marked as being on no live path.
+### Not adopted (and why)
 
-## Round 12 — closing the file-by-file review
+- **An ML classifier (RF/XGBoost) to detect AKI from ICD codes.** The proposal is to train a
+  model to predict labels (`N17.x`, `584.x`) that *we already have*. If the ICD codes are
+  trustworthy enough to be training labels, use them directly as a filter; if they are not,
+  a classifier trained on them inherits the same unreliability. The genuinely useful ideas in
+  that section are the **cleaner index date** and the **stability weighting**, neither of
+  which needs machine learning — and those remain the top open item.
+- **MICE / VAE imputation of covariates.** In v2 the per-visit UACR is no longer used at all
+  (albuminuria is an *output*), which is what the 63 %-imputed figure was really about. Only
+  the baseline value now matters, and the primary analysis already restricts to patients where
+  it is observed. Also: imputing UACR from eGFR and then using UACR to predict the eGFR
+  trajectory is close to circular.
+- **Optuna / contextual bandits to tune `f_scale` and multistarts.** `f_scale` is set from the
+  robust MAD of the residuals — a principled choice. Tuning it to minimise CV RMSE would push
+  it toward down-weighting real signal as if it were outliers, which is precisely the failure
+  mode robust loss exists to avoid.
+- **JAX autodiff, global optimisers (basinhopping / differential_evolution).** With 5
+  parameters, a finite-difference Jacobian costs 6 residual evaluations; after Round 9's ~7×
+  speedup and `--n-jobs`, that is not the constraint. Worth revisiting only if the parameter
+  count grows (e.g. if an explicit AKI state is added).
+- **Full Bayesian (PyMC / NUTS).** Attractive, and it would express `q`'s unidentifiability
+  honestly as a prior-dominated posterior. But we already *know* that from the k-fold check
+  (Round 10), obtained without a heavy new dependency. This is a real future direction, not a
+  fix.
+
+## Round 13 — closing the file-by-file review
 
 ### Fixed
 
@@ -117,7 +121,7 @@ Notable fixes and changes to NephroQ, driven by several rounds of detailed code 
   there: personalization must never take down the app. The reviewer's point stands in general,
   though, and these should become specific exceptions with a logged warning once logging exists.
 
-## Round 11 — honest uncertainty, and one model in the file
+## Round 12 — honest uncertainty, and one model in the file
 
 ### Fixed
 
@@ -145,10 +149,66 @@ Notable fixes and changes to NephroQ, driven by several rounds of detailed code 
 
 ### Notes
 
-Three findings from the same review — the pre-filled fictitious history, historical
-creatinines converted with the patient's *current* age, and the personalization being silently
-overwritten when a MIMIC/private calibration was active — were already fixed and are covered
-by tests.
+This round continues the same external review as Round 11. The three findings fixed there —
+the pre-filled fictitious history, historical creatinines converted with the patient's
+*current* age, and personalization being silently overwritten under a MIMIC/private
+calibration — are covered by tests and are not repeated here.
+
+## Round 11 — three critical bugs found by external review
+
+### Fixed — critical
+
+- **The app personalized every patient from a FICTITIOUS history.** The measurement editor
+  shipped pre-filled with example creatinines (`1.05, 1.15, 1.22`). A user who entered only
+  today's markers and never typed a single historical value still saw **"Personalized to this
+  patient"** — computed from invented data. The editor now starts **empty**, and the example
+  history is behind an explicit button labelled *"Example measurement history — NOT patient
+  data."*
+
+- **Personalization was silently discarded whenever a MIMIC or private calibration was
+  loaded.** `project()` overwrote the personalized `q`/`k_hf`/weights with population values
+  for any tier that was not `public`, while the interface went on announcing "Personalized to
+  this patient". The inferred injury rate is a **multiplier relative to the population model**,
+  so the fix is structural: the personalizer is now parameterized by the *active* population
+  calibration, trained against it, and its estimator is cached per tier. An estimator built
+  around the trial-anchored model cannot be transplanted onto a MIMIC calibration whose hazard
+  is twice as fast.
+
+- **The calibration fitted v2 but EVALUATED with v1.** Not in the review — found while
+  checking it. `calibrate_mimic.py` still called the old unbounded `predict_egfr_at` in three
+  places: the bootstrap-derived risk, Mode B (baseline forecast) and Mode C (KFRE comparison).
+  Parameters were being estimated under one set of dynamics and scored under another. All
+  three now use `predict_egfr_at_v2`. **No live path uses v1 any more.**
+
+### Fixed — high
+
+- **Historical creatinines were converted with the patient's CURRENT age.** A sample drawn
+  ten years ago was run through CKD-EPI with today's age, which systematically *understates*
+  the historical eGFR and makes the decline look flatter than it was. The bias grows with the
+  length of the history — precisely the histories that carry the most information. Each value
+  is now converted with the age the patient had at the time.
+
+### Changed — honesty of the claims
+
+- **`q` is described as what it is.** The README opened by presenting `q` as the central
+  parameter "estimated from clinical trajectories", while the repository's own experiments
+  show it is close to unidentifiable from routine data. It is now stated as a
+  **population-level structural parameter**, with individual heterogeneity carried by the
+  **injury-rate multiplier** — which is the recoverable quantity, and the more interesting
+  claim.
+- **Ensemble spread is no longer dressed up as a confidence interval.** The app reported
+  `q = 1.72 ± 0.13`. That ± is the disagreement between the networks in the ensemble, not an
+  interval with known coverage. It is now labelled "ensemble spread", and `q` is marked
+  *experimental*.
+- **The therapy toggle no longer claims a combined SGLT2i/ACEi-ARB effect.** Both the
+  calibration (CREDENCE) and the out-of-sample validation (DAPA-CKD) are SGLT2 inhibitor
+  trials. The scenario is now an "illustrative SGLT2i-like intervention".
+- **The demo banner no longer says "synthetic calibration".** The public tier has been
+  trial-anchored since Round 7; the banner had not caught up.
+- **`model_core.py`'s header showed the v1 equation** and stated that "v2 is opt-in" — neither
+  was true any more. A reviewer opening the central file would not have known which equation
+  produced the figures. The header now carries the v2 equation, and the legacy v1 helpers are
+  explicitly marked as being on no live path.
 
 ## Round 10 — cross-validation: is the parameter even identifiable?
 
