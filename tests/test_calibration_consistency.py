@@ -181,10 +181,27 @@ def test_bootstrap_calibrate_returns_requested_count():
                              sbp_series=np.full(n_visits, 130.0)))
     point = cal.calibrate(patients, verbose=False, n_multistarts=1)
     boot = cal.bootstrap_calibrate(patients, point, n_boot=3, seed=1)
-    assert len(boot) == 3
-    for b in boot:
+    assert boot["n_requested"] == 3
+    assert len(boot["params"]) == boot["n_successful"]
+    for b in boot["params"]:
         assert set(b.keys()) == {"q", "k_hf", "w_a1c", "w_uacr", "w_sbp"}
         assert np.isfinite(b["q"]) and b["q"] > 0
+
+
+def test_bootstrap_failures_are_counted_not_swallowed():
+    """
+    A failed replicate used to be printed and forgotten. If 12 of 15 fail, the
+    JSON would silently carry a 3-replicate "uncertainty band" and the reader
+    would have no way to know. The counts must survive into the result.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    import calibrate_mimic as cal
+
+    boot = cal.bootstrap_calibrate([], dict(q=1.5, k_hf=0.01, w_a1c=0.01,
+                                            w_uacr=0.01, w_sbp=0.01),
+                                   n_boot=2, seed=1)
+    assert boot["n_requested"] == 2
+    assert boot["n_successful"] + boot["n_failed"] == 2
 
 def test_bootstrap_disabled_returns_empty_list():
     """n_boot=0 must return an empty list (the app's signal to fall back to
@@ -192,7 +209,7 @@ def test_bootstrap_disabled_returns_empty_list():
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
     import calibrate_mimic as cal
     point = dict(q=1.5, k_hf=0.01, w_a1c=0.01, w_uacr=0.01, w_sbp=0.01)
-    assert cal.bootstrap_calibrate([{}], point, n_boot=0) == []
+    assert cal.bootstrap_calibrate([{}], point, n_boot=0) == []   # sentinel for "no bootstrap"
 
 def test_filter_kfre_comparable():
     """The KFRE cohort is defined by KFRE's OWN four variables -- age, sex,
@@ -637,3 +654,68 @@ def test_kfold_folds_are_disjoint_by_patient():
     assert total_test == len(pats)                       # every patient tested exactly once
     for f in cv["folds"]:
         assert f["n_train"] + f["n_test"] == len(pats)   # and never in both
+
+
+def test_mode_b_does_not_return_nan_when_a_baseline_covariate_is_unobserved():
+    """
+    THE BUG THIS CATCHES: `pac.get("hba1c_baseline_strict", fallback)` returns the
+    fallback only when the key is MISSING. A key that is PRESENT but NaN -- exactly
+    what an unobserved baseline covariate looks like -- sails through. And
+    `nan or x` returns nan, because nan is truthy in Python.
+
+    On the real MIMIC run this turned the Mode B RMSE into `nan` for every horizon.
+    A metric that silently reports `nan` is worse than one that errors.
+    """
+    import calibrate_mimic as cal
+
+    pac = dict(patient_id="X", t=np.array([0.0, 2.0, 5.0]),
+               e=np.array([50.0, 44.0, 35.0]), egfr0=50.0,
+               hba1c_baseline_strict=float("nan"),      # present but NOT observed
+               uacr_baseline_strict=300.0,
+               sbp_baseline_strict=float("nan"),
+               hba1c_series=np.full(3, 8.0), uacr_series=np.full(3, 300.0),
+               sbp_series=np.full(3, 140.0))
+    params = dict(q=2.79, k_hf=0.0034, w_a1c=0.011, w_uacr=0.013, w_sbp=0.008)
+
+    out = cal.evaluate_baseline_forecast(params, [pac],
+                                         defaults={"hba1c": 7.0, "sbp": 132.0, "uacr": 20.0})
+    for key in ("year_2.0", "year_5.0"):
+        assert key in out
+        assert np.isfinite(out[key]["rmse_mL_min"]), f"{key} RMSE is not finite"
+    assert out["n_baseline_hba1c_imputed"] == 1     # and it is REPORTED, not hidden
+
+
+def test_the_risk_probability_is_not_degenerate():
+    """
+    THE BUG THIS CATCHES: averaging the threshold indicator over bootstrap
+    replicates ALONE produced a probability that only ever took the values 0.000
+    or 1.000 -- the replicates are nearly identical, so either all of them cross or
+    none do. It was a hard threshold on baseline eGFR wearing a probability's
+    clothes, and on the real MIMIC hold-out it scored **AUC = 0.500 at 2 years**.
+
+    A usable probability must vary continuously with the patient, which requires
+    propagating the two dispersion sources that dominate: measurement noise on the
+    baseline eGFR, and between-patient heterogeneity in the injury rate.
+    """
+    import calibrate_mimic as cal
+
+    rng = np.random.default_rng(0)
+    boot = [dict(core.TRIAL_CALIBRATION_V2, q=2.79 + rng.normal(0, 0.02),
+                 k_hf=0.0034 * (1 + rng.normal(0, 0.03)))
+            for _ in range(15)]
+
+    risks = [cal.nephroq_risk_from_bootstrap(boot, 8.0, 500.0, 140.0, float(e0), 2.0,
+                                             n_draws=200)
+             for e0 in (58, 50, 42, 35, 28, 22, 17)]
+
+    # risks are listed for DECREASING baseline eGFR, so they must be non-decreasing:
+    # a sicker patient can never be given a lower probability
+    assert all(a <= b for a, b in zip(risks, risks[1:])), risks
+    assert len({round(r, 3) for r in risks}) >= 5
+    assert any(0.02 < r < 0.98 for r in risks), "probability is still degenerate"
+
+    # and the old parameter-only behaviour is still reachable, and still degenerate
+    old = [cal.nephroq_risk_from_bootstrap(boot, 8.0, 500.0, 140.0, float(e0), 2.0,
+                                           meas_sd=0, rate_log_sd=0)
+           for e0 in (58, 42, 28, 17)]
+    assert set(old) <= {0.0, 1.0}
