@@ -6,7 +6,6 @@ repository.
 
 ## Expected schema
 
-`mvp_calibration.py` and `hierarchical_model.py` expect a CSV with these
 columns (names are mapped automatically if you use common variants):
 
 ```
