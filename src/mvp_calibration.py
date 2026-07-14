@@ -173,7 +173,19 @@ def res_pop(p):
     for pat in cohort:
         pat["w"]=w; out.append((predict(q,khf,pat["cov"],w,pat["t"],pat["e0"])-pat["e"])/3.0)
     r=np.concatenate(out); return np.where(np.isfinite(r),r,50.)
-sol=least_squares(res_pop,[0,np.log(0.012),*np.log([0.014,0.018,0.011])],method="trf",max_nfev=2500)
+# Robust loss. Real eGFR series contain acute spikes (an AKI episode, a bad draw)
+# that are NOT chronic progression. Plain least squares squares those residuals and
+# lets a handful of them steer the fit; soft_l1 grows linearly in the tail instead.
+# f_scale is set to the observed spread of the residuals at the initial guess, so
+# "outlier" means large RELATIVE TO THIS COHORT, not to a hard-coded constant.
+# calibrate_mimic.py already does this; mvp_calibration did not, which meant the
+# own-data path was fitted with a different, more fragile objective than the MIMIC
+# path.
+_r0 = res_pop(np.array([0, np.log(0.012), *np.log([0.014, 0.018, 0.011])]))
+_f_scale = float(max(1.4826 * np.median(np.abs(_r0 - np.median(_r0))), 1e-3))  # robust sigma
+sol = least_squares(res_pop, [0, np.log(0.012), *np.log([0.014, 0.018, 0.011])],
+                    method="trf", max_nfev=2500,
+                    loss="soft_l1", f_scale=_f_scale, x_scale="jac")
 q_hat=0.8+1.7/(1+np.exp(-sol.x[0])); khf_hat=np.exp(sol.x[1]); w_hat=np.exp(sol.x[2:5])
 for p in cohort: p["w"]=w_hat
 print(f"Population parameters:  q={q_hat:.2f}   k_hf={khf_hat:.4f}   w={np.round(w_hat,4)}")
