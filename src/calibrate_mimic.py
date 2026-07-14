@@ -87,7 +87,7 @@ G_MAX, ALPHA, N_FLOOR, K0_FIX = core.G_MAX, core.ALPHA, core.N_FLOOR, core.K0_DE
 N_of_egfr = core.N_of_egfr
 egfr_of_N = core.egfr_of_N
 
-def predict_egfr(q, khf, pac, w, t_query):
+def predict_egfr(q, khf, pac, w, t_query, base=None):
     """
     v2 predictor: saturating hyperfiltration + ENDOGENOUS albuminuria.
 
@@ -97,7 +97,7 @@ def predict_egfr(q, khf, pac, w, t_query):
     dataset. Missing baseline covariates fall back to the patient's first
     observed value, never to a future one.
     """
-    p = dict(core.TRIAL_CALIBRATION_V2)
+    p = dict(base or core.TRIAL_CALIBRATION_V2)
     p.update(q=q, k_hf=khf, w_a1c=w[0], w_uacr=w[1], w_sbp=w[2])
 
     def _base(key, series):
@@ -114,14 +114,15 @@ def predict_egfr(q, khf, pac, w, t_query):
     return core.predict_egfr_at_v2(pac["egfr0"], a1c, uacr0, sbp, 0.0, p, t_query)
 
 
-def _residual_chunk(patients_chunk, q, khf, w, noise_sd):
+def _residual_chunk(patients_chunk, q, khf, w, noise_sd, base=None):
     """Residuals for one chunk of patients. Module-level (not a closure) so that
     it can be pickled and shipped to worker processes."""
     out = []
     for pac in patients_chunk:
         n_i = max(len(pac["t"]), 1)
         per_patient_scale = noise_sd * np.sqrt(n_i)
-        out.append((predict_egfr(q, khf, pac, w, pac["t"]) - pac["e"]) / per_patient_scale)
+        out.append((predict_egfr(q, khf, pac, w, pac["t"], base=base) - pac["e"])
+                   / per_patient_scale)
     return np.concatenate(out) if out else np.array([])
 
 
@@ -209,14 +210,77 @@ def load_cohort(csv_path):
     return patients, missingness
 
 
+# Parameter bounds. These are GUARDS, not knowledge: if a fit lands ON one of
+# them, the estimate is censored by the box, not determined by the data, and the
+# right response is to widen the box and see where the optimum actually is -- not
+# to report the boundary value. `--q-max` exists for exactly that experiment.
 LO = np.array([0.5, 1e-4, 1e-4, 1e-4, 1e-4])
 HI = np.array([3.0, 0.06, 0.06, 0.06, 0.06])
+
+
+def set_q_max(q_max):
+    """Widen (or narrow) the upper bound on q. Used to test whether an estimate
+    sitting at q = 3.000 is a real optimum or just the ceiling."""
+    HI[0] = float(q_max)
 # expit is the numerically stable logistic: 1/(1+exp(-p)) overflows in exp for
 # very negative p (harmless here, but it emits RuntimeWarnings during fitting).
 def unpack(p): return LO + (HI - LO) * expit(p)
 def pack(th):
     z = np.clip((th - LO) / (HI - LO), 1e-4, 1 - 1e-4)
     return np.log(z / (1 - z))
+
+
+def profile_s_sat(patients, values=(2.0, 2.5, 3.0, 3.5, 4.5, 6.0), noise_sd=8.7,
+                  n_jobs=1, max_patients=None, verbose=True):
+    """
+    PROFILE LIKELIHOOD over S_SAT -- where is the collapse threshold?
+
+    q and S_SAT describe different things:
+        q      = how SHARP the transition is
+        S_SAT  = WHERE it happens (s = S_SAT, i.e. a particular eGFR)
+
+    S_SAT is fixed at 3.5 (eGFR ~44) from the trial placebo arms. If the real
+    breakpoint in THIS cohort sits somewhere else, the optimizer cannot say so --
+    all it can do is crank q to compensate, which is exactly what a q pinned at its
+    ceiling looks like. Fixing S_SAT and letting q absorb the mismatch confounds
+    the two.
+
+    So: fix S_SAT at each candidate, refit the other five parameters, and record
+    the cost. The minimum locates the breakpoint; the FLATNESS of the profile says
+    whether the data actually locate it at all.
+    """
+    out = []
+    for ss in values:
+        base = dict(core.TRIAL_CALIBRATION_V2)
+        base["s_sat"] = float(ss)
+        r = calibrate(patients, noise_sd=noise_sd, verbose=False, n_jobs=n_jobs,
+                      max_patients=max_patients, n_multistarts=3, base_params=base)
+        egfr_break = core.egfr_of_N(1.0 / ss)
+        out.append(dict(s_sat=float(ss), egfr_breakpoint=float(egfr_break),
+                        cost=float(r["chi2_per_n"]), q=float(r["q"]),
+                        k_hf=float(r["k_hf"]), rmse=float(r["rmse_mL_min"])))
+        if verbose:
+            print(f"      S_SAT={ss:4.1f} (breakpoint eGFR {egfr_break:5.1f})  "
+                  f"chi2/n={r['chi2_per_n']:7.3f}  rmse={r['rmse_mL_min']:5.1f}  "
+                  f"q={r['q']:6.3f}  k_hf={r['k_hf']:.5f}")
+
+    best = min(out, key=lambda d: d["cost"])
+    if verbose:
+        spread = max(d["cost"] for d in out) - min(d["cost"] for d in out)
+        rel = spread / max(best["cost"], 1e-9)
+        print(f"\n      >>> best S_SAT={best['s_sat']:.1f}  "
+              f"(collapse threshold at eGFR {best['egfr_breakpoint']:.1f})")
+        if rel < 0.02:
+            print("          But the profile is FLAT (cost varies <2% across the whole range):")
+            print("          the data do NOT locate the breakpoint. Keep the trial-anchored")
+            print("          S_SAT and say so; do not report this minimum as an estimate.")
+        else:
+            print(f"          The profile is informative (cost varies {100*rel:.0f}% across")
+            print("          the range), so the data DO locate the breakpoint.")
+        if best["q"] >= HI[0] - 1e-6:
+            print("          NOTE: q is still at its ceiling even at the best S_SAT --")
+            print("          widen --q-max before drawing conclusions.")
+    return dict(profile=out, best=best)
 
 
 def cross_validate(patients, k=5, seed=42, noise_sd=8.7, n_jobs=1, max_patients=None,
@@ -308,7 +372,14 @@ def cross_validate(patients, k=5, seed=42, noise_sd=8.7, n_jobs=1, max_patients=
         span = bound_hi[key] - bound_lo[key]
         tol = 0.01 * span                       # within 1% of a bound counts as pinned
         n_pinned = int(np.sum((v <= bound_lo[key] + tol) | (v >= bound_hi[key] - tol)))
-        if n_pinned >= max(2, len(v) // 2):     # pinned in at least half the folds
+        if n_pinned >= 1:
+            # ANY fold landing exactly on a bound is already diagnostic: the
+            # optimizer wanted to go further and was not allowed to. The earlier
+            # threshold (half the folds) was wrong and let a real case through --
+            # a fold returning q = 3.000000 on the real MIMIC cohort, while the
+            # spread across folds still looked reassuringly small (CV 0.03).
+            # A truncated estimate is also a BIASED one: the mean of the folds is
+            # pulled by the ceiling, so it understates where the data actually point.
             at_bound[key] = n_pinned
 
     unstable = [key for key in KEYS
@@ -920,7 +991,7 @@ def evaluate_holdout(params, patients, noise_sd=3.5):
 
 
 def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True, n_jobs=1,
-              n_multistarts=5, init_guess=None):
+              n_multistarts=5, init_guess=None, base_params=None):
     """
     max_patients: if set, randomly subsample the cohort (fixed seed, for
     reproducibility) before fitting. 5 parameters need nowhere near tens of
@@ -982,9 +1053,10 @@ def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True, n
         q, khf, wa, wu, wb = unpack(p)
         w = np.array([wa, wu, wb])
         if chunks is None:
-            r = [_residual_chunk([pac], q, khf, w, noise_sd) for pac in patients]
+            r = [_residual_chunk([pac], q, khf, w, noise_sd, base_params) for pac in patients]
         else:
-            parts = pool(delayed(_residual_chunk)(c, q, khf, w, noise_sd) for c in chunks)
+            parts = pool(delayed(_residual_chunk)(c, q, khf, w, noise_sd, base_params)
+                         for c in chunks)
             # regroup per patient, then restore the original order
             per_patient, k = [], 0
             for c, part in zip(chunks, parts):
@@ -1257,6 +1329,12 @@ def main():
                          "not identifiable from the cohort, which a bootstrap cannot reveal "
                          "because it resamples the same patients. 5 is a reasonable value; 0 "
                          "disables it.")
+    ap.add_argument("--q-max", type=float, default=3.0,
+                    help="Upper bound on the collapse exponent q. If a fit or a CV fold comes "
+                         "back at exactly this value, the estimate is CENSORED by the bound, "
+                         "not determined by the data -- widen it (e.g. --q-max 8) and refit. "
+                         "If q then runs to the new ceiling too, the functional form itself is "
+                         "wrong for this cohort, which is a finding, not a nuisance.")
     ap.add_argument("--index-strategy", choices=["confirmed", "first"], default="confirmed",
                     help="How the patient's BASELINE is chosen. 'confirmed' (default) is the "
                          "KDIGO rule: the index eGFR must still hold at >=90 days (not have "
@@ -1284,6 +1362,8 @@ def main():
                          "SMOKE TEST, not a result -- use 100-200 for a preliminary analysis "
                          "and 500-1000 for a number you intend to publish.")
     a = ap.parse_args()
+    set_q_max(a.q_max)
+
     if not a.from_csv and not a.mimic_dir:
         ap.error("--mimic-dir is required unless --from-csv is given.")
 
