@@ -179,6 +179,137 @@ def pack(th):
     return np.log(z / (1 - z))
 
 
+def cross_validate(patients, k=5, seed=42, noise_sd=8.7, n_jobs=1, max_patients=None,
+                   verbose=True):
+    """
+    K-fold cross-validation, split BY PATIENT.
+
+    The point is NOT a slightly better RMSE estimate. It is a STABILITY /
+    IDENTIFIABILITY check on the parameters themselves:
+
+      - If q swings wildly from fold to fold (say 1.1 -> 2.4), then q is not
+        identifiable from this cohort, and any single point estimate of it --
+        however tight its bootstrap interval looks -- is an artifact of which
+        patients happened to land in the training set.
+      - If the parameters are stable but the out-of-fold RMSE is poor, the model
+        is consistently wrong rather than unstable, which is a different problem
+        and calls for a different fix.
+
+    A bootstrap resamples the SAME patients and so cannot see this: it measures
+    sampling noise around one fit. K-fold refits the model on genuinely different
+    subsets, which is what exposes an unidentifiable parameter.
+
+    Returns per-fold parameters, their spread, and out-of-fold prediction error.
+    """
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(len(patients))
+    folds = [idx[i::k] for i in range(k)]
+
+    rows = []
+    for f in range(k):
+        test_idx = set(folds[f].tolist())
+        train = [patients[i] for i in range(len(patients)) if i not in test_idx]
+        test = [patients[i] for i in sorted(test_idx)]
+        if len(train) < 10 or len(test) < 3:
+            continue
+
+        fit = calibrate(train, noise_sd=noise_sd, seed=seed + f, verbose=False,
+                        n_jobs=n_jobs, max_patients=max_patients, n_multistarts=3)
+
+        # out-of-fold error: these patients were never seen during this fit
+        w = np.array([fit["w_a1c"], fit["w_uacr"], fit["w_sbp"]])
+        err = []
+        for pac in test:
+            pred = predict_egfr(fit["q"], fit["k_hf"], pac, w, pac["t"])
+            err.append(pred - pac["e"])
+        err = np.concatenate(err) if err else np.array([np.nan])
+
+        rows.append(dict(fold=f, n_train=len(train), n_test=len(test),
+                         q=fit["q"], k_hf=fit["k_hf"],
+                         w_a1c=fit["w_a1c"], w_uacr=fit["w_uacr"], w_sbp=fit["w_sbp"],
+                         oof_rmse=float(np.sqrt(np.nanmean(err ** 2))),
+                         oof_mae=float(np.nanmean(np.abs(err)))))
+        if verbose:
+            print(f"      fold {f + 1}/{k}: q={fit['q']:.3f}  k_hf={fit['k_hf']:.5f}  "
+                  f"out-of-fold RMSE={rows[-1]['oof_rmse']:.2f} mL/min  "
+                  f"(train {len(train)}, test {len(test)})")
+
+    if not rows:
+        return None
+
+    def spread(key):
+        v = np.array([r[key] for r in rows], dtype=float)
+        mean = float(v.mean())
+        sd = float(v.std(ddof=1)) if len(v) > 1 else 0.0
+        # coefficient of variation: how much the estimate moves relative to itself
+        cv = abs(sd / mean) if mean != 0 else np.inf
+        return dict(mean=mean, sd=sd, cv=cv, min=float(v.min()), max=float(v.max()))
+
+    summary = {key: spread(key) for key in ("q", "k_hf", "w_a1c", "w_uacr", "w_sbp",
+                                            "oof_rmse")}
+
+    # Two ways a parameter can fail to be identifiable, and they look OPPOSITE:
+    #
+    #   (a) it SWINGS across folds        -> large coefficient of variation
+    #   (b) it is PINNED AT A BOUND       -> CV of exactly 0, which naively reads
+    #                                        as perfect stability
+    #
+    # (b) is the dangerous one. If the data carry no information about a
+    # parameter, the optimizer slams it into the boundary in every fold, and a
+    # spread-based check reports it as rock-solid. A parameter sitting on its
+    # bound is degenerate, not identified. Both are flagged.
+    KEYS = ("q", "k_hf", "w_a1c", "w_uacr", "w_sbp")
+    bound_lo = dict(zip(KEYS, LO))
+    bound_hi = dict(zip(KEYS, HI))
+
+    at_bound = {}
+    for j, key in enumerate(KEYS):
+        v = np.array([r[key] for r in rows], dtype=float)
+        span = bound_hi[key] - bound_lo[key]
+        tol = 0.01 * span                       # within 1% of a bound counts as pinned
+        n_pinned = int(np.sum((v <= bound_lo[key] + tol) | (v >= bound_hi[key] - tol)))
+        if n_pinned >= max(2, len(v) // 2):     # pinned in at least half the folds
+            at_bound[key] = n_pinned
+
+    unstable = [key for key in KEYS
+                if summary[key]["cv"] > 0.20 or key in at_bound]
+
+    if verbose:
+        print(f"\n      {'parameter':<10}{'mean':>10}{'sd':>10}{'CV':>8}{'min':>10}{'max':>10}")
+        for key in KEYS:
+            st = summary[key]
+            if key in at_bound:
+                flag = f"  <-- PINNED AT BOUND in {at_bound[key]}/{len(rows)} folds"
+            elif key in unstable:
+                flag = "  <-- UNSTABLE (swings across folds)"
+            else:
+                flag = ""
+            print(f"      {key:<10}{st['mean']:10.4f}{st['sd']:10.4f}{st['cv']:8.2f}"
+                  f"{st['min']:10.4f}{st['max']:10.4f}{flag}")
+        print(f"      out-of-fold RMSE: {summary['oof_rmse']['mean']:.2f} "
+              f"+/- {summary['oof_rmse']['sd']:.2f} mL/min")
+        if unstable:
+            print(f"\n      >>> NOT IDENTIFIABLE from this cohort: {', '.join(unstable)}.")
+            print("          A bootstrap CANNOT see this -- it resamples the SAME patients, so")
+            print("          it measures noise around one fit, not whether a different set of")
+            print("          patients would have given a different answer. Do not report these")
+            print("          as estimates; fix them from an external anchor, or report a range.")
+            if at_bound:
+                print(f"\n          NOTE -- {', '.join(at_bound)} sat ON a bound in most folds.")
+                print("          That yields a spread of ~0, which naively LOOKS like perfect")
+                print("          stability. It is the opposite: the data carry no information")
+                print("          about that parameter, so the optimizer simply slams into the")
+                print("          boundary every time. This is the failure mode most likely to")
+                print("          be mistaken for a good result.")
+        else:
+            print("\n      >>> All parameters stable across folds (CV <= 20%).")
+
+    return dict(k=k, folds=rows, summary=summary, unstable=unstable, at_bound=at_bound,
+                interpretation="K-fold refits on genuinely different patient subsets. A "
+                               "parameter with a large across-fold CV is not identifiable "
+                               "from this cohort, regardless of its bootstrap interval.")
+
+
 def split_train_test(patients, test_frac=0.3, seed=42):
     """Splits by PATIENT (never by row) so no patient's data leaks across
     the split. The test set is not used anywhere in fitting or model
@@ -967,6 +1098,12 @@ def main():
     ap.add_argument("--kfre-egfr-max", type=float, default=60.0,
                     help="Upper bound of baseline eGFR for the MODE C cohort (default 60 = "
                          "an incident G3a-G4 prediction cohort).")
+    ap.add_argument("--cv-folds", type=int, default=0,
+                    help="Run K-fold cross-validation (by patient) after the primary fit. "
+                         "This is a STABILITY check: a parameter that swings across folds is "
+                         "not identifiable from the cohort, which a bootstrap cannot reveal "
+                         "because it resamples the same patients. 5 is a reasonable value; 0 "
+                         "disables it.")
     ap.add_argument("--n-jobs", type=int, default=1,
                     help="Parallel workers for the residual evaluation. Patients are "
                          "independent, so this scales close to linearly with cores. -1 uses "
@@ -1082,6 +1219,13 @@ def main():
     print(f"[diagnostics] Development defaults (training-set BASELINE medians, used to fill "
          f"missing baseline covariates without temporal leakage): "
          f"{result['development_defaults']}")
+
+    if a.cv_folds > 1:
+        print(f"[diagnostics] {a.cv_folds}-fold cross-validation (by patient) -- "
+              f"parameter STABILITY, not just accuracy:")
+        result["cross_validation"] = cross_validate(
+            train, k=a.cv_folds, noise_sd=resid_scale, n_jobs=a.n_jobs,
+            max_patients=a.max_patients)
 
     if a.n_bootstrap > 0:
         result["bootstrap_params"] = bootstrap_calibrate(train, result, n_boot=a.n_bootstrap, n_jobs=a.n_jobs,
