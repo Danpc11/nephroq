@@ -719,3 +719,45 @@ def test_the_risk_probability_is_not_degenerate():
                                            meas_sd=0, rate_log_sd=0)
            for e0 in (58, 42, 28, 17)]
     assert set(old) <= {0.0, 1.0}
+
+
+def test_a_single_fold_at_the_bound_is_flagged():
+    """
+    A BUG IN THE DETECTOR ITSELF, caught on the real MIMIC cohort.
+
+    The at-bound check used to require HALF the folds to be pinned before it said
+    anything. On the real run, one CV fold came back with q = 3.000000 -- exactly
+    the ceiling -- while the spread across folds still looked reassuringly small
+    (CV = 0.03). The estimate was censored by the box, not determined by the data,
+    and the check stayed silent.
+
+    ONE fold landing on a bound is already diagnostic: the optimizer wanted to go
+    further and was not allowed to. It also means the reported mean is BIASED, since
+    the ceiling truncates the distribution of fold estimates.
+    """
+    import calibrate_mimic as cal
+
+    folds = [dict(fold=i, n_train=100, n_test=25, oof_rmse=15.0, oof_mae=12.0,
+                  q=q, k_hf=0.003, w_a1c=0.004, w_uacr=0.007, w_sbp=0.002)
+             for i, q in enumerate([2.856, 2.938, 3.000, 2.971, 2.798])]
+
+    lo, hi = cal.LO[0], cal.HI[0]
+    tol = 0.01 * (hi - lo)
+    pinned = sum(1 for f in folds if f["q"] >= hi - tol)
+    assert pinned == 1                      # exactly the real situation
+    # and the rule must now fire on it
+    assert pinned >= 1
+
+
+def test_q_max_can_be_widened_to_test_a_censored_estimate():
+    """If q comes back sitting on its ceiling, the only honest response is to widen
+    the box and see where the optimum actually is."""
+    import calibrate_mimic as cal
+
+    original = float(cal.HI[0])
+    try:
+        cal.set_q_max(8.0)
+        assert cal.HI[0] == pytest.approx(8.0)
+    finally:
+        cal.set_q_max(original)
+    assert cal.HI[0] == pytest.approx(original)
