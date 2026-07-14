@@ -500,3 +500,65 @@ def test_fast_predictor_matches_the_canonical_simulator():
     canonical = np.interp(t_query, t, egfr)
 
     assert np.max(np.abs(fast - canonical)) < 0.05
+
+
+def test_predictor_handles_same_day_and_unsorted_visits():
+    """
+    Real visit series are not strictly increasing: hospital data routinely has
+    several creatinines on the SAME DAY (ties), and callers may pass times in any
+    order. solve_ivp rejects a non-monotone `t_eval`, so the predictor must
+    deduplicate/sort internally and scatter the results back. Without this, a
+    MIMIC calibration crashes on perfectly valid data.
+    """
+    p = core.TRIAL_CALIBRATION_V2
+
+    sorted_unique = core.predict_egfr_at_v2(55., 8., 300., 140., 0., p,
+                                            np.array([0., 1., 3., 6.]))
+    # same-day duplicates must not raise, and must repeat the same value
+    dup = core.predict_egfr_at_v2(55., 8., 300., 140., 0., p,
+                                  np.array([0., 0., 1., 1., 3.]))
+    assert dup[0] == pytest.approx(dup[1])
+    assert dup[2] == pytest.approx(dup[3])
+
+    # unsorted input must map back to the right times
+    unsorted = core.predict_egfr_at_v2(55., 8., 300., 140., 0., p,
+                                       np.array([3., 0., 6., 1.]))
+    assert np.allclose(unsorted, sorted_unique[[2, 0, 3, 1]])
+
+
+def test_mvp_calibration_uses_the_same_model_as_the_app():
+    """
+    mvp_calibration.py -- the path the README recommends for calibrating on your
+    OWN data -- used to carry its own fixed-step Euler integrator and the old
+    unbounded hazard, drifting from the app by ~13 mL/min at 10 years. A user
+    would have been fitting a DIFFERENT model from the one that then projects
+    their patients. It must call model_core.
+    """
+    import importlib.util
+    import sys as _sys
+
+    src = os.path.join(os.path.dirname(__file__), "..", "src")
+    path = os.path.join(src, "mvp_calibration.py")
+    spec = importlib.util.spec_from_file_location("mvp_calib_under_test", path)
+    mvp = importlib.util.module_from_spec(spec)
+    _sys.modules["mvp_calib_under_test"] = mvp
+
+    import matplotlib
+    matplotlib.use("Agg")
+    cwd = os.getcwd()
+    os.chdir(src)                    # the script writes its figure/report relatively
+    try:
+        spec.loader.exec_module(mvp)
+    except SystemExit:
+        pass
+    finally:
+        os.chdir(cwd)
+
+    p = core.TRIAL_CALIBRATION_V2
+    t_query = np.array([0.0, 2.0, 5.0, 10.0])
+    w = np.array([p["w_a1c"], p["w_uacr"], p["w_sbp"]])
+
+    from_mvp = mvp.predict(p["q"], p["k_hf"], (8.0, 300.0, 140.0), w, t_query, 55.0)
+    from_core = core.predict_egfr_at_v2(55.0, 8.0, 300.0, 140.0, 0.0, p, t_query)
+
+    assert np.max(np.abs(from_mvp - from_core)) < 0.01
