@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nephroq"
+version = "0.11.0"
+description = "A mechanistic digital twin for type 2 diabetes -> chronic kidney disease progression"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Daniel Pérez-Calixto" }]
+keywords = ["nephrology", "digital twin", "mechanistic model", "CKD", "type 2 diabetes"]
+
+# Lower bounds only: the model is plain numpy/scipy and does not depend on any
+# recent API. For a MANUSCRIPT, freeze the exact environment instead --
+# see requirements-lock.txt and the note below.
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+    "scikit-learn>=1.3",
+    "joblib>=1.3",
+    "pandas>=2.0",
+    "streamlit>=1.35",
+]
+
+[project.urls]
+Repository = "https://github.com/Danpc11/nephroq"
+
+[tool.pytest.ini_options]
+# Lets the tests import from src/ without each file doing its own sys.path
+# surgery, and without installing the package.
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.setuptools]
+# src/ is a flat collection of research modules, not an installable package tree.
+py-modules = []
