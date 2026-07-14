@@ -59,3 +59,26 @@ def test_three_trials_are_defined_and_span_the_egfr_range():
     egfrs = sorted(s["egfr_mean"] for s in it.TRIALS.values())
     assert len(it.TRIALS) == 3
     assert egfrs[-1] - egfrs[0] > 15.0
+
+
+def test_the_out_of_sample_pass_is_not_an_artifact_of_the_seed():
+    """
+    The virtual cohorts are random draws. If DAPA-CKD only lands inside its
+    published CI for a lucky seed, the "PASS" is noise, not a result. The
+    prediction must hold across seeds.
+    """
+    D = it.TRIALS["DAPA-CKD (T2D subgroup)"]
+    lo, hi = D["chronic_slope_ci"]
+
+    diffs = []
+    for seed in (1, 11, 42):
+        f = it.fit(n=120, seed=seed)
+        p = it.trial_arms(D, f["scale"], f["eff_met"], f["eff_hf"], f["eff_alb"],
+                          n=120, seed=seed + 500)
+        diffs.append(p["slope_diff"])
+        assert lo <= p["slope_diff"] <= hi, (
+            f"seed {seed}: chronic slope diff {p['slope_diff']:.2f} fell outside "
+            f"the published CI [{lo}, {hi}] -- the PASS depends on the seed")
+
+    # and the spread across seeds must be small relative to the CI width
+    assert float(np.std(diffs)) < 0.25 * (hi - lo)
