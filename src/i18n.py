@@ -47,10 +47,10 @@ STRINGS = {
     "quality_warning": {
         "en": "**Calibration quality warning** — the active MIMIC-IV calibration was "
               "flagged by calibrate_mimic.py as unreliable: {reasons}. Do not treat "
-              "these projections as trustworthy. See docs/KNOWN_ISSUES.md.",
+              "these projections as trustworthy.",
         "es": "**Aviso de calidad de calibración** — calibrate_mimic.py marcó la "
               "calibración MIMIC-IV activa como poco confiable: {reasons}. No trate "
-              "estas proyecciones como confiables. Ver docs/KNOWN_ISSUES.md.",
+              "estas proyecciones como confiables. Ver the README (Limitations).",
     },
     # ---- sidebar -------------------------------------------------------------
     "quality_optin": {
@@ -154,12 +154,12 @@ STRINGS = {
         "en": "90% bootstrap **parameter**-uncertainty interval, among resamples that "
               "cross the threshold: **{lo:.1f} – {hi:.1f} years**. This reflects "
               "calibration-parameter uncertainty only — not measurement noise, "
-              "individual variability, or unknown future lab values (see docs/KNOWN_ISSUES.md).",
+              "individual variability, or unknown future lab values.",
         "es": "Intervalo de incertidumbre de **parámetros** bootstrap al 90%, entre los "
               "remuestreos que cruzan el umbral: **{lo:.1f} – {hi:.1f} años**. Refleja "
               "solo la incertidumbre de los parámetros de calibración — no el ruido de "
               "medición, la variabilidad individual ni valores futuros desconocidos "
-              "(ver docs/KNOWN_ISSUES.md).",
+              "(ver the README (Limitations)).",
     },
     "boot_no_interval": {
         "en": "Fewer than half of the bootstrap resamples reach the threshold within this "
@@ -174,19 +174,19 @@ STRINGS = {
               "returned effectively identical parameters (zero spread), which indicates the "
               "calibration's optimizer did not converge properly rather than a genuinely "
               "precise estimate. Showing a band here would look falsely precise. Point "
-              "estimate only — see docs/KNOWN_ISSUES.md ('optimizer scaling').",
+              "estimate only — ('optimizer scaling').",
         "es": "**Banda de incertidumbre suprimida.** Todos los remuestreos bootstrap de esta "
               "calibración devolvieron parámetros prácticamente idénticos (dispersión cero), "
               "lo que indica que el optimizador de la calibración no convergió correctamente, "
               "no que la estimación sea realmente precisa. Mostrar una banda aquí se vería "
-              "falsamente precisa. Solo estimación puntual — ver docs/KNOWN_ISSUES.md "
+              "falsamente precisa. Solo estimación puntual — ver the README (Limitations) "
               "('optimizer scaling').",
     },
     "boot_none": {
         "en": "No bootstrap parameter-uncertainty band available for this calibration — "
-              "point estimate only (see docs/KNOWN_ISSUES.md).",
+              "point estimate only.",
         "es": "No hay banda de incertidumbre bootstrap para esta calibración — solo "
-              "estimación puntual (ver docs/KNOWN_ISSUES.md).",
+              "estimación puntual (ver the README (Limitations)).",
     },
     # ---- plot ----------------------------------------------------------------
     "band_label": {
@@ -214,9 +214,22 @@ STRINGS = {
               "del inicio de diálisis.",
     },
     "cystatin_warning": {
-        "en": "eGFR was calculated with creatinine only. In synthetic longitudinal identifiability experiments, a combined creatinine\u2013cystatin C eGFR reduced the uncertainty in estimating the feedback exponent (q). This effect has not yet been clinically validated in NephroQ, and this app uses a population q rather than re-estimating it per patient.",
-        "es": "El eGFR se calculó solo con creatinina. En experimentos sintéticos de identificabilidad longitudinal, la eGFR combinada de creatinina y cistatina C redujo la incertidumbre en la estimación del exponente de retroalimentación (q). Este efecto aún no ha sido validado clínicamente en NephroQ, y esta app usa un q poblacional en lugar de reestimarlo por paciente."
+        "en": "eGFR was calculated with creatinine only. If cystatin C is unavailable (as it "
+              "often is), you do **not** need it: in simulation experiments, **repeating the "
+              "creatinine at each visit and pulling older results from the chart beat cystatin "
+              "C alone**. What matters most is the TIME SPAN of the history, not the number of "
+              "measurements — the same 5 values spread over 6 years are worth far more than 12 "
+              "crammed into 18 months. Note this improves the estimate of the patient's injury "
+              "RATE; the collapse exponent q stays weakly identifiable either way.",
+        "es": "El eGFR se calculó solo con creatinina. Si no hay cistatina C (lo habitual), **no "
+              "la necesitas**: en experimentos de simulación, **repetir la creatinina en cada "
+              "visita y rescatar resultados viejos del expediente supera a la cistatina C "
+              "sola**. Lo que más importa es el LAPSO del historial, no el número de mediciones "
+              "— 5 valores repartidos en 6 años valen mucho más que 12 apretados en 18 meses. "
+              "Esto mejora la estimación de la TASA de daño del paciente; el exponente de "
+              "colapso q sigue siendo débilmente identificable en cualquier caso.",
     },
+
     "expander_title": {
         "en": "What does this mean? (to share with the patient/physician)",
         "es": "¿Qué significa esto? (para compartir con el paciente/médico)",
@@ -248,7 +261,7 @@ STRINGS = {
               "MIMIC-IV using robust nonlinear least squares, with patient-level bootstrap "
               "for parameter uncertainty** — not the hierarchical Bayesian workflow used for "
               "the public synthetic calibration. **It has not been validated on a prospective "
-              "clinical cohort** — see `docs/KNOWN_ISSUES.md`.",
+              "clinical cohort** — see `the README (Limitations)`.",
         "es": "Este modelo simula la pérdida progresiva de nefronas funcionales con dos "
               "mecanismos: **hiperfiltración** (al perderse nefronas, las restantes se "
               "sobrecargan y se dañan más rápido) y **compensación** (el eGFR se mantiene "
@@ -257,7 +270,7 @@ STRINGS = {
               "sobre MIMIC-IV con mínimos cuadrados no lineales robustos y bootstrap a nivel "
               "paciente para la incertidumbre de parámetros** — no del flujo bayesiano "
               "jerárquico de la calibración pública sintética. **No ha sido validado en una "
-              "cohorte clínica prospectiva** — ver `docs/KNOWN_ISSUES.md`.",
+              "cohorte clínica prospectiva** — ver `the README (Limitations)`.",
     },
     "uacr_plot_title": {
         "en": "Predicted albuminuria (UACR) — a model OUTPUT, not an input",
@@ -288,7 +301,7 @@ STRINGS = {
               "CREDENCE — and **DAPA-CKD is then predicted out-of-sample**, with both its "
               "chronic eGFR slope and its UACR reduction landing inside the published 95% CI.\n\n"
               "**It has still not been validated on a prospective clinical cohort**, and there "
-              "is no acute haemodynamic dip term. See `docs/KNOWN_ISSUES.md`.",
+              "is no acute haemodynamic dip term. See `the README (Limitations)`.",
         "es": "Este modelo simula la pérdida progresiva de nefronas mediante: "
               "**hiperfiltración** (al perderse nefronas, las restantes se sobrecargan y se "
               "dañan más rápido — pero con un techo *saturante*, acotado fisiológicamente), "
@@ -301,11 +314,53 @@ STRINGS = {
               "muestra**, cayendo tanto su pendiente crónica como su reducción de UACR dentro "
               "del IC 95% publicado.\n\n"
               "**Sigue sin estar validado en una cohorte clínica prospectiva** y no incluye el "
-              "dip hemodinámico agudo. Ver `docs/KNOWN_ISSUES.md`.",
+              "dip hemodinámico agudo. Ver `the README (Limitations)`.",
     },
     "src_trial": {
         "en": "trial-anchored v2 (CREDENCE + EMPA-KIDNEY; DAPA-CKD predicted out-of-sample)",
         "es": "v2 anclada a ensayos (CREDENCE + EMPA-KIDNEY; DAPA-CKD predicho fuera de muestra)",
+    },
+    "training_estimator": {
+        "en": "Preparing the personalization engine (one-off, ~15 s)…",
+        "es": "Preparando el motor de personalización (una sola vez, ~15 s)…",
+    },
+    "history_header": {
+        "en": "Past measurements (optional)",
+        "es": "Mediciones previas (opcional)",
+    },
+    "history_caption": {
+        "en": "Add earlier creatinine values to PERSONALIZE the model to this patient. "
+              "Needs at least 3 measurements spanning at least 9 months.",
+        "es": "Agrega creatininas anteriores para PERSONALIZAR el modelo a este paciente. "
+              "Requiere al menos 3 mediciones que abarquen al menos 9 meses.",
+    },
+    "history_years_ago": {"en": "Years ago", "es": "Hace (años)"},
+    "history_creat": {"en": "Creatinine (mg/dL)", "es": "Creatinina (mg/dL)"},
+    "personalized_on": {
+        "en": "**Personalized to this patient.** From their measurement history, the model "
+              "infers an individual injury rate of **{scale:.2f}×** the population average "
+              "(±{scale_sd:.2f}) and a collapse exponent **q = {q:.2f}** (±{q_sd:.2f}). The "
+              "projection below uses these, not the population defaults.",
+        "es": "**Personalizado a este paciente.** A partir de su historial, el modelo infiere "
+              "una tasa de daño individual de **{scale:.2f}×** el promedio poblacional "
+              "(±{scale_sd:.2f}) y un exponente de colapso **q = {q:.2f}** (±{q_sd:.2f}). La "
+              "proyección de abajo usa estos valores, no los poblacionales.",
+    },
+    "personalized_off": {
+        "en": "Using **population** parameters (anchored to published trials). To personalize, "
+              "add at least 3 past creatinine measurements spanning at least 9 months in the "
+              "sidebar.",
+        "es": "Usando parámetros **poblacionales** (anclados a ensayos publicados). Para "
+              "personalizar, agrega al menos 3 creatininas previas que abarquen al menos "
+              "9 meses en la barra lateral.",
+    },
+    "personalized_caveat": {
+        "en": "The individual injury rate is the reliable part of this personalization; **q is "
+              "only weakly identifiable** from a handful of noisy measurements, so treat its "
+              "value as indicative. See the README (Limitations).",
+        "es": "La tasa de daño individual es la parte confiable de esta personalización; **q es "
+              "sólo débilmente identificable** a partir de unas pocas mediciones ruidosas, así "
+              "que su valor es indicativo. Ver el README (Limitations).",
     },
     "footer": {
         "en": "Source code and full documentation: "
