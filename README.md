@@ -226,17 +226,22 @@ because the anchors are published aggregate results.
 **This is the recommended way to calibrate NephroQ for your population.** You do
 **not** need MIMIC-IV. Any longitudinal cohort with repeated creatinine works.
 
-### 1. Format your data as a CSV
+### 1. Format your data as a TAB-separated file (`.tsv`)
 
 One row per visit, per patient:
 
-```csv
-patient_id,time_years,egfr,hba1c,uacr,sbp
-P001,0.0,58.2,8.4,180,145
-P001,0.6,55.1,8.1,210,142
-P001,1.4,51.7,8.6,260,148
-P002,0.0,72.4,7.2,45,132
 ```
+patient_id	time_years	egfr	hba1c	uacr	sbp
+P001	0.0	58.2	8.4	180	145
+P001	0.6	55.1	8.1	210	142
+P001	1.4	51.7	8.6	260	148
+P002	0.0	72.4	7.2	45	132
+```
+
+Tabs, not commas: clinical exports routinely contain commas inside fields
+(free-text sites, `"Apellido, Nombre"`), which silently corrupt a CSV. A
+comma-separated file still works — the delimiter is sniffed from the header —
+but tabs are what this expects.
 
 | Column | Meaning | Required |
 |---|---|---|
@@ -247,8 +252,10 @@ P002,0.0,72.4,7.2,45,132
 | `uacr` | mg/g | recommended |
 | `sbp` | mmHg | recommended |
 
-Missing covariates are allowed (leave the cell empty) — they are imputed, and the
-imputation is **reported**, not hidden. But `uacr` carries a large share of the
+Missing covariates are allowed (leave the cell empty). A missing **baseline**
+covariate is filled with the **cohort's baseline median** — never with that
+patient's own later visits, which would leak the future into a baseline forecast —
+and the fraction imputed is **reported**, not hidden. But `uacr` carries a large share of the
 hazard, so a cohort with poor UACR coverage will not identify its weight well.
 
 **Minimum per patient:** at least 4 eGFR measurements spanning at least 180 days.
@@ -258,7 +265,7 @@ Shorter trajectories cannot constrain the curvature.
 
 ```bash
 cd src
-CKD_CSV=../data/my_cohort.csv python mvp_calibration.py
+CKD_DATA=../data/my_cohort.tsv python mvp_calibration.py
 ```
 
 This fits the model, compares it against a linear-slope baseline, tests whether it
