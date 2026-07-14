@@ -2,6 +2,61 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 8 — per-patient personalization (amortized inference)
+
+### Addeda
+
+- **`src/personalize.py` — the model is now personalized per patient.** Until now everya
+  patient was projected with the same population parameters: two patients with an identical
+  eGFR today got an identical future, even if one had been collapsing for three years and
+  the other was flat. Given a few past creatinine values, an **amortized (simulation-based)
+  neural estimator** now infers that patient's own injury rate and collapse exponent `q`.
+  - It is a **hybrid** model, not a black box: the network solves only the INVERSE problem,
+    and the forward projection remains the mechanistic ODE. Its output is two physically
+    meaningful numbers.
+  - It is trained **entirely on simulations from the mechanistic model**, so no patient data
+    is needed to train it.
+  - Validated on held-out virtual patients (forecast 5 years past the last visit): RMSE
+    **9.42** vs **15.55** for population parameters (**−39%**), also beating a classical
+    per-patient least-squares fit (11.61) while being ~28× faster.
+  - **Honest limit, reported in the app:** `q` is only weakly identifiable (R² ≈ 0.15) from
+    sparse noisy measurements. Nearly all the benefit comes from inferring the injury rate.
+  - With fewer than 3 measurements (or under 9 months of history) it **refuses to
+    personalize** and falls back to population parameters, saying why.
+- Measurement-history editor in the app sidebar, which drives the personalization.
+- **`src/measurement_strategy.py` — what is actually worth measuring.** Simulation
+  experiments on how well each strategy recovers a patient's parameters. Three findings, two
+  of which contradicted our own prior assumptions:
+  - **`q` is essentially unidentifiable from routine data** (R² ≈ 0.0–0.08) and **no assay
+    fixes it, cystatin C included.** The app previously claimed cystatin C reduced the error
+    in `q` roughly 5×; that claim was **wrong and has been removed**. Cystatin C helps, but it
+    helps the patient's *injury rate*, not `q`.
+  - **The time span of the history matters far more than the number of measurements.** The
+    same 4–6 creatinines spread over 4–8 years recover the injury rate ~3× better than the
+    same number crammed into 1–2 years (R² 0.59 vs 0.18), and better than 10–14 values inside
+    a short window (0.34).
+  - **Duplicate creatinine + a long history beats cystatin C alone** (R² 0.71 vs 0.67).
+    Practical consequence: pull the patient's old creatinine results from the chart. They
+    already exist and are free.
+  - **Serial UACR does not help** (0.47 vs 0.48 baseline), refuting the intuition that a
+    second cheap biomarker must add signal: in this model albuminuria is a deterministic
+    function of the same latent state, so it adds no independent information while carrying
+    large biological noise.
+
+### Fixed
+
+- **The shipped estimator can never become a liability.** `calibration/personalizer.pkl`
+  (0.6 MB) is committed so the app starts instantly, but it is *never required*: if it is
+  missing, or unloadable because scikit-learn changed its pickle format, `get_estimator()`
+  retrains it from simulations (~13 s) instead of crashing. This removes the usual fragility
+  of shipping a pickle. Training was retuned (2500 sims, ensemble of 4 nets) so that
+  first-use cost is acceptable, at negligible accuracy cost.
+- The estimator is persisted by saving its **components**, not the class instance: pickling
+  the instance recorded it as `__main__.Personalizer` when the module was run as a script,
+  which then failed to unpickle from the app. A missing or version-incompatible estimator now
+  degrades gracefully to population parameters instead of crashing.
+- `scikit-learn` was declared in `requirements.txt` but unused; it is now genuinely used.
+
 ## Round 7 — model v2, trial anchoring, and the release cleanup
 
 This round replaced the model's two weakest structural assumptions, re-anchored its
