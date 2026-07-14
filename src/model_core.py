@@ -296,17 +296,25 @@ def predict_egfr_at_v2(egfr0, a1c, uacr0, sbp, u, p, t_query, years=None):
     t_end = float(max(t_query.max(), 1e-3)) if years is None else float(years)
 
     N0 = N_of_egfr(egfr0)
-    t_eval = np.clip(t_query, 0.0, t_end)
+    t_clipped = np.clip(t_query, 0.0, t_end)
+
+    # solve_ivp requires t_eval to be STRICTLY increasing. Real visit series are
+    # not: hospital data routinely has several creatinines on the same day (ties),
+    # and a caller may pass times in any order. Integrate on the unique sorted
+    # times and scatter the results back -- otherwise this raises
+    # "Values in `t_eval` are not properly sorted" on perfectly valid data.
+    t_unique, inverse = np.unique(t_clipped, return_inverse=True)
 
     def rhs(t, y):
         N = max(y[0], 1e-3)
         return [-N * renal_hazard_v2(N, N0, a1c, uacr0, sbp, u, p)]
 
-    sol = solve_ivp(rhs, (0.0, t_end), [N0], t_eval=t_eval, method="LSODA",
+    sol = solve_ivp(rhs, (0.0, t_end), [N0], t_eval=t_unique, method="LSODA",
                     rtol=1e-6, atol=1e-9)
-    if not sol.success or sol.y.shape[1] != len(t_eval):
+    if not sol.success or sol.y.shape[1] != len(t_unique):
         # fall back to the canonical simulator rather than returning garbage
         t, egfr, _, _ = simulate_trajectory_v2(egfr0, a1c, uacr0, sbp, u=u, p=p,
                                                years=t_end, n=200)
         return np.interp(t_query, t, egfr)
-    return np.array([egfr_of_N(max(x, 1e-3)) for x in sol.y[0]])
+    egfr_unique = np.array([egfr_of_N(max(x, 1e-3)) for x in sol.y[0]])
+    return egfr_unique[inverse]
