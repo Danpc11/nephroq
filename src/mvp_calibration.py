@@ -16,35 +16,77 @@ Validations produced (the ones that convince a clinician):
   (3) Progressor discrimination (concordance of final eGFR).
 Saves a figure + a .md report with the numbers.
 
-Usage:   CKD_CSV=my_data.csv  python mvp_calibration.py
+Input file: TAB-SEPARATED (.tsv), one row per visit per patient:
+
+    patient_id\ttime_years\tegfr\thba1c\tuacr\tsbp
+    P001\t0.0\t58.2\t8.4\t180\t145
+    P001\t0.6\t55.1\t8.1\t210\t142
+
+Tabs are the default because clinical exports routinely contain commas inside
+fields (free-text sites, "Apellido, Nombre"), which silently corrupt a CSV. A
+comma-separated file still works -- the delimiter is sniffed -- but tabs are
+what this expects.
+
+Usage:   CKD_DATA=my_data.tsv  python mvp_calibration.py
+         (CKD_CSV is still honoured for backward compatibility)
 ================================================================================
 """
 import os, numpy as np
 from scipy.optimize import minimize_scalar, least_squares
 import matplotlib.pyplot as plt
 
-rng = np.random.default_rng(2)
-G_MAX, ALPHA, N_FLOOR, K0 = 120.0, 0.80, 0.05, 0.0030
+import model_core as core
+from model_core import N_of_egfr, egfr_of_N
 
-def N_of_egfr(e): return np.power(np.clip(e,1e-6,None)/G_MAX,1/ALPHA)
-def egfr_of_N(N): return G_MAX*np.power(np.clip(N,1e-9,None),ALPHA)
-def insult(cov,w):
-    a,u,s=cov; return w[0]*max(a-6.5,0)+w[1]*np.log1p(u/30)+w[2]*max(s-130,0)/10
-def simulate(q,khf,cov,w,tmax,e0,dt=0.05):
-    I=insult(cov,w); N=N_of_egfr(e0); n=int(tmax/dt)+1
-    ts=np.linspace(0,tmax,n); Ns=np.empty(n); Ns[0]=N
-    for k in range(1,n):
-        Nc=min(max(Ns[k-1],N_FLOOR),1.0); h=min(K0+khf*(1/Nc)**q+I,50.0)
-        Nn=Ns[k-1]-dt*Ns[k-1]*h; Ns[k]=min(max(Nn if np.isfinite(Nn) else N_FLOOR,N_FLOOR),1.0)
-    return ts,Ns
-def predict(q,khf,cov,w,tq,e0):
-    ts,Ns=simulate(q,khf,cov,w,float(np.max(tq))+0.1,e0)
-    return np.clip(egfr_of_N(np.interp(tq,ts,Ns)),0,G_MAX)
+rng = np.random.default_rng(2)
+G_MAX = 120.0          # physiological eGFR ceiling (same as model_core)
+
+# THE MODEL LIVES IN model_core. This file used to carry its own fixed-step Euler
+# integrator and the OLD unbounded hazard, which drifted from the app by up to
+# 13 mL/min at 10 years -- so a user who calibrated on their own data was fitting
+# a DIFFERENT model from the one the app projects with. It now calls the same
+# simulator as everything else. There is one model.
+
+def _params(q, khf, w):
+    p = dict(core.TRIAL_CALIBRATION_V2)
+    p.update(q=float(q), k_hf=float(khf),
+             w_a1c=float(w[0]), w_uacr=float(w[1]), w_sbp=float(w[2]))
+    return p
+
+def predict(q, khf, cov, w, tq, e0):
+    """eGFR at times `tq`. `cov` = (HbA1c, UACR, SBP) at BASELINE."""
+    a1c, uacr, sbp = cov
+    tq = np.atleast_1d(np.asarray(tq, dtype=float))
+    return core.predict_egfr_at_v2(e0, a1c, uacr, sbp, 0.0, _params(q, khf, w), tq)
+
+def simulate(q, khf, cov, w, tmax, e0):
+    """Kept for the synthetic-cohort generator. Returns (t, N)."""
+    a1c, uacr, sbp = cov
+    t, egfr, _, _ = core.simulate_trajectory_v2(e0, a1c, uacr, sbp, u=0.0,
+                                                p=_params(q, khf, w),
+                                                years=float(tmax), n=200)
+    return t, N_of_egfr(egfr)
 
 # --------------------------------------------------- data loading
-def load_csv(path):
+def load_table(path):
+    """
+    Read a TAB-separated visit table (a comma-separated one also works: the
+    delimiter is sniffed from the header).
+    """
+    import csv as _csv
     import pandas as pd
-    df=pd.read_csv(path)
+
+    with open(path, "r", newline="") as fh:
+        head = fh.readline()
+    if "\t" in head:
+        sep = "\t"
+    else:
+        try:
+            sep = _csv.Sniffer().sniff(head, delimiters="\t,;|").delimiter
+        except Exception:
+            sep = ","
+    print(f"  delimiter detected: {'TAB' if sep == chr(9) else repr(sep)}")
+    df = pd.read_csv(path, sep=sep)
     # flexible mapping of common names -> standard schema
     ren={c.lower():c for c in df.columns}
     def col(*names):
@@ -53,13 +95,35 @@ def load_csv(path):
         raise KeyError(f"missing column {names}")
     pid=col("patient_id","id","subject"); tt=col("time_years","time","t","years")
     eg=col("egfr","egfr_value"); ha=col("hba1c","a1c"); ua=col("uacr","acr","albuminuria"); bp=col("sbp","systolic","bp")
-    pats=[]
-    for k,g in df.groupby(df[pid]):
-        g=g.dropna(subset=[tt,eg]).sort_values(tt)
-        if len(g)<3: continue
-        cov=(float(g[ha].median()),float(g[ua].median()),float(g[bp].median()))
-        pats.append(dict(cov=cov,e0=float(g[eg].iloc[0]),
-                         t=g[tt].values.astype(float),e=g[eg].values.astype(float)))
+    # Development-set medians, used ONLY to fill a covariate a patient never had.
+    # They are computed from BASELINE rows across the cohort -- never from a
+    # patient's own later visits, which would leak the future into a baseline
+    # forecast.
+    firsts = df.sort_values(tt).groupby(df[pid]).first()
+    defaults = {c: float(firsts[c].median()) for c in (ha, ua, bp)
+                if firsts[c].notna().any()}
+
+    pats, n_imputed = [], {ha: 0, ua: 0, bp: 0}
+    for k, g in df.groupby(df[pid]):
+        g = g.dropna(subset=[tt, eg]).sort_values(tt)
+        if len(g) < 3:
+            continue
+        # BASELINE covariates: the value at (or before) the index visit.
+        cov = []
+        for c in (ha, ua, bp):
+            v = g[c].iloc[0]
+            if not np.isfinite(v):
+                v = defaults.get(c, np.nan)
+                n_imputed[c] += 1
+            cov.append(float(v))
+        pats.append(dict(cov=tuple(cov), e0=float(g[eg].iloc[0]),
+                         t=g[tt].values.astype(float), e=g[eg].values.astype(float)))
+
+    if pats:
+        for c, n in n_imputed.items():
+            if n:
+                print(f"  {c}: baseline missing for {n}/{len(pats)} patients "
+                      f"({100*n/len(pats):.0f}%) -> filled with the cohort baseline median")
     return pats
 
 def make_synth(n=200):
@@ -91,11 +155,14 @@ def make_synth(n=200):
         P.append(dict(cov=cov,e0=e0,t=tg,e=np.maximum(eg+rng.normal(0,3.0,len(eg)),1)))
     return P
 
-CSV=os.environ.get("CKD_CSV","")
-if CSV and os.path.exists(CSV):
-    print(f"Real data: {CSV}"); cohort=load_csv(CSV); SYNTH=False
+DATA = os.environ.get("CKD_DATA", "") or os.environ.get("CKD_CSV", "")
+if DATA and os.path.exists(DATA):
+    print(f"Real data: {DATA}")
+    cohort = load_table(DATA); SYNTH = False
 else:
-    print("No CSV -> synthetic cohort (demo).  For real data: CKD_CSV=file.csv"); cohort=make_synth(); SYNTH=True
+    print("No input file -> synthetic cohort (demo).  For real data: "
+          "CKD_DATA=my_data.tsv  (tab-separated)")
+    cohort = make_synth(); SYNTH = True
 for p in cohort: p["w"]=np.array([0.0144,0.018,0.0108])
 print(f"{len(cohort)} patients loaded.\n")
 
@@ -188,7 +255,7 @@ plt.tight_layout(); plt.savefig("../results/mvp_validation.png",dpi=130)
 with open("../results/validation_report.md","w") as f:
     f.write(f"""# NephroQ — Validation Report
 
-**Data source:** {"synthetic (demonstration)" if SYNTH else CSV}
+**Data source:** {"synthetic (demonstration)" if SYNTH else DATA}
 **Patients:** {len(cohort)}
 
 ## Calibrated population parameters
