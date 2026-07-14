@@ -203,7 +203,7 @@ is implemented above and in Round 9 respectively.
 
 ### Fixed — three bugs, one of them capable of killing a running calibration
 
-- 🔴 **`predict_egfr_at_v2` crashed on same-day lab draws.** The Round 9 speedup (below)
+- **`predict_egfr_at_v2` crashed on same-day lab draws.** The Round 9 speedup (below)
   integrates straight onto the visit times, and `solve_ivp` requires `t_eval` to be
   **strictly increasing**. Real data is not: hospital records routinely contain several
   creatinines drawn on the **same day**, and callers may pass times in any order. The result
@@ -211,7 +211,7 @@ is implemented above and in Round 9 respectively.
   The predictor now deduplicates and sorts internally, then scatters the results back to the
   requested order.
 
-- 🔴 **`mvp_calibration.py` was fitting a DIFFERENT model from the one the app projects
+- **`mvp_calibration.py` was fitting a DIFFERENT model from the one the app projects
   with.** It carried its own fixed-step Euler integrator and the **old unbounded hazard**,
   bypassing `model_core` entirely. On the same patient with the same parameters it drifted by
   up to **13 mL/min at 10 years** (10.9 vs 24.0). Since this is the path the README recommends
@@ -220,7 +220,7 @@ is implemented above and in Round 9 respectively.
   class of bug as the two diverging integrators fixed in an earlier round, and it is now
   locked down by a test.
 
-- 🟠 **Temporal leakage in the own-data loader.** Covariates were taken as the **median over
+- **Temporal leakage in the own-data loader.** Covariates were taken as the **median over
   each patient's whole trajectory**, which feeds a patient's own future into a supposedly
   baseline forecast. They are now taken at **baseline**, and a missing baseline is filled from
   the **cohort's baseline median** — never from that patient's later visits. The imputed
