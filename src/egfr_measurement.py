@@ -11,7 +11,6 @@ Three assays, from lower to higher precision (and lower measurement noise):
   3) eGFR_cr_cys  : creatinine + cystatin (best) -> lower noise  <- recommended
 
 Lower noise => the feedback exponent q is identified much better
-(see noise_identifiability.py: q = 1.78±0.15 -> 1.61±0.11 -> 1.54±0.03).
 
 Units: Scr in mg/dL ; Scys in mg/L ; age in years ; sex='F' or 'M'.
 ================================================================================
