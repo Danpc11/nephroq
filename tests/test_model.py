@@ -76,3 +76,51 @@ def test_gfr_category():
     assert core.gfr_category(95) == "G1"
     assert core.gfr_category(47) == "G3a"
     assert core.gfr_category(10) == "G5"
+
+
+def test_model_core_contains_exactly_one_model():
+    """
+    A reviewer opening model_core.py must not find two families of equations and
+    have to guess which one produced the figures. The unbounded v1 hazard and its
+    integrators were dead code; they are gone.
+    """
+    import inspect
+    src = inspect.getsource(core)
+    for dead in ("def renal_hazard(", "def simulate_trajectory(",
+                 "def predict_egfr_at(", "def hyperfiltration_hazard(",
+                 "def simulate_trajectory_dynamic(", "def predict_egfr_at_dynamic("):
+        assert dead not in src, f"dead v1 function still present: {dead}"
+    # and the v2 model is there
+    assert hasattr(core, "simulate_trajectory_v2")
+    assert hasattr(core, "renal_hazard_v2")
+
+
+def test_batched_bootstrap_ode_matches_the_per_replicate_loop():
+    """
+    predict_egfr_at_v2_batched stacks every bootstrap replicate into ONE
+    B-dimensional ODE solve (~19x faster than B separate solve_ivp calls, whose
+    per-call overhead dominates a 1-D problem). It must give the same answer as
+    the loop it replaces -- this project has already been bitten by two
+    integrators that silently diverged.
+    """
+    base = core.TRIAL_CALIBRATION_V2
+    rng = np.random.default_rng(0)
+    boot = [dict(base,
+                 q=float(1.52 + rng.normal(0, 0.12)),
+                 k_hf=float(base["k_hf"] * (1 + rng.normal(0, 0.15))))
+            for _ in range(25)]
+    t_query = np.array([1.0, 3.0, 7.0])
+
+    batched = core.predict_egfr_at_v2_batched(55., 8., 300., 140., 0.0, boot, t_query)
+    looped = np.stack([core.predict_egfr_at_v2(55., 8., 300., 140., 0.0, p, t_query)
+                       for p in boot])
+
+    assert batched.shape == (len(boot), len(t_query))
+    assert np.max(np.abs(batched - looped)) < 0.01
+
+
+def test_batched_ode_handles_an_empty_bootstrap():
+    """No bootstrap replicates must not crash -- it must return an empty result so
+    the caller can report 'no uncertainty band' rather than a fake one."""
+    out = core.predict_egfr_at_v2_batched(55., 8., 300., 140., 0.0, [], np.array([5.0]))
+    assert out.shape == (0, 1)
