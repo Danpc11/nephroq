@@ -6,14 +6,14 @@ Notable fixes and changes to NephroQ, driven by several rounds of detailed code 
 
 ### Fixed — critical
 
-- 🔴 **The app personalized every patient from a FICTITIOUS history.** The measurement editor
+- **The app personalized every patient from a FICTITIOUS history.** The measurement editor
   shipped pre-filled with example creatinines (`1.05, 1.15, 1.22`). A user who entered only
   today's markers and never typed a single historical value still saw **"Personalized to this
   patient"** — computed from invented data. The editor now starts **empty**, and the example
   history is behind an explicit button labelled *"Example measurement history — NOT patient
   data."*
 
-- 🔴 **Personalization was silently discarded whenever a MIMIC or private calibration was
+- **Personalization was silently discarded whenever a MIMIC or private calibration was
   loaded.** `project()` overwrote the personalized `q`/`k_hf`/weights with population values
   for any tier that was not `public`, while the interface went on announcing "Personalized to
   this patient". The inferred injury rate is a **multiplier relative to the population model**,
@@ -22,7 +22,7 @@ Notable fixes and changes to NephroQ, driven by several rounds of detailed code 
   around the trial-anchored model cannot be transplanted onto a MIMIC calibration whose hazard
   is twice as fast.
 
-- 🔴 **The calibration fitted v2 but EVALUATED with v1.** Not in the review — found while
+- **The calibration fitted v2 but EVALUATED with v1.** Not in the review — found while
   checking it. `calibrate_mimic.py` still called the old unbounded `predict_egfr_at` in three
   places: the bootstrap-derived risk, Mode B (baseline forecast) and Mode C (KFRE comparison).
   Parameters were being estimated under one set of dynamics and scored under another. All
@@ -30,7 +30,7 @@ Notable fixes and changes to NephroQ, driven by several rounds of detailed code 
 
 ### Fixed — high
 
-- 🟠 **Historical creatinines were converted with the patient's CURRENT age.** A sample drawn
+- **Historical creatinines were converted with the patient's CURRENT age.** A sample drawn
   ten years ago was run through CKD-EPI with today's age, which systematically *understates*
   the historical eGFR and makes the decline look flatter than it was. The bias grows with the
   length of the history — precisely the histories that carry the most information. Each value
@@ -62,7 +62,7 @@ Notable fixes and changes to NephroQ, driven by several rounds of detailed code 
 
 ### Fixed
 
-- 🔴 **The auditor never checked albuminuria.** `audit_calibration.py` is the gate that
+- **The auditor never checked albuminuria.** `audit_calibration.py` is the gate that
   decides whether a MIMIC calibration may be shipped, but it only tested the placebo-arm
   slopes — while `insilico_trial.py` had been testing the UACR endpoint all along. The
   auditor now checks both.
@@ -73,17 +73,17 @@ Notable fixes and changes to NephroQ, driven by several rounds of detailed code 
   second gate**, not an independent confirmation. Recorded in the code so it cannot be
   mistaken for one.
 
-- 🔴 **Failed bootstrap replicates were printed and forgotten.** If 12 of 15 failed, the JSON
+- **Failed bootstrap replicates were printed and forgotten.** If 12 of 15 failed, the JSON
   silently carried a three-replicate "uncertainty band" and no reader could tell. The counts
   (`n_requested`, `n_successful`, `n_failed`, and the first failures) are now written to
   `bootstrap_diagnostics`, and a warning is printed.
 
-- 🟠 **`mvp_calibration.py` fitted with a non-robust objective.** `calibrate_mimic.py` uses
+- **`mvp_calibration.py` fitted with a non-robust objective.** `calibrate_mimic.py` uses
   `soft_l1` with a data-driven `f_scale`; the own-data path used plain least squares, so a
   handful of AKI spikes could steer the whole fit. It now uses the same robust loss, with
   `f_scale` set from the cohort's own residual spread (robust MAD), not a hard-coded constant.
 
-- 🟠 **The "bootstrap degenerate" warning was written for modellers, not clinicians** (and
+- **The "bootstrap degenerate" warning was written for modellers, not clinicians** (and
   ended in a dangling `('optimizer scaling')` fragment). Rewritten in both languages to say
   plainly what it means: the fit never moved, so its numbers carry no information — re-run it.
 
@@ -121,7 +121,7 @@ Notable fixes and changes to NephroQ, driven by several rounds of detailed code 
 
 ### Fixed
 
-- 🔴 **The ensemble spread was being sold as uncertainty, and it was ~7× too narrow.**
+- **The ensemble spread was being sold as uncertainty, and it was ~7× too narrow.**
   `personalize.py` claimed "their disagreement IS the uncertainty". Measured on held-out
   virtual patients, a nominal 90% band built from that spread covered the truth **32.8%** of
   the time for `q` and **41.5%** for the injury rate. Quoting it as "±" was false precision.
@@ -133,12 +133,12 @@ Notable fixes and changes to NephroQ, driven by several rounds of detailed code 
   of the calibrated interval: **89.5%** and **91.2%** against a nominal 90%. The raw spread is
   still exposed, but as `q_spread` — never as an interval. A test now fails if coverage drifts.
 
-- 🔴 **The app claimed the parameters came from "hierarchical Bayesian inference on synthetic
+- **The app claimed the parameters came from "hierarchical Bayesian inference on synthetic
   data".** That module has not been part of the tree for several rounds; the active parameters
   are anchored to published trial data. The claim was false, and it appeared in the app's own
   "About the model" panel (EN and ES) and in `CITATION.cff`. Corrected.
 
-- 🟠 **`model_core.py` still carried the entire v1 model as dead code** — the unbounded
+- **`model_core.py` still carried the entire v1 model as dead code** — the unbounded
   hazard, its integrator, and its predictor — none of it called from anywhere. A reviewer
   opening the central file would find two families of equations and no way to tell which one
   produced the figures. Removed, and locked by a test.
