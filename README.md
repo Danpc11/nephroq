@@ -17,10 +17,14 @@ the time to a **modeled eGFR < 15 mL/min/1.73 m² threshold** — a kidney-funct
 threshold, **not** a prediction of when dialysis would actually start (real KRT
 initiation depends on symptoms, labs and clinical judgment).
 
-**Why "NephroQ":** the model's central, physically meaningful parameter is `q`,
-the hyperfiltration feedback exponent that quantifies how abrupt the terminal
-collapse of renal function is. It is estimated from clinical trajectories, not
-fitted as a black box.
+**Why "NephroQ":** `q` is the hyperfiltration feedback exponent — the parameter
+that sets how abrupt the terminal collapse of renal function is. It is a
+**population-level structural parameter**: the repository's own experiments show
+`q` is close to unidentifiable from routine clinical data (see
+[Per-patient personalization](#per-patient-personalization-ai)). Individual
+heterogeneity is therefore captured not through `q` but through a **personal
+injury-rate multiplier**, which *is* recoverable. That is a more useful — and
+more honest — claim than "we estimate each patient's `q`".
 
 ---
 
@@ -47,7 +51,7 @@ published clinical trials, so it works out of the box.
 git clone https://github.com/Danpc11/nephroq.git
 cd nephroq
 python -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt          # or requirements-lock.txt to reproduce exactly
 
 streamlit run app_web.py          # interactive app (English / Spanish)
 ```
@@ -119,6 +123,8 @@ patient with the same eGFR the same future. **If you supply a few past
 creatinine values, NephroQ infers that patient's own parameters.**
 
 Two patients with an identical eGFR of 55 today:
+
+The headline output is the **injury rate**, not `q`:
 
 | History | Inferred injury rate | Modeled time to eGFR<15 |
 |---|---|---|
@@ -325,7 +331,8 @@ Useful flags:
 --cv-folds 5          # K-fold CV: is each parameter even IDENTIFIABLE from this cohort?
 --n-jobs -1           # use every core (see below) -- results are IDENTICAL to serial
 --n-bootstrap 200     # 15 = smoke test ONLY; 100-200 preliminary; 500-1000 for a manuscript
---from-csv path.csv   # reuse a previously built cohort, skipping the slow rebuild
+--keep-cohort        # KEEP the cohort file (TSV) -- otherwise it is deleted after the fit
+--from-cohort path   # reuse it, skipping the slow re-read of labevents.csv.gz
 ```
 
 **Speed.** The fit integrates one ODE per patient per residual evaluation, so a full
@@ -340,7 +347,7 @@ run on thousands of patients is expensive. Two things make it tractable:
 Do a cheap diagnostic run before committing to a long one:
 
 ```bash
-python calibrate_mimic.py --from-csv ../data/_mimic_tmp.csv \
+python calibrate_mimic.py --from-cohort ../data/_mimic_cohort.tsv \
     --chronic-only --n-jobs -1 --n-bootstrap 0 --max-patients 800
 ```
 
@@ -377,7 +384,7 @@ evidence; all the weight is on DAPA-CKD:
 The run writes `results/insilico_trial_report.md`.
 
 ```bash
-python -m pytest tests -q      # 47 tests
+python -m pytest tests -q      # 73 tests
 ```
 
 ---
@@ -399,7 +406,7 @@ nephroq/
 │   ├── mvp_calibration.py      # calibrate + validate on YOUR data
 │   ├── calibrate_mimic.py      # optional: calibrate on MIMIC-IV
 │   └── mimic_loader.py         # optional: MIMIC-IV cohort builder
-├── tests/                      # 47 tests
+├── tests/                      # 73 tests
 ├── docs/
 │   ├── MODEL_DOCUMENTATION.md  # mathematical specification
 │   ├── CLINICIAN_DEMO.md       # 7-minute clinician demo script
