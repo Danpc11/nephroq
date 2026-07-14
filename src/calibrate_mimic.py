@@ -1257,6 +1257,13 @@ def main():
                          "not identifiable from the cohort, which a bootstrap cannot reveal "
                          "because it resamples the same patients. 5 is a reasonable value; 0 "
                          "disables it.")
+    ap.add_argument("--index-strategy", choices=["confirmed", "first"], default="confirmed",
+                    help="How the patient's BASELINE is chosen. 'confirmed' (default) is the "
+                         "KDIGO rule: the index eGFR must still hold at >=90 days (not have "
+                         "recovered by >30%%). This stops a creatinine drawn during an acute "
+                         "episode -- sepsis, dehydration, contrast -- from being recorded as "
+                         "the patient's chronic baseline, which over-diagnoses. 'first' is the "
+                         "old rule; run both to MEASURE the size of that bias.")
     ap.add_argument("--blas-threads", default="1",
                     help="Threads each worker's BLAS may use. Default 1, which is what you "
                          "want with --n-jobs: the workers are separate processes, and BLAS "
@@ -1288,7 +1295,8 @@ def main():
         print(f"[1/3] Skipping MIMIC-IV rebuild -- calibrating directly from {a.from_csv}")
     else:
         print("[1/3] Building the cohort from local MIMIC-IV (never leaves your machine)...")
-        build_mimic_csv(a.mimic_dir, tmp_csv, a.min_span_days, a.min_points)
+        build_mimic_csv(a.mimic_dir, tmp_csv, a.min_span_days, a.min_points,
+                        index_strategy=a.index_strategy)
 
     print("\n[2/3] Calibrating the mechanistic model...")
     patients, missingness = load_cohort(tmp_csv)
