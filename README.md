@@ -315,8 +315,31 @@ Useful flags:
 
 ```bash
 --chronic-only        # keep only net-declining, lower-volatility trajectories
+--n-jobs -1           # use every core (see below) -- results are IDENTICAL to serial
 --n-bootstrap 200     # 15 = smoke test ONLY; 100-200 preliminary; 500-1000 for a manuscript
 --from-csv path.csv   # reuse a previously built cohort, skipping the slow rebuild
+```
+
+**Speed.** The fit integrates one ODE per patient per residual evaluation, so a full
+run on thousands of patients is expensive. Two things make it tractable:
+
+- the predictor integrates **straight onto the visit times** rather than onto a dense
+  grid it then interpolates — ~**7× faster**, and numerically identical (<10⁻⁶ mL/min);
+- `--n-jobs` splits the patients across cores. They are independent, and the residual
+  vector is reassembled in the **original patient order**, so the optimizer sees exactly
+  what it would have seen serially. A regression test asserts the two agree to 10⁻⁹.
+
+Do a cheap diagnostic run before committing to a long one:
+
+```bash
+python calibrate_mimic.py --from-csv ../data/_mimic_tmp.csv \
+    --chronic-only --n-jobs -1 --n-bootstrap 0 --max-patients 800
+```
+
+Then audit whatever it produces **before** trusting it:
+
+```bash
+python audit_calibration.py
 ```
 
 ---
