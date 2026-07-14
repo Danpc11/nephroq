@@ -162,16 +162,23 @@ def sample_cohort(spec, n, rng):
     return dict(egfr=egfr, uacr=uacr, hba1c=hba1c, sbp=sbp)
 
 
-def _params(scale, eff_met=0.0, eff_hf=0.0, eff_alb=0.0):
-    """Model parameters = model_core's v2 defaults, with the fitted scales applied."""
-    p = dict(core.TRIAL_CALIBRATION_V2)
+def _params(scale, eff_met=0.0, eff_hf=0.0, eff_alb=0.0, base=None):
+    """
+    Model parameters = a base calibration with the fitted scales applied.
+
+    `base` defaults to model_core's trial-anchored v2 parameters. Passing a
+    different base (e.g. a MIMIC calibration) lets the auditor ask whether THOSE
+    parameters can reproduce the published trials.
+    """
+    p = dict(base or core.TRIAL_CALIBRATION_V2)
     p.update(k_hf=K_HF_BASE * scale,
              w_a1c=W_BASE[0] * scale, w_uacr=W_BASE[1] * scale, w_sbp=W_BASE[2] * scale,
              eff_met=eff_met, eff_hf=eff_hf, eff_alb=eff_alb)
     return p
 
 
-def trial_arms(spec, scale, eff_met, eff_hf, eff_alb, n=400, seed=11, skip_years=0.15):
+def trial_arms(spec, scale, eff_met, eff_hf, eff_alb, n=400, seed=11, skip_years=0.15,
+               base=None):
     """
     Run both arms of a virtual trial through model_core's v2 simulator.
 
@@ -186,7 +193,7 @@ def trial_arms(spec, scale, eff_met, eff_hf, eff_alb, n=400, seed=11, skip_years
     yrs = spec["duration_years"]
     out = {}
     for u, arm in ((0.0, "placebo"), (1.0, "treated")):
-        p = _params(scale, eff_met, eff_hf, eff_alb)
+        p = _params(scale, eff_met, eff_hf, eff_alb, base=base)
         slopes, uacr_ratio = [], []
         for i in range(n):
             t, egfr, uacr, _ = core.simulate_trajectory_v2(
