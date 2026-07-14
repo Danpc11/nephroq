@@ -447,3 +447,56 @@ def test_hazard_is_finite_and_capped():
     for N in (0.9, 0.3, 0.05, 1e-3):
         h = core.renal_hazard_v2(N, 0.6, 9.0, 2000.0, 170.0, 0.0, p)
         assert np.isfinite(h) and 0.0 < h <= 50.0
+
+
+def _synthetic_cohort(n_patients=30, seed=0):
+    rng = np.random.default_rng(seed)
+    pats = []
+    for i in range(n_patients):
+        n = int(rng.integers(5, 15))
+        t = np.sort(rng.uniform(0, 4, n)); t[0] = 0.0
+        e0 = float(rng.uniform(25, 90)); a1c = float(rng.uniform(6, 10))
+        ua = float(np.exp(rng.uniform(3, 6))); sbp = 140.0
+        e = np.clip(e0 - rng.uniform(2, 8) * t + rng.normal(0, 4, n), 4, None)
+        pats.append(dict(patient_id=str(i), t=t, e=e, egfr0=e0,
+                         hba1c_baseline_strict=a1c, uacr_baseline_strict=ua,
+                         sbp_baseline_strict=sbp,
+                         hba1c_series=np.full(n, a1c), uacr_series=np.full(n, ua),
+                         sbp_series=np.full(n, sbp)))
+    return pats
+
+
+def test_parallel_calibration_is_identical_to_serial():
+    """
+    Parallelism must be a pure speedup, never a change of answer. Patients are
+    chunked across workers and reassembled in the ORIGINAL order, so the residual
+    vector the optimizer sees is bit-for-bit the serial one. If someone breaks the
+    reordering, the fit would silently drift -- this catches that.
+    """
+    import calibrate_mimic as cal
+
+    pats = _synthetic_cohort()
+    serial = cal.calibrate(pats, noise_sd=8.7, verbose=False, n_multistarts=1, n_jobs=1)
+    parallel = cal.calibrate(pats, noise_sd=8.7, verbose=False, n_multistarts=1, n_jobs=4)
+
+    assert serial["q"] == pytest.approx(parallel["q"], abs=1e-9)
+    assert serial["k_hf"] == pytest.approx(parallel["k_hf"], abs=1e-12)
+    assert serial["chi2_per_n"] == pytest.approx(parallel["chi2_per_n"], abs=1e-9)
+
+
+def test_fast_predictor_matches_the_canonical_simulator():
+    """
+    predict_egfr_at_v2 integrates straight onto the visit times instead of using a
+    dense grid + interpolation (~7x faster). It must still agree with the canonical
+    simulator -- this project has already been bitten once by two integrators that
+    silently diverged.
+    """
+    p = core.TRIAL_CALIBRATION_V2
+    t_query = np.array([0.0, 0.7, 1.9, 3.4, 6.0])
+
+    fast = core.predict_egfr_at_v2(55.0, 8.0, 300.0, 140.0, 0.0, p, t_query)
+    t, egfr, _, _ = core.simulate_trajectory_v2(55.0, 8.0, 300.0, 140.0, u=0.0,
+                                                p=p, years=6.0, n=800)
+    canonical = np.interp(t_query, t, egfr)
+
+    assert np.max(np.abs(fast - canonical)) < 0.05
