@@ -130,7 +130,7 @@ def compare_to_trials(cal):
     return scale_mimic
 
 
-def survives_the_trials(cal, n=250):
+def survives_the_trials(cal, n=250, tol=0.30):
     """The real judge: can the MIMIC parameters reproduce a published placebo arm?"""
     print("\n[3] DOES THE MIMIC CALIBRATION SURVIVE THE IN-SILICO TRIALS?")
     print("    (its parameters are asked to reproduce the PUBLISHED placebo-arm slopes;")
@@ -159,13 +159,43 @@ def survives_the_trials(cal, n=250):
         ratios.append(model / pub)
         print(f"    {name:<26}{model:9.2f}{pub:11.2f}{model/pub:8.2f}x")
 
+    # SECOND ENDPOINT: the treated arm's UACR reduction. The placebo-slope check
+    # above tests only the PROGRESSION parameters. A calibration can get those
+    # right and still be wrong about albuminuria, which in v2 is an OUTPUT of the
+    # same hazard -- so it is an independent constraint, and insilico_trial.py
+    # already tests it. The auditor used to ignore it.
+    print(f"\n    {'trial (UACR reduction)':<26}{'model':>9}{'published':>11}{'in CI?':>8}")
+    uacr_ok = True
+    for name, spec in it.TRIALS.items():
+        if not spec.get("uacr_reduction_ci"):
+            continue
+        p_treat = dict(p)
+        p_treat.update(eff_met=core.TRIAL_CALIBRATION_V2["eff_met"],
+                       eff_hf=core.TRIAL_CALIBRATION_V2["eff_hf"],
+                       eff_alb=core.TRIAL_CALIBRATION_V2["eff_alb"])
+        arms = it.trial_arms(spec, 1.0, p_treat["eff_met"], p_treat["eff_hf"],
+                             p_treat["eff_alb"], n=n, seed=7, base=p)
+        u = arms["uacr_reduction_pct"]
+        lo, hi = spec["uacr_reduction_ci"]
+        ok = lo <= u <= hi
+        uacr_ok &= ok
+        print(f"    {name:<26}{u:9.1f}{spec['uacr_reduction_pct']:11.1f}"
+              f"{'yes' if ok else 'NO':>8}")
+
     worst = max(abs(np.log(r)) for r in ratios)
+    slope_ok = worst < np.log(1.0 + tol)
     print()
-    if worst < np.log(1.3):
-        print("    >>> PASSES: the MIMIC parameters reproduce every published placebo arm to")
-        print("        within 30%. This calibration is usable.")
+    if slope_ok and uacr_ok:
+        print(f"    >>> PASSES: the MIMIC parameters reproduce every published placebo arm to")
+        print(f"        within {100*tol:.0f}%, AND the treated-arm UACR reduction lands inside the")
+        print("        published CIs. This calibration is usable.")
     else:
-        print("    >>> FAILS: the MIMIC parameters cannot reproduce the real placebo arms.")
+        if not slope_ok:
+            print("    >>> FAILS on the PLACEBO SLOPES: the MIMIC parameters cannot reproduce")
+            print("        the untreated progression seen in real trials.")
+        if not uacr_ok:
+            print("    >>> FAILS on the UACR reduction: the progression parameters distort")
+            print("        albuminuria, which in v2 is an output of the same hazard.")
         print("        Do NOT ship these parameters in the app, regardless of how good the")
         print("        internal chi2/n looks -- an internally consistent fit to a biased")
         print("        cohort is still biased. The trial-anchored defaults remain the safer")
@@ -195,6 +225,12 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Audit a MIMIC calibration against the trials")
     ap.add_argument("--json", default=DEFAULT_JSON)
     ap.add_argument("--n", type=int, default=250, help="virtual patients per trial arm")
+    ap.add_argument("--tol", type=float, default=0.30,
+                    help="How far a modelled placebo slope may sit from the published one "
+                         "before the calibration is rejected, as a fraction. 0.30 (i.e. 30%%) "
+                         "is a judgement call, not a standard: it is roughly the width of the "
+                         "published slope CIs themselves, so a model inside it is not "
+                         "distinguishable from the trial. Tighten it for a manuscript.")
     a = ap.parse_args()
 
     cal = load(a.json)
@@ -205,6 +241,6 @@ if __name__ == "__main__":
     moved = check_optimizer(cal)
     compare_to_trials(cal)
     if moved:
-        survives_the_trials(cal, n=a.n)
+        survives_the_trials(cal, n=a.n, tol=a.tol)
     else:
         print("\n[3] SKIPPED -- the optimizer never moved, so its parameters mean nothing.")
