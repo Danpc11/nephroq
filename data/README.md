@@ -1,4 +1,4 @@
-# data/
+# data
 
 Place your real data (CSV) here to calibrate the model. **This folder is
 excluded from git** (see `.gitignore`) — never push patient data to the
