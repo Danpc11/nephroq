@@ -22,11 +22,6 @@ the hyperfiltration feedback exponent that quantifies how abrupt the terminal
 collapse of renal function is. It is estimated from clinical trajectories, not
 fitted as a black box.
 
-> ### ⚠️ Research prototype (TRL 4) — NOT a diagnostic tool
-> Not validated on a prospective clinical cohort. Must not be used for clinical
-> decisions without qualified medical supervision. Projections illustrate the
-> model's *mechanism*; they are not individualized clinical predictions.
-
 ---
 
 ## Table of contents
