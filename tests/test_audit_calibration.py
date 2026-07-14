@@ -58,6 +58,27 @@ def test_agreement_is_reported_when_the_sources_converge(capsys):
     assert "agree" in out.lower()
 
 
+def test_underestimate_message_does_not_blame_chronic_only(capsys):
+    """
+    TAREA 2 regression. When MIMIC decishes SLOWER than the trials (ratio < 0.8),
+    the auditor used to blame --chronic-only for selecting stable patients. That is
+    backwards: --chronic-only selects DECLINING trajectories, so it biases toward
+    progressors and would push the ratio UP. A ratio < 1 on this cohort points to a
+    lack of signal in the insult covariates (near-normoalbuminuric UACR), and the
+    fix is --anchor-weights, not a change of cohort filter.
+    """
+    slow = _cal(k_hf=0.0103 * 0.35, w_a1c=0.0105 * 0.35, w_uacr=0.0131 * 0.35,
+                w_sbp=0.0079 * 0.35)
+    audit.compare_to_trials(slow)
+    out = capsys.readouterr().out
+    assert "SLOWER" in out
+    # must NOT tell the user a stable-patient cohort is understating progression
+    assert "dominated by stable patients" not in out
+    # must point at the real cause and the real fix
+    assert "anchor-weights" in out
+    assert "normoalbuminuric" in out.lower()
+
+
 def test_reference_scale_matches_model_core():
     """The audit must compare against the SAME anchored parameters the app ships."""
     ref = core.TRIAL_CALIBRATION_V2
