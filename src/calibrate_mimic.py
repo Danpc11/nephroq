@@ -564,32 +564,90 @@ def _calibration_slope_intercept(probs, labels, max_iter=100, tol=1e-8):
     return float(beta[0]), float(beta[1])
 
 
-def nephroq_risk_from_bootstrap(bootstrap_params, a1c, uacr, sbp, egfr0, horizon):
+# Dispersion sources for the risk probability. The bootstrap alone is NOT enough
+# (see nephroq_risk_from_bootstrap): parameter uncertainty is the SMALLEST of the
+# three, and on its own it produces a degenerate 0-or-1 "probability".
+RISK_MEAS_SD = 8.7      # mL/min: within-patient dispersion of eGFR (the value the
+                        # cohort diagnostics report). A baseline eGFR is one noisy
+                        # draw, not the patient's true level.
+RISK_RATE_LOG_SD = 0.45  # log-normal SD of the individual injury-rate multiplier.
+                         # Patients are not the population mean; personalize.py
+                         # recovers multipliers spanning roughly 0.25x-3x.
+RISK_N_DRAWS = 400       # Monte-Carlo draws over (bootstrap x noise x heterogeneity)
+
+
+def nephroq_risk_from_bootstrap(bootstrap_params, a1c, uacr, sbp, egfr0, horizon,
+                                meas_sd=RISK_MEAS_SD, rate_log_sd=RISK_RATE_LOG_SD,
+                                n_draws=RISK_N_DRAWS, seed=0):
     """
-    Turn NephroQ's mechanistic projection into an actual PROBABILITY, so it can
-    be compared with KFRE on more than rank-based metrics (AUC).
+    P_NQ(T <= h) = P( eGFR(h) < 15 ) for this patient.
 
-        P_NQ(T <= h) = (1/B) * sum_b  1[ eGFR_b(h) < 15 ]
+    WHY THIS IS NOT JUST THE BOOTSTRAP FRACTION
+    -------------------------------------------
+    The original version averaged the indicator over bootstrap replicates alone.
+    That FAILS, and it fails in a way that looks fine until you check: the
+    replicates are nearly identical, so either all of them cross the threshold or
+    none do. The "probability" it returned was literally binary -- only ever 0.000
+    or 1.000 -- which is a hard threshold on baseline eGFR wearing a probability's
+    clothes. On the held-out MIMIC cohort it produced **AUC = 0.500 at 2 years**:
+    no discrimination at all, because every eligible patient got the same P.
 
-    i.e. the fraction of bootstrap parameter resamples under which this patient
-    crosses the threshold by the horizon. This unlocks Brier score and
-    calibration slope/intercept, which a bare score (-eGFR) cannot support.
+    Calibration-parameter uncertainty is the SMALLEST of the three things that
+    make a patient's future uncertain. The two that dominate:
 
-    All B replicates are integrated in ONE ODE solve (see
-    model_core.predict_egfr_at_v2_batched): the replicates are independent
-    trajectories, so they stack into a single B-dimensional system. ~19x faster
-    than looping. The thresholding itself is nanoseconds and was never the
-    bottleneck.
+      1. MEASUREMENT NOISE. A baseline eGFR is one noisy draw; within-patient
+         dispersion in this cohort is ~8.7 mL/min. Whether a patient sits at 22 or
+         at 30 changes their 2-year risk enormously, and we do not know which.
+      2. INDIVIDUAL HETEROGENEITY. Patients do not progress at the population rate.
+         personalize.py recovers per-patient injury-rate multipliers spanning
+         ~0.25x-3x; ignoring that spread pretends every patient is average.
 
-    CAVEAT: this propagates ONLY calibration-parameter uncertainty. It does not
-    include measurement noise, individual random effects, or unknown future
-    covariates, so it will tend to be UNDER-dispersed (too confident).
+    All three are propagated here by Monte Carlo. The result is a real probability
+    that varies continuously with the patient, which is what an AUC, a Brier score
+    or a calibration slope actually require.
+
+    Set meas_sd=0 and rate_log_sd=0 to recover the old parameter-only behaviour.
     """
     if not bootstrap_params:
         return None
-    egfr = core.predict_egfr_at_v2_batched(
-        egfr0, a1c, uacr, sbp, 0.0, bootstrap_params, np.array([float(horizon)]))
-    return float((egfr[:, 0] < core.DIALYSIS_eGFR).mean())
+
+    rng = np.random.default_rng(seed)
+    B = len(bootstrap_params)
+
+    # draw (parameter set, measurement noise, individual rate) jointly
+    idx = rng.integers(0, B, size=n_draws)
+    egfr_draws = egfr0 + rng.normal(0.0, meas_sd, size=n_draws) if meas_sd > 0 \
+        else np.full(n_draws, float(egfr0))
+    egfr_draws = np.clip(egfr_draws, 5.0, 150.0)
+    rate_mult = np.exp(rng.normal(0.0, rate_log_sd, size=n_draws)) if rate_log_sd > 0 \
+        else np.ones(n_draws)
+
+    crossed = 0
+    # group the draws by parameter set so each solve is batched
+    for b in range(B):
+        sel = np.flatnonzero(idx == b)
+        if sel.size == 0:
+            continue
+        # A bootstrap replicate carries only the 5 FITTED parameters; the structural
+        # ones (k0, s_sat, beta, eff_*) come from the model defaults. Building on
+        # TRIAL_CALIBRATION_V2 rather than on the bare replicate keeps every key the
+        # simulator needs.
+        base = dict(core.TRIAL_CALIBRATION_V2)
+        base.update(bootstrap_params[b])
+        # the individual multiplier scales the whole hazard (hyperfiltration +
+        # metabolic insult), exactly as personalize.py applies it
+        psets = [dict(base,
+                      k_hf=base["k_hf"] * m,
+                      w_a1c=base["w_a1c"] * m,
+                      w_uacr=base["w_uacr"] * m,
+                      w_sbp=base["w_sbp"] * m)
+                 for m in rate_mult[sel]]
+        for k, ps in zip(sel, psets):
+            e = core.predict_egfr_at_v2(float(egfr_draws[k]), a1c, uacr, sbp, 0.0,
+                                        ps, np.array([float(horizon)]))[0]
+            crossed += (e < core.DIALYSIS_eGFR)
+
+    return float(crossed) / float(n_draws)
 
 def evaluate_kfre_benchmark(params, patients, horizons=(2.0, 5.0),
                             development_defaults=None,
@@ -739,7 +797,30 @@ def evaluate_kfre_benchmark(params, patients, horizons=(2.0, 5.0),
     return out or None
 
 
-def evaluate_baseline_forecast(params, patients, horizons=(2.0, 5.0), tolerance_years=0.5):
+def _as_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _finite_or(value, fallback):
+    """
+    dict.get(key, default) returns the default only when the key is MISSING. A key
+    that is PRESENT but NaN -- which is exactly what an unobserved baseline
+    covariate looks like -- sails straight through. And `nan or x` returns nan,
+    because nan is truthy in Python. Both mistakes were live here and turned the
+    Mode B RMSE into `nan`.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+    return v if np.isfinite(v) else float(fallback)
+
+
+def evaluate_baseline_forecast(params, patients, horizons=(2.0, 5.0), tolerance_years=0.5,
+                               defaults=None):
     """
     MODE B (prospective baseline forecast) --
     "three evaluation modes". Uses ONLY each patient's BASELINE (first
@@ -767,6 +848,7 @@ def evaluate_baseline_forecast(params, patients, horizons=(2.0, 5.0), tolerance_
     q, khf, w = params["q"], params["k_hf"], np.array([params["w_a1c"], params["w_uacr"], params["w_sbp"]])
     per_horizon = {h: [] for h in horizons}
     n_used = 0
+    n_imputed_baseline = 0
     for pac in patients:
         t, e = pac["t"], pac["e"]
         if len(t) < 1:
@@ -778,9 +860,15 @@ def evaluate_baseline_forecast(params, patients, horizons=(2.0, 5.0), tolerance_
         # back to series[0] only if strict values weren't computed (e.g. an
         # older CSV without them) -- shouldn't happen when this function is
         # only ever called on a filter_kfre_comparable() cohort.
-        a1c0 = pac.get("hba1c_baseline_strict", pac["hba1c_series"][0])
-        uacr0 = pac.get("uacr_baseline_strict", pac["uacr_series"][0])
-        sbp0 = pac.get("sbp_baseline_strict") or pac["sbp_series"][0]
+        # A baseline covariate can be PRESENT-but-NaN (not observed at/before the
+        # index date). Fall back to the DEVELOPMENT-set median -- the same value
+        # Mode C uses -- never to the patient's own later visits, which would leak
+        # the future into a baseline forecast.
+        d = defaults or {}
+        a1c0 = _finite_or(pac.get("hba1c_baseline_strict"), d.get("hba1c", 7.5))
+        uacr0 = _finite_or(pac.get("uacr_baseline_strict"), d.get("uacr", 30.0))
+        sbp0 = _finite_or(pac.get("sbp_baseline_strict"), d.get("sbp", 135.0))
+        n_imputed_baseline += (not np.isfinite(_as_float(pac.get("hba1c_baseline_strict"))))
         p_v2 = dict(core.TRIAL_CALIBRATION_V2)
         p_v2.update(q=q, k_hf=khf, w_a1c=w[0], w_uacr=w[1], w_sbp=w[2])
         used_patient = False
@@ -801,6 +889,7 @@ def evaluate_baseline_forecast(params, patients, horizons=(2.0, 5.0), tolerance_
             out[f"year_{h}"] = dict(n_patients=len(errs), rmse_mL_min=round(float(np.sqrt(np.mean(errs))), 2))
     out["n_patients_evaluated"] = n_used
     out["n_patients_available"] = len(patients)
+    out["n_baseline_hba1c_imputed"] = int(n_imputed_baseline)
     return out
 
 
@@ -1337,7 +1426,11 @@ def main():
 
     kfre_test = filter_kfre_comparable(test)
     if kfre_test:
-        baseline_forecast = evaluate_baseline_forecast(result, kfre_test)
+        # Development-set BASELINE medians -- the same values Mode C uses to fill an
+        # unobserved baseline covariate. Computed from the TRAINING patients only.
+        dev_defaults = compute_development_defaults(train)
+        baseline_forecast = evaluate_baseline_forecast(result, kfre_test,
+                                                       defaults=dev_defaults)
         result["holdout_baseline_forecast"] = baseline_forecast
         print(f"[diagnostics] Held-out, MODE B (baseline eGFR forecast, baseline covariates "
              f"held constant -- an eGFR-accuracy metric, NOT a KFRE benchmark; see MODE C): "
