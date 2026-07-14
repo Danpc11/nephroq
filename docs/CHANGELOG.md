@@ -2,11 +2,60 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 10 — cross-validation: is the parameter even identifiable?
+
+### Added
+
+- **`--cv-folds`: K-fold cross-validation, split by patient.** The point is *not* a slightly
+  better RMSE estimate — it is a **stability / identifiability check on the parameters
+  themselves**. If `q` swings from 1.1 to 2.4 depending on which patients land in the
+  training set, then `q` is not identifiable from that cohort, and any point estimate of it
+  is an artifact of the split.
+
+  **A bootstrap cannot see this.** It resamples the *same* patients, so it measures sampling
+  noise around one fit — not whether a genuinely different set of patients would have given a
+  different answer. A tight bootstrap interval on an unidentifiable parameter is false
+  precision, and this is the check that catches it.
+
+- **Detection of parameters pinned at a bound — the dangerous false green.** Writing the
+  check above immediately exposed a flaw in it. On a deliberately uninformative cohort
+  (short follow-up, high noise), `q` came back as `[0.50, 0.50, 0.50, 0.50]`: a coefficient
+  of variation of **0.00**, which a spread-based check reports as *perfectly stable*. It is
+  the opposite. 0.50 is the optimizer's lower bound: the data carry no information, so the
+  fit slams into the boundary every time. A parameter sitting on its bound is **degenerate,
+  not identified**. Both failure modes — swinging across folds, and pinned at a bound — are
+  now flagged, and both are covered by tests.
+
+  Note how the out-of-fold RMSE fails to raise the alarm on its own: 8.80 mL/min on the
+  uninformative cohort versus 2.94 on the informative one. Only ~3× worse, entirely
+  publishable-looking — while the parameters underneath it are meaningless.
+
+### Not adopted (and why)
+
+A review was received that targets a **different codebase** (a LightGBM binary classifier on
+kidney-transplant data: `grado_histologico`, `time_tx`, `inmunosupresion`, `cmv`). None of
+those variables exist here, and NephroQ contains no classifier at all. Recorded for the
+avoidance of doubt:
+
+- **SMOTE / class balancing** — there are no classes. NephroQ predicts *trajectories* from an
+  ODE; synthesising patients by interpolating in feature space would break the mechanistic
+  coherence that makes the model falsifiable.
+- **Deep learning "to capture complex non-linear interactions"** — this would destroy the
+  property that lets the model be *caught being wrong*. The unbounded-hazard error of Round 7
+  was found precisely because the parameters are physical. Inside a neural network, it would
+  have shown up only as a slightly larger loss.
+- **SHAP** — the parameters already have physical meaning; there is nothing opaque to explain.
+- **MDRD for eGFR** — a regression. This project uses CKD-EPI 2021 (no race coefficient).
+- **Optuna, drift monitoring** — no relevant hyperparameters, and nothing is in production.
+
+What *did* apply from that review — cross-validation, and the warning about data leakage —
+is implemented above and in Round 9 respectively.
+
 ## Round 9 — calibration speed, a calibration auditor, and one model everywhere
 
 ### Fixed — three bugs, one of them capable of killing a running calibration
 
-- 🔴 **`predict_egfr_at_v2` crashed on same-day lab draws.** The Round 9 speedup (below)
+-  **`predict_egfr_at_v2` crashed on same-day lab draws.** The Round 9 speedup (below)
   integrates straight onto the visit times, and `solve_ivp` requires `t_eval` to be
   **strictly increasing**. Real data is not: hospital records routinely contain several
   creatinines drawn on the **same day**, and callers may pass times in any order. The result
@@ -14,7 +63,7 @@ Notable fixes and changes to NephroQ, driven by several rounds of detailed code 
   The predictor now deduplicates and sorts internally, then scatters the results back to the
   requested order.
 
-- 🔴 **`mvp_calibration.py` was fitting a DIFFERENT model from the one the app projects
+-  **`mvp_calibration.py` was fitting a DIFFERENT model from the one the app projects
   with.** It carried its own fixed-step Euler integrator and the **old unbounded hazard**,
   bypassing `model_core` entirely. On the same patient with the same parameters it drifted by
   up to **13 mL/min at 10 years** (10.9 vs 24.0). Since this is the path the README recommends
@@ -23,7 +72,7 @@ Notable fixes and changes to NephroQ, driven by several rounds of detailed code 
   class of bug as the two diverging integrators fixed in an earlier round, and it is now
   locked down by a test.
 
-- 🟠 **Temporal leakage in the own-data loader.** Covariates were taken as the **median over
+-  **Temporal leakage in the own-data loader.** Covariates were taken as the **median over
   each patient's whole trajectory**, which feeds a patient's own future into a supposedly
   baseline forecast. They are now taken at **baseline**, and a missing baseline is filled from
   the **cohort's baseline median** — never from that patient's later visits. The imputed
