@@ -74,11 +74,11 @@ import model_core as core
 warnings.filterwarnings("ignore", category=UserWarning)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# The trained estimator is a CACHE, not an artifact of the repository: it is
-# derived entirely from simulations of the mechanistic model, so it can always be
-# regenerated. It is therefore git-ignored and trained on first use (~13 s),
-# rather than committing a binary blob that would also break whenever scikit-learn
-# changes its pickle format.
+# The trained estimator IS committed to the repository, so the app starts
+# instantly. But it is never REQUIRED: it is derived entirely from simulations of
+# the mechanistic model, so if it is missing -- or unloadable because scikit-learn
+# changed its pickle format -- get_estimator() simply retrains it (~13 s). That
+# removes the usual fragility of shipping a pickle.
 MODEL_PATH = os.path.join(HERE, "..", "calibration", "personalizer.pkl")
 
 # Training configuration. Chosen by measuring the cost/accuracy trade-off:
@@ -256,9 +256,10 @@ def get_estimator(force_retrain=False):
     """
     Return the estimator, training it if necessary.
 
-    Order: in-process cache -> on-disk cache -> train from scratch (~13 s).
-    Nothing here is committed to the repository: the estimator is derived purely
-    from simulations of the mechanistic model, so it is always reproducible.
+    Order: in-process cache -> the committed estimator on disk -> train from
+    scratch (~13 s). The committed file is a convenience, never a dependency: the
+    estimator is derived purely from simulations of the mechanistic model, so a
+    missing or version-incompatible pickle is retrained rather than fatal.
     """
     if not force_retrain and "est" in _CACHE:
         return _CACHE["est"]
