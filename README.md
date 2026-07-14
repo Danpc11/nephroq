@@ -322,6 +322,7 @@ Useful flags:
 
 ```bash
 --chronic-only        # keep only net-declining, lower-volatility trajectories
+--cv-folds 5          # K-fold CV: is each parameter even IDENTIFIABLE from this cohort?
 --n-jobs -1           # use every core (see below) -- results are IDENTICAL to serial
 --n-bootstrap 200     # 15 = smoke test ONLY; 100-200 preliminary; 500-1000 for a manuscript
 --from-csv path.csv   # reuse a previously built cohort, skipping the slow rebuild
