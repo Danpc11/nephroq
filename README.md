@@ -22,12 +22,18 @@ the hyperfiltration feedback exponent that quantifies how abrupt the terminal
 collapse of renal function is. It is estimated from clinical trajectories, not
 fitted as a black box.
 
+> ### ⚠️ Research prototype (TRL 4) — NOT a diagnostic tool
+> Not validated on a prospective clinical cohort. Must not be used for clinical
+> decisions without qualified medical supervision. Projections illustrate the
+> model's *mechanism*; they are not individualized clinical predictions.
+
 ---
 
 ## Table of contents
 
 - [Quick start (2 minutes)](#quick-start-2-minutes)
 - [How the model works](#how-the-model-works)
+- [**Per-patient personalization (AI)**](#per-patient-personalization-ai)
 - [Where the parameters come from](#where-the-parameters-come-from)
 - [**Using your own data**](#using-your-own-data) ← start here to calibrate
 - [Optional: calibrating with MIMIC-IV](#optional-calibrating-with-mimic-iv)
@@ -108,6 +114,96 @@ Three ideas do the work:
    published **31–35%**).
 
 Full mathematical specification: [`docs/MODEL_DOCUMENTATION.md`](docs/MODEL_DOCUMENTATION.md).
+
+---
+
+## Per-patient personalization (AI)
+
+The app is used one patient at a time — but a population model gives every
+patient with the same eGFR the same future. **If you supply a few past
+creatinine values, NephroQ infers that patient's own parameters.**
+
+Two patients with an identical eGFR of 55 today:
+
+| History | Inferred injury rate | Modeled time to eGFR<15 |
+|---|---|---|
+| Falling fast (85 → 55 over 3 years) | **2.01×** population | **5.4 years** |
+| Nearly flat (58 → 55 over 3 years) | **0.44×** population | **> 20 years** |
+| *(no history — population model)* | *1.00×* | *13.9 years for **both*** |
+
+### How it works
+
+A neural network solves the **inverse problem**: given a handful of noisy eGFR
+measurements, it infers the patient's personal injury rate and collapse exponent
+`q`. The **forward projection is still the mechanistic ODE** — the network never
+predicts the trajectory itself. This is a hybrid model, not a black box: its
+output is two physically meaningful numbers.
+
+The estimator is trained **entirely on simulations from the mechanistic model**
+(*amortized / simulation-based inference*), so **no patient data is required to
+train it**.
+
+A pre-trained estimator ships with the repo (`calibration/personalizer.pkl`,
+0.6 MB) so the app starts instantly. It is **never required**, though: it is
+derived entirely from simulations of the mechanistic model, so if it is missing —
+or unloadable because your scikit-learn pickles differently — it is simply
+**retrained on demand** (~13 s) and cached. Nothing to break, nothing to fetch.
+
+```bash
+cd src
+python personalize.py --train      # retrain + validate explicitly
+python personalize.py              # validate the shipped estimator
+```
+
+### Does it earn its place?
+
+Validated on held-out virtual patients, forecasting eGFR **5 years past the last
+visit**:
+
+| Method | Forecast RMSE | Speed |
+|---|---|---|
+| Population parameters (no personalization) | 16.26 | — |
+| **Amortized network** | **9.24** (**−43 %**) | 1.3 ms |
+| Per-patient least-squares fit (classical) | 10.64 (−35 %) | 39 ms (30× slower) |
+
+It beats both the population model and the classical per-patient optimizer, and
+it is fast enough to run on every keystroke.
+
+### Honest limits
+
+- **`q` is essentially unidentifiable from routine data** (R² ≈ 0.0) — and no
+  assay fixes that, cystatin C included. Almost all of the benefit comes from
+  inferring the patient's **injury rate**, which *is* recovered well. Treat a
+  reported `q` as indicative only.
+
+### What to measure (you do not need cystatin C)
+
+Simulation experiments on parameter recovery of the patient's injury rate:
+
+| Measurement strategy | Rate recovery (R²) |
+|---|---|
+| Creatinine only, short history | 0.48 |
+| + cystatin C | 0.67 |
+| **+ duplicate creatinine per visit, long history** | **0.71** |
+| + cystatin C *and* long history | 0.75 |
+
+**The single most valuable thing is the TIME SPAN of the history, not the number
+of measurements.** The same 4–6 creatinine values spread over 4–8 years recover
+the rate three times better (R² 0.59) than the same number crammed into 1–2 years
+(0.18) — and better than 10–14 values inside a short window (0.34).
+
+Practical consequence: **pull the patient's old creatinine results from the
+chart.** They already exist, they cost nothing, and they beat buying a new assay.
+
+Serial **UACR does not help** (R² 0.47 vs 0.48). In this model albuminuria is a
+deterministic function of the same latent state, so it adds no independent
+information — and it carries large biological noise.
+- It needs **≥ 3 measurements spanning ≥ 9 months**. With less, the app says so
+  and falls back to population parameters rather than inventing a
+  personalization.
+- It is trained on simulations from *this* model, so it inherits every assumption
+  the model makes. It infers "the parameters that best explain these points
+  **under this model**", not ground truth.
 
 ---
 
@@ -255,7 +351,7 @@ evidence; all the weight is on DAPA-CKD:
 The run writes `results/insilico_trial_report.md`.
 
 ```bash
-python -m pytest tests -q      # 40 tests
+python -m pytest tests -q      # 47 tests
 ```
 
 ---
@@ -271,18 +367,20 @@ nephroq/
 │   ├── model_core.py           # THE model — single source of truth
 │   ├── egfr_measurement.py     # CKD-EPI 2021
 │   ├── i18n.py                 # UI strings (EN/ES) + example patients
+│   ├── personalize.py          # per-patient AI (amortized inference)
+│   ├── measurement_strategy.py # what is worth measuring (simulation experiments)
 │   ├── insilico_trial.py       # falsifiable validation against 3 published trials
 │   ├── mvp_calibration.py      # calibrate + validate on YOUR data
 │   ├── calibrate_mimic.py      # optional: calibrate on MIMIC-IV
 │   └── mimic_loader.py         # optional: MIMIC-IV cohort builder
-├── tests/                      # 40 tests
+├── tests/                      # 47 tests
 ├── docs/
 │   ├── MODEL_DOCUMENTATION.md  # mathematical specification
 │   ├── CLINICIAN_DEMO.md       # 7-minute clinician demo script
 │   ├── MIMIC_COMPLIANCE.md     # data-handling rules
 │   ├── WEB_DEPLOYMENT.md       # free deployment
 │   └── CHANGELOG.md
-├── calibration/                # your calibration JSON lands here (git-ignored)
+├── calibration/                # personalizer.pkl (shipped); your MIMIC JSON (git-ignored)
 └── docker/Dockerfile
 ```
 
