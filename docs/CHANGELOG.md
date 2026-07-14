@@ -2,6 +2,91 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 15 — hybrid calibration: estimate each parameter from the data that contain it
+
+### Context
+
+The MIMIC-IV fit (2259 patients, `--chronic-only`) produced `q = 2.923`, `k_hf = 0.00277`,
+`quality = pass`, but `audit_calibration.py` rejected it: the parameters underestimate the
+published placebo-arm slopes of CREDENCE (0.68×) and DAPA-CKD (0.79×), while nearly matching
+EMPA-KIDNEY (0.95×). The ratio tracks baseline eGFR — worst where eGFR is highest.
+
+Root cause is not the collapse exponent. k-fold CV shows `q` (CV 3%) and `k_hf` (CV 13%) are
+identified and stable, and `q = 2.92` survives `--q-max 8`, so it is a real optimum, not a
+censored bound. The weights are the problem: MIMIC's median UACR is ~23 mg/g versus 927 in
+CREDENCE, so the cohort is essentially normoalbuminuric. There is no albuminuria signal to
+learn, the insult weights are fitted on noise (CV: `w_a1c` 20%, `w_sbp` 54%), and the model
+attributes ~87% of the hazard to hyperfiltration — which is exactly why it cannot reproduce
+the albuminuria-driven progression of a high-eGFR CREDENCE patient.
+
+### Added
+
+- **`--anchor-weights`: hybrid calibration.** Each parameter is now estimable from the data
+  that actually contain it: `q, k_hf` from MIMIC (identified here), and `w_a1c, w_uacr, w_sbp`
+  from the trials (`model_core.TRIAL_CALIBRATION_V2`, whose weights are pinned by the CREDENCE
+  and EMPA-KIDNEY placebo arms). The weights are fixed **before** fitting — the free vector
+  shrinks from 5 to 2 and `(q, k_hf)` are re-optimised under that constraint. This is *not*
+  the same as fitting five parameters and overwriting three afterwards: in the overwrite,
+  `q, k_hf` stay optimised for the weights they were fitted alongside, leaving a fit that is
+  optimal for no parameter set at all. A regression test asserts the two produce a different
+  `(q, k_hf)`, so the constraint is demonstrably not inert. A side benefit is that the
+  `q ↔ k_hf ↔ weights` degeneracy cannot arise with the weights held fixed.
+
+  The flag propagates through `calibrate`, `cross_validate`, `bootstrap_calibrate` and the
+  sensitivity fit. The k-fold identifiability summary scores only the free parameters — a
+  trial-anchored weight is a constant, and reporting `CV = 0.00` for it would manufacture the
+  precise "looks perfectly stable, is actually no information" artifact Round 10 added the
+  check to catch. The bootstrap band correspondingly has zero width in the weight directions
+  (they were not estimated), and the JSON records provenance (`anchor_weights`,
+  `free_parameters`, `anchored_parameters`, `anchored_weight_source`) so a reader can tell a
+  fitted `w_uacr` from an assumed one.
+
+  Implemented via the existing `base_params=` hook (added for the S_SAT profile) plus a
+  free-index restriction of `unpack`/`pack`. The ordinary 5-parameter fit is bit-for-bit
+  unchanged (`free_idx=None` path), locked by a test.
+
+### Fixed
+
+- **`audit_calibration.py` check [2] gave backwards advice on an underestimate.** When MIMIC
+  declined *slower* than the trials (ratio < 0.8), the auditor blamed `--chronic-only` for
+  selecting "stable patients". That is reversed: `--chronic-only` selects **declining**
+  trajectories, so it biases toward progressors and would push the ratio *up*, not down. It
+  sent the user to look in the wrong place. The message now states the real cause — too little
+  signal in the insult covariates (near-normoalbuminuric UACR) — and the real fix
+  (`--anchor-weights`), not a change of cohort filter. Regression test added.
+
+### Falsifiable success criterion (run on `fx-gpu`, not yet executed here)
+
+```
+python calibrate_mimic.py --from-cohort ../data/_mimic_cohort.tsv \
+    --chronic-only --n-jobs 20 --anchor-weights --cv-folds 5 --n-bootstrap 200
+python audit_calibration.py
+```
+
+- If the hybrid passes all three placebo arms → defensible population calibration; ship it.
+- If it still fails CREDENCE (the high-eGFR arm) → the weights were not the whole story and
+  `q = 2.92` is incompatible with early trial progression. The honest conclusion is then that
+  these are **two populations needing two separate calibrations**, not one hybrid — report it
+  that way rather than forcing the fit. Both outcomes are publishable.
+
+  An a-priori feasibility scan (weights fixed at trial values, `S_SAT = 3.5`) shows the hybrid
+  family *can* pass in principle: at `q = 2.92` every placebo arm lands within 30% for
+  `k_hf ≈ 0.0015–0.0033`. Whether MIMIC's own `k_hf` falls in that band is the empirical
+  question the run above settles; the scan only establishes the target is not empty.
+
+### Not adopted this round (recorded for a later one)
+
+An external statistical review (this round's) additionally proposed: a one-parameter
+susceptibility-scale reduced model (`s_MIMIC · H_structural`); a joint/regularised objective
+`L_MIMIC + λ·L_trials`; splitting `quality_status` into internal / stability / external-audit
+levels with a `deployment.approved` gate the app checks instead of `quality == pass`; renaming
+"primary analysis within the chronic-only cohort" to "complete-case analysis within the
+chronic-trajectory sensitivity cohort"; a baseline-covariate comparison table (observed vs
+missing UACR) to test biomarker-availability selection; and reporting the KFRE benchmark with
+confidence intervals given its 2–5 events. Each is sound and each is its own piece of work with
+its own falsifiable check; none is folded in silently here. No new ML dependency was
+introduced (SMOTE, deep learning, SHAP, Optuna remain rejected — see earlier rounds).
+
 ## Round 14 — vectorisation where it actually costs, and two coefficients that were wrong
 
 ### Fixed
