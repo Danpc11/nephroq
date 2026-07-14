@@ -2,6 +2,154 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 11 — three critical bugs found by external review
+
+### Fixed — critical
+
+- 🔴 **The app personalized every patient from a FICTITIOUS history.** The measurement editor
+  shipped pre-filled with example creatinines (`1.05, 1.15, 1.22`). A user who entered only
+  today's markers and never typed a single historical value still saw **"Personalized to this
+  patient"** — computed from invented data. The editor now starts **empty**, and the example
+  history is behind an explicit button labelled *"Example measurement history — NOT patient
+  data."*
+
+- 🔴 **Personalization was silently discarded whenever a MIMIC or private calibration was
+  loaded.** `project()` overwrote the personalized `q`/`k_hf`/weights with population values
+  for any tier that was not `public`, while the interface went on announcing "Personalized to
+  this patient". The inferred injury rate is a **multiplier relative to the population model**,
+  so the fix is structural: the personalizer is now parameterized by the *active* population
+  calibration, trained against it, and its estimator is cached per tier. An estimator built
+  around the trial-anchored model cannot be transplanted onto a MIMIC calibration whose hazard
+  is twice as fast.
+
+- 🔴 **The calibration fitted v2 but EVALUATED with v1.** Not in the review — found while
+  checking it. `calibrate_mimic.py` still called the old unbounded `predict_egfr_at` in three
+  places: the bootstrap-derived risk, Mode B (baseline forecast) and Mode C (KFRE comparison).
+  Parameters were being estimated under one set of dynamics and scored under another. All
+  three now use `predict_egfr_at_v2`. **No live path uses v1 any more.**
+
+### Fixed — high
+
+- 🟠 **Historical creatinines were converted with the patient's CURRENT age.** A sample drawn
+  ten years ago was run through CKD-EPI with today's age, which systematically *understates*
+  the historical eGFR and makes the decline look flatter than it was. The bias grows with the
+  length of the history — precisely the histories that carry the most information. Each value
+  is now converted with the age the patient had at the time.
+
+### Changed — honesty of the claims
+
+- **`q` is described as what it is.** The README opened by presenting `q` as the central
+  parameter "estimated from clinical trajectories", while the repository's own experiments
+  show it is close to unidentifiable from routine data. It is now stated as a
+  **population-level structural parameter**, with individual heterogeneity carried by the
+  **injury-rate multiplier** — which is the recoverable quantity, and the more interesting
+  claim.
+- **Ensemble spread is no longer dressed up as a confidence interval.** The app reported
+  `q = 1.72 ± 0.13`. That ± is the disagreement between the networks in the ensemble, not an
+  interval with known coverage. It is now labelled "ensemble spread", and `q` is marked
+  *experimental*.
+- **The therapy toggle no longer claims a combined SGLT2i/ACEi-ARB effect.** Both the
+  calibration (CREDENCE) and the out-of-sample validation (DAPA-CKD) are SGLT2 inhibitor
+  trials. The scenario is now an "illustrative SGLT2i-like intervention".
+- **The demo banner no longer says "synthetic calibration".** The public tier has been
+  trial-anchored since Round 7; the banner had not caught up.
+- **`model_core.py`'s header showed the v1 equation** and stated that "v2 is opt-in" — neither
+  was true any more. A reviewer opening the central file would not have known which equation
+  produced the figures. The header now carries the v2 equation, and the legacy v1 helpers are
+  explicitly marked as being on no live path.
+
+## Round 12 — closing the file-by-file review
+
+### Fixed
+
+- 🔴 **The auditor never checked albuminuria.** `audit_calibration.py` is the gate that
+  decides whether a MIMIC calibration may be shipped, but it only tested the placebo-arm
+  slopes — while `insilico_trial.py` had been testing the UACR endpoint all along. The
+  auditor now checks both.
+
+  Honest caveat, found by testing it: on a deliberately AKI-inflated calibration the UACR
+  check **passes** while the placebo slopes fail (1.7–1.8×). The UACR reduction is dominated
+  by `eff_alb` and is largely insensitive to the progression parameters, so it is a **weak
+  second gate**, not an independent confirmation. Recorded in the code so it cannot be
+  mistaken for one.
+
+- 🔴 **Failed bootstrap replicates were printed and forgotten.** If 12 of 15 failed, the JSON
+  silently carried a three-replicate "uncertainty band" and no reader could tell. The counts
+  (`n_requested`, `n_successful`, `n_failed`, and the first failures) are now written to
+  `bootstrap_diagnostics`, and a warning is printed.
+
+- 🟠 **`mvp_calibration.py` fitted with a non-robust objective.** `calibrate_mimic.py` uses
+  `soft_l1` with a data-driven `f_scale`; the own-data path used plain least squares, so a
+  handful of AKI spikes could steer the whole fit. It now uses the same robust loss, with
+  `f_scale` set from the cohort's own residual spread (robust MAD), not a hard-coded constant.
+
+- 🟠 **The "bootstrap degenerate" warning was written for modellers, not clinicians** (and
+  ended in a dangling `('optimizer scaling')` fragment). Rewritten in both languages to say
+  plainly what it means: the fit never moved, so its numbers carry no information — re-run it.
+
+### Added
+
+- **Seed-sensitivity test for the in-silico replication.** The virtual cohorts are random
+  draws; if DAPA-CKD only landed inside its published CI for a lucky seed, the PASS would be
+  noise. Across seeds the held-out chronic slope difference is **2.22 ± 0.07** (published CI
+  1.88–2.64) and the UACR reduction **31.1 ± 0.1** (CI 30.6–39.4) — **6/6 seeds pass**, and a
+  test now fails if that stops being true. Note the UACR prediction sits consistently near the
+  *lower edge* of its interval; it passes, but it is not centred.
+
+- **`pyproject.toml`** (pytest `pythonpath = ["src"]`, so tests no longer need `sys.path`
+  surgery) and **`requirements-lock.txt`** with the exact versions the results were produced
+  with. `requirements.txt` keeps lower bounds for easy installation; the lock file is what a
+  manuscript should cite.
+
+- **The hazard cap is documented and named** (`HAZARD_CAP = 50.0`). It is a numerical guard so
+  the integrator cannot blow up while an optimizer explores an absurd corner of parameter
+  space — at that rate a nephron population halves every ~5 days. It must never bind for a
+  plausible patient; if it does, the parameters are wrong, not the patient.
+
+### Not adopted
+
+- **`logging` instead of `print`** — the calibration's `print` output *is* the diagnostic
+  record a reviewer reads, and it is a research tool, not a service. Worth revisiting if this
+  is ever deployed.
+- **Type hints throughout, a central `config.py`** — readability, not correctness. Low return
+  next to what is still missing (an AKI-free index date).
+- **Narrowing the two `except Exception: pass` blocks** — the silent failure is deliberate
+  there: personalization must never take down the app. The reviewer's point stands in general,
+  though, and these should become specific exceptions with a logged warning once logging exists.
+
+## Round 11 — honest uncertainty, and one model in the file
+
+### Fixed
+
+- 🔴 **The ensemble spread was being sold as uncertainty, and it was ~7× too narrow.**
+  `personalize.py` claimed "their disagreement IS the uncertainty". Measured on held-out
+  virtual patients, a nominal 90% band built from that spread covered the truth **32.8%** of
+  the time for `q` and **41.5%** for the injury rate. Quoting it as "±" was false precision.
+
+  The spread is now **conformalized** (split-conformal, normalized nonconformity): on a
+  held-out calibration split the ratio |θ_true − θ̂| / spread is computed and its 90th
+  percentile is stored. The required inflation turned out to be **×7.29** (`q`) and **×6.47**
+  (injury rate) — a measure of just how over-confident the raw spread was. Measured coverage
+  of the calibrated interval: **89.5%** and **91.2%** against a nominal 90%. The raw spread is
+  still exposed, but as `q_spread` — never as an interval. A test now fails if coverage drifts.
+
+- 🔴 **The app claimed the parameters came from "hierarchical Bayesian inference on synthetic
+  data".** That module has not been part of the tree for several rounds; the active parameters
+  are anchored to published trial data. The claim was false, and it appeared in the app's own
+  "About the model" panel (EN and ES) and in `CITATION.cff`. Corrected.
+
+- 🟠 **`model_core.py` still carried the entire v1 model as dead code** — the unbounded
+  hazard, its integrator, and its predictor — none of it called from anywhere. A reviewer
+  opening the central file would find two families of equations and no way to tell which one
+  produced the figures. Removed, and locked by a test.
+
+### Notes
+
+Three findings from the same review — the pre-filled fictitious history, historical
+creatinines converted with the patient's *current* age, and the personalization being silently
+overwritten when a MIMIC/private calibration was active — were already fixed and are covered
+by tests.
+
 ## Round 10 — cross-validation: is the parameter even identifiable?
 
 ### Added
@@ -55,7 +203,7 @@ is implemented above and in Round 9 respectively.
 
 ### Fixed — three bugs, one of them capable of killing a running calibration
 
--  **`predict_egfr_at_v2` crashed on same-day lab draws.** The Round 9 speedup (below)
+- 🔴 **`predict_egfr_at_v2` crashed on same-day lab draws.** The Round 9 speedup (below)
   integrates straight onto the visit times, and `solve_ivp` requires `t_eval` to be
   **strictly increasing**. Real data is not: hospital records routinely contain several
   creatinines drawn on the **same day**, and callers may pass times in any order. The result
@@ -63,7 +211,7 @@ is implemented above and in Round 9 respectively.
   The predictor now deduplicates and sorts internally, then scatters the results back to the
   requested order.
 
--  **`mvp_calibration.py` was fitting a DIFFERENT model from the one the app projects
+- 🔴 **`mvp_calibration.py` was fitting a DIFFERENT model from the one the app projects
   with.** It carried its own fixed-step Euler integrator and the **old unbounded hazard**,
   bypassing `model_core` entirely. On the same patient with the same parameters it drifted by
   up to **13 mL/min at 10 years** (10.9 vs 24.0). Since this is the path the README recommends
@@ -72,7 +220,7 @@ is implemented above and in Round 9 respectively.
   class of bug as the two diverging integrators fixed in an earlier round, and it is now
   locked down by a test.
 
--  **Temporal leakage in the own-data loader.** Covariates were taken as the **median over
+- 🟠 **Temporal leakage in the own-data loader.** Covariates were taken as the **median over
   each patient's whole trajectory**, which feeds a patient's own future into a supposedly
   baseline forecast. They are now taken at **baseline**, and a missing baseline is filled from
   the **cohort's baseline median** — never from that patient's later visits. The imputed
