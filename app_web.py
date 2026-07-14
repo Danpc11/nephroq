@@ -16,12 +16,14 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 import numpy as np
+import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
 from egfr_measurement import egfr_cr, egfr_cr_cys
 import model_core as core
 from model_core import DIALYSIS_eGFR, gfr_category
+import personalize as pz
 from i18n import t as _t, PRESETS, LANGUAGES, preset_by_id
 
 # ------------------------------------------------------------------------------
@@ -145,6 +147,22 @@ with st.sidebar:
     sbp = st.number_input(_("sbp"), 80, 220, key="sbp")
     st.divider()
     treated = st.checkbox(_("treated"), value=False)
+    st.divider()
+
+    # --- measurement history -> per-patient personalization ---
+    st.header(_("history_header"))
+    st.caption(_("history_caption"))
+    if "history" not in st.session_state:
+        st.session_state["history"] = pd.DataFrame(
+            {"years_ago": [3.0, 2.0, 1.0], "creatinine": [1.05, 1.15, 1.22]})
+    hist = st.data_editor(
+        st.session_state["history"], num_rows="dynamic", use_container_width=True,
+        column_config={
+            "years_ago": st.column_config.NumberColumn(_("history_years_ago"),
+                                                       min_value=0.0, max_value=25.0, step=0.5),
+            "creatinine": st.column_config.NumberColumn(_("history_creat"),
+                                                        min_value=0.3, max_value=15.0, step=0.05),
+        }, key="history_editor")
 
 # ---- baseline eGFR ----
 if cystatin:
@@ -154,10 +172,47 @@ else:
     egfr0 = egfr_cr(creatinine, age, sex)
     method = _("method_cr")
 
+@st.cache_resource(show_spinner=False)
+def _get_personalizer():
+    """Trained once per app process and cached. The estimator is derived purely
+    from simulations of the mechanistic model, so it is regenerated on demand
+    rather than shipped as a binary in the repository."""
+    return pz.get_estimator()
+
+
+# ---- PER-PATIENT PERSONALIZATION (amortized inference) ------------------------
+# The measurement history (if any) is converted to an eGFR series with the
+# patient's own age/sex, then a neural estimator -- trained purely on simulations
+# from the mechanistic model -- infers this patient's injury rate and collapse
+# exponent. The forward projection is still the ODE: the network only solves the
+# inverse problem.
+PERSONAL = dict(personalized=False, params=dict(core.TRIAL_CALIBRATION_V2))
+try:
+    h = hist.dropna()
+    h = h[(h["years_ago"] >= 0) & (h["creatinine"] > 0)].sort_values("years_ago", ascending=False)
+    if len(h) >= pz.MIN_VISITS - 1:      # + today's measurement
+        # today's measurement closes the series
+        t_hist = np.append((h["years_ago"].max() - h["years_ago"]).to_numpy(float),
+                           float(h["years_ago"].max()))
+        e_hist = np.append(np.array([egfr_cr(c, age, sex) for c in h["creatinine"]]), egfr0)
+        with st.spinner(_("training_estimator")):
+            _est = _get_personalizer()
+        PERSONAL = pz.personalize(t_hist, e_hist, hba1c, uacr, sbp, estimator=_est)
+except Exception:
+    pass                    # never let personalization break the app
+P_PARAMS = PERSONAL["params"]
+
 _active = st.session_state.get("_active_preset")
 _ap = preset_by_id(_active) if _active else None
 if _ap:
     st.info(_("example_loaded", label=_ap["label"][LANG], note=_ap["note"][LANG]))
+
+if PERSONAL["personalized"]:
+    st.success(_("personalized_on", scale=PERSONAL["scale"], scale_sd=PERSONAL["scale_sd"],
+                 q=PERSONAL["q"], q_sd=PERSONAL["q_sd"]))
+    st.caption(_("personalized_caveat"))
+else:
+    st.info(_("personalized_off"))
 
 col1, col2, col3 = st.columns(3)
 col1.metric(_("baseline_egfr"), f"{egfr0:.1f} mL/min/1.73m²", help=_("baseline_help", method=method))
@@ -173,7 +228,7 @@ def project(a1c, sbp, uacr, egfr0, treated, q=None, khf=None, w=None, years=15):
     the default parameters are anchored to published trials, and a local
     MIMIC calibration (if present) overrides q / k_hf / the covariate weights.
     """
-    p = dict(core.TRIAL_CALIBRATION_V2)
+    p = dict(P_PARAMS)          # personalized if a history was given; population otherwise
     if q is not None:
         p.update(q=q, k_hf=khf, w_a1c=w[0], w_uacr=w[1], w_sbp=w[2])
     elif CALIB_TIER != "public":
