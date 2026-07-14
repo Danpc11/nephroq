@@ -459,7 +459,10 @@ def main(mimic_dir, out_path, min_span_days=180, min_points=4):
     df["sbp"]   = df["sbp"].fillna(df["sbp"].median() if df["sbp"].notna().any() else 135.0)
     df = df.drop(columns=["charttime"])   # only needed for the matching above
 
-    df.to_csv(out_path, index=False)
+    # TAB-separated. Clinical exports and free-text fields routinely contain
+    # commas, which silently corrupt a CSV; tabs do not appear in any of these
+    # columns. The reader sniffs the delimiter, so an older .csv still loads.
+    df.to_csv(out_path, sep="\t", index=False)
     print(f"[5/5] Saved: {out_path}  ({df.patient_id.nunique()} patients, {len(df)} rows)")
     print("\nNOTE: *_imputed columns flag values that were not measured and were filled "
           "with the population median. Review before final calibration.")
