@@ -341,7 +341,7 @@ def bootstrap_calibrate(patients, point_estimate, n_boot=15, max_patients=None, 
         return []
     init = np.array([point_estimate["q"], point_estimate["k_hf"], point_estimate["w_a1c"],
                      point_estimate["w_uacr"], point_estimate["w_sbp"]])
-    boot_params = []
+    boot_params, failures = [], []
     n = len(patients)
     rng = np.random.default_rng(seed)
     print(f"      Bootstrap ({n_boot} resamples, patient-level, for the app's uncertainty band)...")
@@ -355,11 +355,21 @@ def bootstrap_calibrate(patients, point_estimate, n_boot=15, max_patients=None, 
             boot_params.append(dict(q=r["q"], k_hf=r["k_hf"],
                                     w_a1c=r["w_a1c"], w_uacr=r["w_uacr"], w_sbp=r["w_sbp"]))
         except Exception as e:
+            # A failed replicate used to be printed and forgotten. If 12 of 15 fail,
+            # the JSON would silently carry a 3-replicate "uncertainty band" and
+            # nobody would know. The count is now recorded and surfaced.
+            failures.append(f"replicate {b + 1}: {type(e).__name__}: {e}")
             print(f"      (bootstrap replicate {b+1} failed, skipped: {e})")
         if (b + 1) % 5 == 0:
             print(f"        ...{b+1}/{n_boot} bootstrap replicates done "
                  f"({time.time()-t0:.1f}s for the last one)")
-    return boot_params
+
+    if failures:
+        print(f"      WARNING: only {len(boot_params)}/{n_boot} bootstrap replicates "
+              f"succeeded. The uncertainty band is based on the successful ones only.")
+    return dict(params=boot_params, n_requested=int(n_boot),
+                n_successful=len(boot_params), n_failed=len(failures),
+                failures=failures[:10])
 
 
 def filter_kfre_comparable(patients):
@@ -535,10 +545,11 @@ def nephroq_risk_from_bootstrap(bootstrap_params, a1c, uacr, sbp, egfr0, horizon
         return None
     crossed = 0
     for bp in bootstrap_params:
-        insult = core.metabolic_hazard(a1c, uacr, sbp,
-                                       bp["w_a1c"], bp["w_uacr"], bp["w_sbp"])
-        eg = core.predict_egfr_at(K0_FIX, bp["k_hf"], bp["q"], 1.0, insult,
-                                  N_of_egfr(egfr0), np.array([horizon]))[0]
+        p = dict(core.TRIAL_CALIBRATION_V2)
+        p.update(q=bp["q"], k_hf=bp["k_hf"], w_a1c=bp["w_a1c"],
+                 w_uacr=bp["w_uacr"], w_sbp=bp["w_sbp"])
+        eg = core.predict_egfr_at_v2(egfr0, a1c, uacr, sbp, 0.0, p,
+                                     np.array([horizon]))[0]
         crossed += int(eg < core.DIALYSIS_eGFR)
     return crossed / len(bootstrap_params)
 
@@ -627,9 +638,10 @@ def evaluate_kfre_benchmark(params, patients, horizons=(2.0, 5.0),
                 continue      # no usable baseline value and no development default
             uacr_b = float(pac["uacr_baseline_strict"])
 
-            insult = core.metabolic_hazard(float(a1c), uacr_b, float(sbp_b), w[0], w[1], w[2])
-            egfr_h = core.predict_egfr_at(K0_FIX, khf, q, 1.0, insult,
-                                          N_of_egfr(egfr0), np.array([h]))[0]
+            p = dict(core.TRIAL_CALIBRATION_V2)
+            p.update(q=q, k_hf=khf, w_a1c=w[0], w_uacr=w[1], w_sbp=w[2])
+            egfr_h = core.predict_egfr_at_v2(egfr0, float(a1c), uacr_b, float(sbp_b),
+                                             0.0, p, np.array([h]))[0]
             nq_scores.append(-float(egfr_h))     # lower projected eGFR = higher risk
             kfre_scores.append(kfre_risk(pac["age_at_index"], pac["sex"], egfr0, uacr_b, h))
             labels.append(label)
@@ -732,14 +744,15 @@ def evaluate_baseline_forecast(params, patients, horizons=(2.0, 5.0), tolerance_
         a1c0 = pac.get("hba1c_baseline_strict", pac["hba1c_series"][0])
         uacr0 = pac.get("uacr_baseline_strict", pac["uacr_series"][0])
         sbp0 = pac.get("sbp_baseline_strict") or pac["sbp_series"][0]
-        N0 = N_of_egfr(pac["egfr0"])
-        insult0 = core.metabolic_hazard(a1c0, uacr0, sbp0, w[0], w[1], w[2])
+        p_v2 = dict(core.TRIAL_CALIBRATION_V2)
+        p_v2.update(q=q, k_hf=khf, w_a1c=w[0], w_uacr=w[1], w_sbp=w[2])
         used_patient = False
         for h in horizons:
             idx_near = int(np.argmin(np.abs(t - h)))
             if abs(t[idx_near] - h) > tolerance_years:
                 continue   # no observation near this horizon for this patient -- skip, don't impute
-            pred = core.predict_egfr_at(K0_FIX, khf, q, 1.0, insult0, N0, np.array([h]))[0]
+            pred = core.predict_egfr_at_v2(pac["egfr0"], a1c0, uacr0, sbp0, 0.0, p_v2,
+                                           np.array([h]))[0]
             per_horizon[h].append(float((pred - e[idx_near]) ** 2))
             used_patient = True
         if used_patient:
@@ -1228,10 +1241,16 @@ def main():
             max_patients=a.max_patients)
 
     if a.n_bootstrap > 0:
-        result["bootstrap_params"] = bootstrap_calibrate(train, result, n_boot=a.n_bootstrap, n_jobs=a.n_jobs,
-                                                          max_patients=a.max_patients)
-        print(f"      Bootstrap done: {len(result['bootstrap_params'])}/{a.n_bootstrap} "
-             f"replicates succeeded.")
+        _boot = bootstrap_calibrate(train, result, n_boot=a.n_bootstrap, n_jobs=a.n_jobs,
+                                    max_patients=a.max_patients)
+        result["bootstrap_params"] = _boot["params"]
+        # Surfaced in the JSON: a band built from 3 surviving replicates out of 15 is
+        # NOT the band that was asked for, and the reader must be able to see that.
+        result["bootstrap_diagnostics"] = dict(
+            n_requested=_boot["n_requested"], n_successful=_boot["n_successful"],
+            n_failed=_boot["n_failed"], failures=_boot["failures"])
+        print(f"      Bootstrap done: {_boot['n_successful']}/{_boot['n_requested']} "
+              f"replicates succeeded.")
 
     if sensitivity_patients is not None and len(sensitivity_patients) > len(primary_patients):
         print("\n      --- SENSITIVITY analysis (full cohort, imputation included) ---")
