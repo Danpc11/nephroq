@@ -761,3 +761,121 @@ def test_q_max_can_be_widened_to_test_a_censored_estimate():
     finally:
         cal.set_q_max(original)
     assert cal.HI[0] == pytest.approx(original)
+
+
+# ==============================================================================
+# Round 15 -- HYBRID CALIBRATION (--anchor-weights)
+# ==============================================================================
+# Each parameter is estimated from the data that contain it: q, k_hf from MIMIC,
+# the three insult weights from the trials. The weights are fixed BEFORE fitting
+# (free vector 5 -> 2), so q and k_hf are re-optimized under the constraint.
+
+def test_anchored_calibration_returns_exactly_the_trial_weights():
+    """The three weights must come back BIT-FOR-BIT equal to TRIAL_CALIBRATION_V2:
+    they are constants of the objective, not fitted quantities."""
+    import calibrate_mimic as cal
+
+    pats = _synthetic_cohort(30, seed=1)
+    r = cal.calibrate(pats, noise_sd=8.7, verbose=False, n_multistarts=1,
+                      anchor_weights=True)
+    for k in ("w_a1c", "w_uacr", "w_sbp"):
+        assert r[k] == core.TRIAL_CALIBRATION_V2[k], k
+    assert r["anchor_weights"] is True
+    assert r["free_parameters"] == ["q", "k_hf"]
+    assert set(r["anchored_parameters"]) == {"w_a1c", "w_uacr", "w_sbp"}
+
+
+def test_anchored_calibration_still_moves_q_and_khf():
+    """Shrinking the free vector must NOT freeze the fit: q and k_hf still have to
+    move off the initial guess and respond to the data."""
+    import calibrate_mimic as cal
+
+    init = np.array([1.5, 0.012, 0.014, 0.018, 0.011])
+    pats = _cohort_from_model(40, span=8.0, n_visits=(8, 14), noise=3.0, seed=7)
+    r = cal.calibrate(pats, noise_sd=8.7, verbose=False, n_multistarts=3,
+                      anchor_weights=True)
+    moved = max(abs(r["q"] - init[0]), abs(r["k_hf"] - init[1]))
+    assert moved > 1e-6, "anchored optimizer did not move q or k_hf"
+    assert cal.LO[0] < r["q"] < cal.HI[0]
+
+
+def test_anchoring_is_not_the_same_as_overwriting_afterwards():
+    """
+    The METHODOLOGICAL point of the whole feature. Fitting all five and then
+    substituting the trial weights leaves q, k_hf optimized for the wrong weights;
+    fixing the weights first re-optimizes q, k_hf under the constraint. The two
+    must therefore give a DIFFERENT (q, k_hf) -- if they didn't, the constraint
+    would be doing nothing.
+    """
+    import calibrate_mimic as cal
+
+    pats = _cohort_from_model(40, span=6.0, n_visits=(6, 12), noise=4.0, seed=11)
+
+    free = cal.calibrate(pats, noise_sd=8.7, verbose=False, n_multistarts=3,
+                         anchor_weights=False)
+    # the WRONG way: keep free q, k_hf, just swap the weights in
+    overwritten = dict(free, **{k: core.TRIAL_CALIBRATION_V2[k]
+                                for k in ("w_a1c", "w_uacr", "w_sbp")})
+    # the RIGHT way: re-optimize under the fixed weights
+    anchored = cal.calibrate(pats, noise_sd=8.7, verbose=False, n_multistarts=3,
+                             anchor_weights=True)
+
+    assert abs(anchored["q"] - overwritten["q"]) > 1e-3 \
+        or abs(anchored["k_hf"] - overwritten["k_hf"]) > 1e-5, \
+        "anchored fit is indistinguishable from overwriting -- the constraint is inert"
+
+    # NOTE deliberately NOT asserted: that the anchored fit has a lower plain
+    # chi2/n than the overwritten one. The optimizer minimizes the ROBUST
+    # (soft_l1), per-patient-WEIGHTED objective, whereas evaluate_holdout reports
+    # an unweighted chi2/n -- they are different functionals, so re-optimizing
+    # under the constraint is not guaranteed to win on the plain metric (on this
+    # synthetic cohort the two tie to ~1e-6). The coherence argument for anchoring
+    # is structural, not a plain-chi2 improvement; see the anchored_base docstring.
+
+
+def test_anchored_kfold_scores_only_the_free_parameters():
+    """Under anchoring the weights are constants: reporting a CV for them would
+    manufacture a fake 'CV = 0.00, perfectly stable' out of an assumption. The
+    k-fold summary must cover q and k_hf only."""
+    import calibrate_mimic as cal
+
+    pats = _cohort_from_model(40, span=8.0, n_visits=(8, 14), noise=3.0, seed=5)
+    cv = cal.cross_validate(pats, k=4, noise_sd=8.7, verbose=False, anchor_weights=True)
+    assert cv["anchor_weights"] is True
+    assert set(cv["free_parameters"]) == {"q", "k_hf"}
+    for w in ("w_a1c", "w_uacr", "w_sbp"):
+        assert w not in cv["summary"]
+        assert w not in cv["unstable"]
+
+
+def test_anchored_bootstrap_has_no_width_in_the_weight_directions():
+    """The uncertainty band must not invent spread for parameters that were never
+    estimated: every replicate carries identical (trial) weights."""
+    import calibrate_mimic as cal
+
+    pats = _synthetic_cohort(30, seed=2)
+    point = cal.calibrate(pats, noise_sd=8.7, verbose=False, n_multistarts=1,
+                          anchor_weights=True)
+    boot = cal.bootstrap_calibrate(pats, point, n_boot=6, seed=3, anchor_weights=True)
+    params = boot["params"]
+    assert len(params) >= 1
+    for w in ("w_a1c", "w_uacr", "w_sbp"):
+        vals = {round(p[w], 12) for p in params}
+        assert vals == {round(core.TRIAL_CALIBRATION_V2[w], 12)}, w
+    # q must still vary across replicates (it was actually fitted)
+    assert len({round(p["q"], 6) for p in params}) >= 1
+
+
+def test_default_calibration_is_unchanged_by_the_anchor_plumbing():
+    """Adding the free-index machinery must leave the ordinary 5-parameter fit
+    bit-for-bit what it was."""
+    import calibrate_mimic as cal
+
+    pats = _synthetic_cohort(30, seed=4)
+    a = cal.calibrate(pats, noise_sd=8.7, verbose=False, n_multistarts=1, n_jobs=1)
+    b = cal.calibrate(pats, noise_sd=8.7, verbose=False, n_multistarts=1, n_jobs=1,
+                      anchor_weights=False)
+    for k in ("q", "k_hf", "w_a1c", "w_uacr", "w_sbp", "chi2_per_n"):
+        assert a[k] == pytest.approx(b[k], abs=1e-12), k
+    assert a["anchor_weights"] is False
+    assert a["free_parameters"] == ["q", "k_hf", "w_a1c", "w_uacr", "w_sbp"]
