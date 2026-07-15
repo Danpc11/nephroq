@@ -75,7 +75,7 @@ TRIALS = {
         # Placebo-subtracted geometric-mean UACR reduction at week 26.
         # Canagliflozin lowered UACR by 31% (95% CI 27-36). Source: post hoc
         # analysis of CREDENCE (PMC7790219).
-        uacr_reduction_pct=31.0, uacr_reduction_ci=(27.0, 36.0),
+        uacr_reduction_pct=31.0, uacr_reduction_ci=(26.0, 35.0),
         source="Perkovic et al., NEJM 2019 (NCT02065791); slope analyses per "
                "CREDENCE secondary/post-hoc reports. Total-slope diff 1.52 "
                "(95% CI 1.11-1.93).",
@@ -99,10 +99,11 @@ TRIALS = {
         # (95% CI 30.6-39.4) vs placebo. Source: DAPA-CKD prespecified
         # albuminuria analysis (Heerspink et al.).
         uacr_reduction_pct=35.1, uacr_reduction_ci=(30.6, 39.4),
-        placebo_slope=-3.83,   # DAPA-CKD placebo arm, published total slope. The
-                               # placebo arm receives no SGLT2i, hence no acute
-                               # hemodynamic dip, so its total slope is a fair
-                               # comparator for the model's chronic slope.
+        placebo_slope=-3.84,   # DAPA-CKD placebo CHRONIC slope, T2D subgroup
+                               # (Heerspink 2021, Fig 2A + p.747). The placebo arm
+                               # receives no SGLT2i and thus has no acute dip, so
+                               # this chronic slope is the correct comparator for
+                               # the model's (dip-free) chronic slope.
         source="Heerspink et al., Lancet Diabetes Endocrinol 2021 (DAPA-CKD "
                "prespecified slope analysis, NCT03036150). T2D subgroup: chronic "
                "slope diff 2.26 (95% CI 1.88-2.64); total slope diff 1.18 "
