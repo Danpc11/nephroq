@@ -1,7 +1,6 @@
 # Guía de demostración para clínicos — NephroQ
-### Clinician demo guide (ES + EN reference)
 
-Guion completo de ~7 minutos para mostrar la utilidad del gemelo digital a un
+Guion completo de ~7 minutos para mostrar la utilidad del digital-twin a un
 nefrólogo, endocrinólogo o médico de primer contacto, en el contexto de
 diabetes tipo 2 → enfermedad renal crónica (ERC).
 
@@ -10,7 +9,7 @@ sus valores exactos y las salidas que debes esperar, las dos formas de correr la
 demo, el guion hablado, las advertencias honestas y el cierre. No necesitas
 abrir ningún otro archivo para dar la demo.
 
-> ⚠️ **NephroQ es un prototipo de investigación. NO es una herramienta
+> **NephroQ es un prototipo de investigación. NO es una herramienta
 > diagnóstica.** No debe usarse para decisiones clínicas sin supervisión médica
 > calificada. Las trayectorias son *ilustrativas del mecanismo del modelo*, no
 > predicciones individualizadas. Esto está escrito en la propia interfaz y no se
@@ -94,12 +93,12 @@ los brazos placebo de CREDENCE y EMPA-KIDNEY; DAPA-CKD predicho fuera de muestra
 
 | Paciente | Edad/Sexo | Cr | HbA1c | UACR | PAS | **eGFR basal** | **KDIGO** | **Sin tx** | **Con reno** |
 |---|---|---|---|---|---|---|---|---|---|
-| 🔴 Progresor rápido | 58 F | 1.3 | 8.1 % | 145 | 142 | **47.7** | G3a | 13.4 años | >15 años |
-| 🟠 eGFR normal, riesgo oculto | 49 M | 0.95 | 9.2 % | 280 | 150 | **98.1** | **G1** | >15 años | >15 años |
-| 🟢 Bien controlado, bajo riesgo | 55 F | 1.0 | 6.6 % | 15 | 125 | **66.5** | G2 | >15 años | >15 años |
-| 🟣 Avanzado (G3b–G4) | 63 M | 2.1 | 8.8 % | 600 | 155 | **34.7** | G3b | 7.2 años | >15 años |
+| Progresor rápido | 58 F | 1.3 | 8.1 % | 145 | 142 | **47.7** | G3a | 13.4 años | >15 años |
+| eGFR normal, riesgo oculto | 49 M | 0.95 | 9.2 % | 280 | 150 | **98.1** | **G1** | >15 años | >15 años |
+| Bien controlado, bajo riesgo | 55 F | 1.0 | 6.6 % | 15 | 125 | **66.5** | G2 | >15 años | >15 años |
+| Avanzado (G3b–G4) | 63 M | 2.1 | 8.8 % | 600 | 155 | **34.7** | G3b | 7.2 años | >15 años |
 
-### 🆕 La albuminuria predicha (el nuevo panel de la app)
+### La albuminuria predicha
 
 En v2 la UACR es una **salida del modelo**, no una entrada fija. La app ahora
 grafica su trayectoria — y para varios pacientes **esta es la historia principal**,
@@ -107,17 +106,17 @@ más que el tiempo al umbral:
 
 | Paciente | UACR sin tratamiento (0 → 15 a) | UACR con renoprotección |
 |---|---|---|
-| 🔴 Progresor rápido | 145 → **760** | 104 → 183 |
-| 🟠 **eGFR normal, riesgo oculto** | 280 → **1636** | 200 → 341 |
-| 🟢 Bien controlado | 15 → 27 | 11 → 14 |
-| 🟣 Avanzado | 600 → **6693** | 428 → 984 |
+| Progresor rápido | 145 → **760** | 104 → 183 |
+| **eGFR normal, riesgo oculto** | 280 → **1636** | 200 → 341 |
+| Bien controlado | 15 → 27 | 11 → 14 |
+| Avanzado | 600 → **6693** | 428 → 984 |
 
 El modelo predice además una **caída inmediata de ~29 %** en la UACR al iniciar
 tratamiento — los ensayos de iSGLT2 publicaron **31–35 %**. Ese número **no es un
 ajuste**: sale de parámetros anclados en CREDENCE y verificados fuera de muestra
 en DAPA-CKD.
 
-> **⚠️ Cambio importante respecto a versiones previas de esta guía.** Con el modelo
+> **Cambio importante respecto a versiones previas de esta guía.** Con el modelo
 > v1 el "progresor rápido" cruzaba el umbral en 5.0 años y el de "riesgo oculto" en
 > 10.4. Esos números eran **demasiado agresivos**: la validación in-silico mostró que
 > v1 hacía declinar a los pacientes **~2× más rápido** que los brazos placebo reales
@@ -136,7 +135,7 @@ en DAPA-CKD.
 Este es el orden que mejor cuenta la historia. **No empieces por el progresor
 obvio** — empieza por el caso que una foto puntual no ve.
 
-### 🟠 Paso 1 — "eGFR normal, riesgo oculto" *(empieza aquí)*
+### Paso 1 — "eGFR normal, riesgo oculto" *(empieza aquí)*
 
 - **Qué verá el clínico:** eGFR basal **98.1**, categoría **G1** — "riñón normal"
   en un laboratorio de rutina. Pero HbA1c 9.2 %, UACR 280 mg/g, PAS 150.
@@ -151,29 +150,29 @@ obvio** — empieza por el caso que una foto puntual no ve.
   ya está en marcha y es visible en la albuminuria. Esta es la utilidad central:
   modelar el **mecanismo**, no solo el número de hoy.
 
-### 🔴 Paso 2 — "Progresor rápido"
+### Paso 2 — "Progresor rápido"
 
 - **Qué verá:** G3a ya establecido (eGFR 47.7); cruce del umbral en **5.0 años**.
 - **El mensaje:** compara las dos curvas. La renoprotección mueve el umbral a
   **7.9 años** — una diferencia de **~3 años**, no de meses. El caso "actuar
   ahora".
 
-### 🟢 Paso 3 — "Bien controlado, bajo riesgo"
+### Paso 3 — "Bien controlado, bajo riesgo"
 
 - **Qué verá:** trayectoria lenta, casi plana (12.6 años sin tratamiento).
 - **El mensaje:** el modelo **no exagera**. Tan importante como detectar
   progresores es no alarmar a quien va bien. Es una comprobación de
   **especificidad / validez aparente** — y es la que le da credibilidad al
-  paciente 🟠.
+  paciente.
 
-### 🟣 Paso 4 — "Avanzado (G3b–G4)"
+### Paso 4 — "Avanzado (G3b–G4)"
 
-- **Qué verá:** régimen de **colapso terminal**, donde el exponente **q** domina
+- Régimen de **colapso terminal**, donde el exponente **q** domina
   (2.4 años sin tratamiento).
 - **El mensaje:** cerca del final, pequeñas diferencias de control se traducen en
   meses. Ilustra por qué importa la *forma* de la curva y no una pendiente lineal.
 
-### 🔬 Remate — qué vale la pena medir
+### Lo que vale la pena medir
 
 El mensaje accionable no es un examen caro, es el **tiempo de seguimiento**. Las
 mismas 4–6 creatininas repartidas en 4–8 años estiman la tasa de progresión del
@@ -186,11 +185,7 @@ viejas del expediente — son gratis y valen más que un análisis nuevo.
 
 ---
 
-## 5. Las tres advertencias honestas (dilas en voz alta)
-
-Un buen clínico va a preguntar esto. **Adelántate.** Decirlo suma credibilidad:
-demuestra que el modelo conoce sus límites. (Detalle completo en
-[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).)
+## 5. Tres advertencias
 
 1. **No está validado en cohorte clínica prospectiva.** Está verificado en datos
    sintéticos y con una primera comprobación de validez aparente contra perfiles
@@ -222,36 +217,14 @@ demuestra que el modelo conoce sus límites. (Detalle completo en
 - **Investigación:** en el contexto IMSS–ISSSTE, es la base para una calibración
   con cohorte mexicana real y una comparación cabeza a cabeza contra KFRE.
 
-**Lo que NO hay que afirmar:**
+**Lo afirma:**
 - ❌ que predice la fecha de inicio de diálisis;
 - ❌ que sustituye el juicio clínico;
 - ❌ que MIMIC-IV, por ser "datos reales", lo vuelve una herramienta validada.
 
 ---
 
-## 7. Si te piden ver "los números" del modelo
-
-Pipeline completo con evidencia auditable por corrida:
-```bash
-cd src
-python insilico_trial.py    # replica in-silico contra 3 ensayos publicados
-```
-
-MVP de calibración/validación (ajuste, forecast vs extrapolación lineal,
-discriminación de progresores):
-```bash
-cd src
-python mvp_calibration.py                                  # datos sintéticos
-CKD_CSV=../data/mis_datos.csv python mvp_calibration.py    # con tus datos
-```
-Formato del CSV: `patient_id, time_years, egfr, hba1c, uacr, sbp`.
-
-Genera `results/validation_report.md` — el reporte de una página pensado para
-compartir con colaboradores clínicos.
-
----
-
-## 8. Preguntas que te van a hacer
+## Preguntas
 
 **"¿En qué se diferencia de KFRE?"**
 KFRE es una ecuación de riesgo estadística (probabilidad de falla renal a 2/5
@@ -273,9 +246,3 @@ recalibrar con una cohorte local (sección 7).
 **"¿Por qué el eGFR<15 y no diálisis?"**
 Porque es lo que el modelo puede sostener: un umbral de función renal. El inicio
 de diálisis es una decisión clínica, no una línea en una curva.
-
----
-
-*Regla de oro de la demo: muestra el paciente 🟠 primero, deja que el clínico
-note que "el eGFR está normal", y solo entonces enseña la curva. Ese momento —
-cuando la foto tranquiliza pero el mecanismo no— es toda la propuesta de valor.*
