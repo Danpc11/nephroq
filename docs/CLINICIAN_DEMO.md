@@ -209,7 +209,7 @@ viejas del expediente — son gratis y valen más que un análisis nuevo.
 ## 6. El cierre: "¿y esto para qué me sirve?"
 
 - **Estratificación temprana:** marca al paciente con eGFR normal pero
-  hiperfiltrando, antes de que la caída sea visible en el laboratorio (el caso 🟠).
+  hiperfiltrando, antes de que la caída sea visible en el laboratorio.
 - **Conversación con el paciente:** una curva "con vs sin tratamiento" comunica el
   beneficio de la renoprotección mucho mejor que un valor aislado.
 - **Qué medir:** justifica pedir **UACR** y **cistatina C** por su impacto
