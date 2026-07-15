@@ -2,6 +2,105 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 16 — separating the albuminuric term so one hazard fits two populations
+
+### Context
+
+Rounds 10-15 established a robust, uncomfortable finding: MIMIC (the target IMSS-like
+population -- type 2 diabetes, near-normoalbuminuric, median UACR ~23) and the trial placebo
+arms (macroalbuminuric, UACR ~927) will not calibrate to a common `q`. MIMIC wants a late,
+abrupt structural collapse (`q ~= 2.9`, identified at k-fold CV 3%); the trials want early
+progression (`q = 1.52`). A single-regime hazard cannot put its collapse "step" in two places
+at once, and the Round 15 hybrid confirmed it: anchoring the weights to the trials sent `q` to
+its ceiling and raised the cost. These are two diseases of different shape.
+
+The product is for the IMSS-like population, which is mostly normoalbuminuric but also includes
+the sickest patients, who arrive already albuminuric. A single-regime model underestimates
+those patients dangerously. So the model must carry BOTH regimes in one hazard and let the
+patient's own UACR decide which dominates.
+
+### Changed -- `model_core.py`
+
+The UACR term was pulled out of `metabolic_hazard` (which is now A1c + SBP only) into its own
+coexisting term, `albuminuria_hazard(uacr, k_alb) = k_alb * log1p(UACR/30)`:
+
+```
+h = k0
+  + k_hf  * s^q / (1 + (s/S_SAT)^q)      structural  (hyperfiltration)
+  + k_alb * log1p(UACR(t)/30)            albuminuric  (NEW: separate coefficient)
+  + w_a1c*(A1c-6.5) + w_sbp*(SBP-130)/10 metabolic residual (no UACR)
+```
+
+The log form is unchanged -- it is the one already validated in-silico against the three
+trials (linear over-weights very high UACR; a threshold contradicts microalbuminuria
+predicting progression). The two insult terms keep the same `(1 - eff_met*u)` drug multiplier
+the old combined block had, and albuminuria's endogenous `eff_alb` reduction is untouched, so
+the drug response is identical.
+
+The point of the separation is calibration by domain. `k_hf, q` are pinned on MIMIC (where the
+structural signal is); `k_alb` is pinned on the trials (where albuminuria is observable),
+NEVER on MIMIC. `k_alb` was added to `TRIAL_CALIBRATION_V2` (same value the trial-fitted
+`w_uacr` had, `0.0180*0.730`). Because MIMIC is near-normoalbuminuric, `k_alb` has large
+leverage at high UACR and almost none at low UACR (a measured ~5x endpoint-shift ratio between
+UACR 927 and UACR 23 over 5 years), which is exactly what lets one parameter set serve both
+populations.
+
+### Backward compatibility -- migration chosen over a zero default
+
+`w_uacr` is threaded through the entire calibration/audit/app/personalize pipeline and dozens
+of tests. Rather than rename it everywhere (large, risky) or default `k_alb` to 0 (which would
+silently disconnect the coefficient `calibrate_mimic` still fits from the term it is supposed
+to control), the albuminuric coefficient is read via `_k_alb_of(p)`: use `k_alb` if present,
+else fall back to `w_uacr`. So every pre-Round-16 parameter dict -- and every `calibrate_mimic`
+fit, and every anchored run -- drives the hazard exactly as before. Under `--anchor-weights`,
+fixing `w_uacr` to the trial value now IS anchoring `k_alb` to the trials: the hybrid run from
+Round 15 already produces the dual-domain parameter set (MIMIC `q, k_hf` + trial `k_alb`), the
+separation just makes the semantics honest. `--index-strategy`, `--anchor-weights` and the
+conformal personalizer were not touched.
+
+### Verified by running (not by reading)
+
+- Default behaviour is BIT-IDENTICAL: `renal_hazard_v2` recomputed the old way (UACR inside
+  the metabolic block) matches the new split to |Δ| = 0 across eGFR, UACR, and treated/placebo.
+- Migration is exact: a pre-R16 dict (only `w_uacr`) simulates identically to one with
+  `k_alb` set to that value (max |Δ eGFR| = 0).
+- `batched == loop` still holds to < 1e-4 (the invariant the review demanded), including
+  replicates that set `k_alb` explicitly and ones that rely on migration.
+- In-silico trial replication still passes 3/3 (CREDENCE 0.99x, DAPA-CKD held-out 0.94x,
+  EMPA-KIDNEY 0.99x).
+- Suite: 93 tests green (86 + 7 new Round 16 regression tests covering the split, the
+  migration, the independence of `k_alb` from `w_uacr` once set, the leverage asymmetry, and
+  the batched/loop agreement).
+
+### Falsifiable DUAL test -- offline result, and what remains for `fx-gpu`
+
+The dual criterion: one parameter set must reproduce (a) MIMIC's late-abrupt collapse
+(chi2/n ~ 3) AND (b) all three placebo arms (ratios in [0.8, 1.25]).
+
+An offline feasibility scan (structural `q, k_hf` fixed at the MIMIC values, `w_a1c, w_sbp` at
+the trials, sweeping `k_alb`) shows (b) is achievable with the SAME `k_alb` that leaves the
+near-normoalbuminuric regime almost unmoved:
+
+- with the free-MIMIC structural fit (`q=2.923, k_hf=0.00277`): a `k_alb ~ 0.007-0.013`
+  window passes all three arms; the synthetic UACR~23 slope moves only ~6% across it.
+- with the anchored structural fit (`q~3.97, k_hf~0.0005`): the trial `k_alb = 0.01314`
+  itself passes all three arms (worst 1.07x).
+
+So the two-term model can, in principle, reconcile the populations -- the leverage asymmetry is
+real. This scan uses a simplified slope measure with drug effects off, so it is indicative, not
+the verdict. Side (a) -- the MIMIC chi2/n -- and the exact audit ratios must come from the
+`fx-gpu` run:
+
+```
+python calibrate_mimic.py --from-cohort ../data/_mimic_cohort.tsv --chronic-only \
+    --n-jobs 20 --anchor-weights --cv-folds 5 --n-bootstrap 20 --q-max 8
+python audit_calibration.py
+```
+
+If (a) and (b) both hold, the dual-regime model reconciles the two populations. If it improves
+the placebos but breaks MIMIC (or vice versa), that is reported as-is: which term is not
+enough, and why. No dependency on SMOTE, deep learning, SHAP or Optuna was introduced.
+
 ## Round 15 — hybrid calibration: estimate each parameter from the data that contain it
 
 ### Context
