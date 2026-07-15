@@ -879,3 +879,115 @@ def test_default_calibration_is_unchanged_by_the_anchor_plumbing():
         assert a[k] == pytest.approx(b[k], abs=1e-12), k
     assert a["anchor_weights"] is False
     assert a["free_parameters"] == ["q", "k_hf", "w_a1c", "w_uacr", "w_sbp"]
+
+
+# ==============================================================================
+# Round 16 -- SEPARATED ALBUMINURIC TERM (k_alb) + dual-domain structure
+# ==============================================================================
+# UACR was pulled out of metabolic_hazard into its own coexisting term
+# albuminuria_hazard(uacr, k_alb). w_uacr migrates to k_alb (a pre-R16 dict is
+# read via _k_alb_of), so default behaviour is bit-identical and the whole
+# calibration pipeline (which still fits a coefficient it calls w_uacr) keeps
+# driving the hazard with no silent disconnect.
+
+def test_metabolic_hazard_no_longer_depends_on_uacr():
+    """The metabolic term is now A1c + SBP only. Its signature must not take
+    UACR, and UACR must not appear in its value."""
+    import inspect
+    params = list(inspect.signature(core.metabolic_hazard).parameters)
+    assert params == ["a1c", "sbp", "w_a1c", "w_sbp"], params
+    # value is invariant to any UACR (it simply is not an argument)
+    v = core.metabolic_hazard(8.0, 150.0, 0.0144, 0.0108)
+    assert v == pytest.approx(0.0144 * 1.5 + 0.0108 * 2.0)
+
+
+def test_albuminuria_hazard_is_the_log_form_and_separate():
+    """albuminuria_hazard = k_alb * log1p(UACR/30), the validated log form."""
+    for uacr in (0.0, 23.0, 300.0, 927.0):
+        assert core.albuminuria_hazard(uacr, 0.013) == pytest.approx(
+            0.013 * np.log1p(uacr / 30.0))
+    assert core.albuminuria_hazard(500.0, 0.0) == 0.0   # no coefficient, no term
+
+
+def test_default_hazard_is_bit_identical_after_separation():
+    """
+    The whole safety case for Round 16: separating the term must not move the
+    production model at all with default parameters. Recompute the hazard the
+    OLD way (UACR inside the metabolic block) and require exact equality.
+    """
+    p = dict(core.TRIAL_CALIBRATION_V2)
+
+    def old_hazard(N, N0, a1c, uacr0, sbp, u):
+        uacr_t = core.uacr_of_state(N, N0, uacr0, u, p["eff_alb"], p.get("beta", core.BETA))
+        hf = core.hyperfiltration_hazard_v2(N, p["k_hf"], p["q"], p.get("s_sat", core.S_SAT)) \
+            * (1.0 - p["eff_hf"] * u)
+        insult = (p["w_a1c"] * max(a1c - 6.5, 0.0)
+                  + p["w_uacr"] * np.log1p(uacr_t / 30.0)
+                  + p["w_sbp"] * max(sbp - 130.0, 0.0) / 10.0) * (1.0 - p["eff_met"] * u)
+        return min(p["k0"] + hf + insult, core.HAZARD_CAP)
+
+    for egfr0, a1c, uacr0, sbp, u in [(60, 8, 23, 135, 0.0), (56, 8, 927, 135, 0.0),
+                                      (40, 9, 300, 150, 1.0), (75, 6.5, 10, 120, 0.0)]:
+        N0 = core.N_of_egfr(egfr0)
+        for frac in (1.0, 0.8, 0.5, 0.3):
+            N = N0 * frac
+            new = core.renal_hazard_v2(N, N0, a1c, uacr0, sbp, u, p)
+            assert new == pytest.approx(old_hazard(N, N0, a1c, uacr0, sbp, u), abs=1e-15)
+
+
+def test_w_uacr_migrates_to_k_alb_exactly():
+    """A pre-R16 parameter dict (w_uacr, no k_alb) must simulate identically to
+    the same dict with k_alb set to that w_uacr value."""
+    p_old = dict(core.TRIAL_CALIBRATION_V2); p_old.pop("k_alb")
+    p_new = dict(p_old, k_alb=p_old["w_uacr"])
+    for egfr0, uacr0 in [(56, 927), (60, 23), (45, 300)]:
+        _, e_old, _, _ = core.simulate_trajectory_v2(egfr0, 8, uacr0, 135, 0, p_old, years=6, n=120)
+        _, e_new, _, _ = core.simulate_trajectory_v2(egfr0, 8, uacr0, 135, 0, p_new, years=6, n=120)
+        assert np.max(np.abs(e_old - e_new)) == 0.0
+
+
+def test_k_alb_and_w_uacr_are_independent_after_migration():
+    """Once k_alb is present it OVERRIDES w_uacr -- so the albuminuric coefficient
+    can be calibrated (on the trials) independently of anything left in w_uacr."""
+    p = dict(core.TRIAL_CALIBRATION_V2, k_alb=0.030, w_uacr=0.0)  # divergent on purpose
+    _, e_big, _, _ = core.simulate_trajectory_v2(56, 8, 927, 135, 0, p, years=5, n=120)
+    p_small = dict(p, k_alb=0.005)
+    _, e_small, _, _ = core.simulate_trajectory_v2(56, 8, 927, 135, 0, p_small, years=5, n=120)
+    # bigger k_alb -> faster decline at high UACR -> lower eGFR at the end
+    assert e_big[-1] < e_small[-1] - 1.0
+    # and w_uacr is genuinely ignored: changing it must do nothing when k_alb is set
+    p_wu = dict(p, w_uacr=0.05)
+    _, e_wu, _, _ = core.simulate_trajectory_v2(56, 8, 927, 135, 0, p_wu, years=5, n=120)
+    assert np.max(np.abs(e_wu - e_big)) == 0.0
+
+
+def test_k_alb_has_leverage_at_high_uacr_and_little_at_low_uacr():
+    """The property that makes ONE parameter set fit both populations: raising
+    k_alb must strongly speed a macroalbuminuric patient and barely touch a
+    normoalbuminuric one."""
+    lo = dict(core.TRIAL_CALIBRATION_V2, k_alb=0.006)
+    hi = dict(core.TRIAL_CALIBRATION_V2, k_alb=0.020)
+
+    def end(p, uacr0):
+        _, e, _, _ = core.simulate_trajectory_v2(56, 8, uacr0, 135, 0, p, years=5, n=120)
+        return e[-1]
+
+    macro_shift = end(lo, 927) - end(hi, 927)   # how much k_alb moves UACR=927
+    normo_shift = end(lo, 23) - end(hi, 23)      # ... vs UACR=23
+    # measured: macro ~8.4 mL/min, normo ~1.7 mL/min over 5 yr (ratio ~5x). The
+    # design property is the LEVERAGE RATIO, not an absolute floor on the normo
+    # side (a bigger k_alb does still nudge low-UACR patients a little).
+    assert macro_shift > 4.0                       # strong effect at high UACR
+    assert macro_shift > 4.0 * normo_shift         # and far weaker at low UACR
+
+
+def test_batched_still_matches_loop_after_k_alb_split():
+    """The batched integrator must still equal the per-replicate loop to <1e-4,
+    including a replicate that sets k_alb explicitly."""
+    ps = [dict(core.TRIAL_CALIBRATION_V2, q=q) for q in (1.3, 1.52, 2.0, 2.9)]
+    ps.append(dict(core.TRIAL_CALIBRATION_V2, k_alb=0.025))       # explicit k_alb
+    ps.append({k: v for k, v in core.TRIAL_CALIBRATION_V2.items() if k != "k_alb"})  # migrated
+    tq = np.array([0.0, 1.0, 2.0, 3.0, 5.0])
+    bat = core.predict_egfr_at_v2_batched(56, 8, 927, 135, 0, ps, tq)
+    loop = np.stack([core.predict_egfr_at_v2(56, 8, 927, 135, 0, pp, tq) for pp in ps])
+    assert np.max(np.abs(bat - loop)) < 1e-4
