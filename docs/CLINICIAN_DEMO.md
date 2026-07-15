@@ -10,7 +10,7 @@ sus valores exactos y las salidas que debes esperar, las dos formas de correr la
 demo, el guion hablado, las advertencias honestas y el cierre. No necesitas
 abrir ningún otro archivo para dar la demo.
 
-> ⚠️ **NephroQ es un prototipo de investigación (TRL 4). NO es una herramienta
+> ⚠️ **NephroQ es un prototipo de investigación. NO es una herramienta
 > diagnóstica.** No debe usarse para decisiones clínicas sin supervisión médica
 > calificada. Las trayectorias son *ilustrativas del mecanismo del modelo*, no
 > predicciones individualizadas. Esto está escrito en la propia interfaz y no se
@@ -173,12 +173,16 @@ obvio** — empieza por el caso que una foto puntual no ve.
 - **El mensaje:** cerca del final, pequeñas diferencias de control se traducen en
   meses. Ilustra por qué importa la *forma* de la curva y no una pendiente lineal.
 
-### 🔬 Remate — el valor de la cistatina C
+### 🔬 Remate — qué vale la pena medir
 
-Marca la casilla **"Tengo cistatina C"** en cualquier paciente. Menciona que
-pedir cistatina C reduce **~5×** el error en la estimación de **q**. Es un
-argumento concreto de *qué medir* para que el modelo prediga mejor — y una
-recomendación accionable que el clínico se puede llevar hoy.
+El mensaje accionable no es un examen caro, es el **tiempo de seguimiento**. Las
+mismas 4–6 creatininas repartidas en 4–8 años estiman la tasa de progresión del
+paciente ~3× mejor que esas mismas mediciones apretadas en 1–2 años — y mejor que
+10–14 mediciones dentro de una ventana corta. La cistatina C ayuda de forma
+modesta a la tasa individual (R² 0.67 vs 0.48 con solo creatinina), pero **no**
+identifica el exponente de colapso `q` a nivel de un paciente: eso requiere una
+población, no un examen. Recomendación para llevar hoy: rescata las creatininas
+viejas del expediente — son gratis y valen más que un análisis nuevo.
 
 ---
 
