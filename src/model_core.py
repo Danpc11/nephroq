@@ -18,10 +18,14 @@ before/after numeric comparison that caught this.
     dN/dt = -N * h(N)
 
     h(N) = k0
-         + k_hf * s^q / (1 + (s/S_SAT)^q)        <- SATURATING hyperfiltration
-         + insult(HbA1c, UACR(t), SBP)           <- UACR(t) is ENDOGENOUS
+         + k_hf  * s^q / (1 + (s/S_SAT)^q)       <- SATURATING hyperfiltration (structural)
+         + k_alb * log1p(UACR(t)/30)             <- ALBUMINURIC (Round 16: own term)
+         + w_a1c*(A1c-6.5) + w_sbp*(SBP-130)/10  <- metabolic residual (no UACR)
 
     with s = N_ref/N, and  UACR(t) = UACR_0 * (s(t)/s_0)^BETA * (1 - eff_alb*u).
+    The structural term is pinned on MIMIC (normoalbuminuric); the albuminuric
+    term k_alb on the trials (macroalbuminuric). ONE parameter set, the patient's
+    UACR decides which regime dominates.
 
     THIS is the production model (v2) -- the equation that produced every figure,
     every calibration and every validation in the repository. The unbounded power
@@ -55,12 +59,55 @@ def N_of_egfr(egfr):
 N_DIALYSIS = N_of_egfr(DIALYSIS_eGFR)
 
 
-def metabolic_hazard(a1c, uacr, sbp, w_a1c, w_uacr, w_sbp):
-    """Explicit-weights metabolic insult (already-scaled calibrated weights,
-    e.g. from calibrate_mimic.py). I >= 0."""
+def metabolic_hazard(a1c, sbp, w_a1c, w_sbp):
+    """
+    Metabolic-insult hazard from the NON-albuminuric covariates only (already-
+    scaled calibrated weights, e.g. from calibrate_mimic.py). I >= 0.
+
+    Round 16: UACR was REMOVED from this term and given its own coexisting
+    coefficient (see albuminuria_hazard). It used to sit here as
+    w_uacr*log1p(UACR/30), mixed in with A1c and SBP, which meant it was
+    calibrated as one block on MIMIC -- a near-normoalbuminuric cohort with no
+    albuminuria signal to learn. Separating it lets the albuminuric coefficient
+    be calibrated where albuminuria is actually observable (the trials) while the
+    structural terms are calibrated on MIMIC.
+    """
     return (w_a1c * max(a1c - 6.5, 0.0)
-            + w_uacr * np.log1p(uacr / 30.0)
             + w_sbp * max(sbp - 130.0, 0.0) / 10.0)
+
+
+def albuminuria_hazard(uacr, k_alb):
+    """
+    Albuminuric hazard: a proteinuria-driven pathway distinct from hemodynamic
+    (hyperfiltration) injury. Logarithmic in UACR -- the same log1p(UACR/30) form
+    that was validated in-silico against all three trials; a linear form
+    over-weights very high UACR and a threshold form contradicts the fact that
+    microalbuminuria already predicts progression.
+
+    This COEXISTS with the structural hyperfiltration term rather than replacing
+    it. For a near-normoalbuminuric patient (UACR ~20) it is small and the
+    structural term dominates; for a macroalbuminuric patient (UACR ~900) it
+    switches on and carries the early progression the trials are driven by. That
+    asymmetry -- large leverage at high UACR, almost none at low UACR -- is what
+    lets ONE parameter set fit both the MIMIC (structural) and trial (albuminuric)
+    populations.
+    """
+    return k_alb * np.log1p(uacr / 30.0)
+
+
+def _k_alb_of(p):
+    """
+    Albuminuric coefficient for a parameter dict, with backward compatibility.
+
+    Round 16 migrates w_uacr -> k_alb. A dict written before Round 16 carries
+    w_uacr but no k_alb; it is read as k_alb here so every pre-existing parameter
+    set (and every calibrate_mimic fit, which still fits a coefficient it calls
+    w_uacr) keeps driving the hazard exactly as before -- no silent disconnect
+    between a fitted coefficient and the term it is supposed to control.
+    """
+    if "k_alb" in p:
+        return p["k_alb"]
+    return p.get("w_uacr", 0.0)
 
 
 def gfr_category(egfr):
@@ -134,6 +181,13 @@ TRIAL_CALIBRATION_V2 = dict(
     k_hf=0.0141 * 0.730,                    # hazard scale 0.730
     k0=0.0030,
     w_a1c=0.0144 * 0.730,
+    # ALBUMINURIC coefficient (Round 16). Same numeric value as the old w_uacr,
+    # so the trial path is unchanged; it is now a NAMED, independently
+    # calibratable term (the trials are where albuminuria is observable, so this
+    # is the domain that pins it -- not MIMIC). w_uacr is kept below only for
+    # backward compatibility with code that still reads that key; the hazard uses
+    # k_alb (see _k_alb_of).
+    k_alb=0.0180 * 0.730,
     w_uacr=0.0180 * 0.730,
     w_sbp=0.0108 * 0.730,
     eff_met=0.669,
@@ -166,7 +220,12 @@ def renal_hazard_v2(N, N0, a1c, uacr0, sbp, u, p):
     uacr_t = uacr_of_state(N, N0, uacr0, u, p["eff_alb"], p.get("beta", BETA))
     hf = hyperfiltration_hazard_v2(N, p["k_hf"], p["q"], p.get("s_sat", S_SAT))
     hf *= (1.0 - p["eff_hf"] * u)
-    insult = metabolic_hazard(a1c, uacr_t, sbp, p["w_a1c"], p["w_uacr"], p["w_sbp"])
+    # Metabolic (A1c + SBP) and albuminuric (UACR) insults now COEXIST as
+    # separate terms. Both keep the same (1 - eff_met u) drug multiplier the old
+    # combined block had, so with k_alb == the old w_uacr the total is unchanged
+    # (the SGLT2i UACR-lowering effect additionally flows through uacr_t's eff_alb).
+    insult = metabolic_hazard(a1c, sbp, p["w_a1c"], p["w_sbp"])
+    insult += albuminuria_hazard(uacr_t, _k_alb_of(p))
     insult *= (1.0 - p["eff_met"] * u)
     # HAZARD CAP. 50/yr is a numerical guard, not biology: at that rate a nephron
     # population halves roughly every 5 days, which no patient survives. It exists
@@ -280,7 +339,7 @@ def predict_egfr_at_v2_batched(egfr0, a1c, uacr0, sbp, u, param_sets, t_query):
     q = np.array([p["q"] for p in param_sets], dtype=float)
     k_hf = np.array([p["k_hf"] for p in param_sets], dtype=float)
     w_a1c = np.array([p["w_a1c"] for p in param_sets], dtype=float)
-    w_uacr = np.array([p["w_uacr"] for p in param_sets], dtype=float)
+    k_alb = np.array([_k_alb_of(p) for p in param_sets], dtype=float)
     w_sbp = np.array([p["w_sbp"] for p in param_sets], dtype=float)
     k0 = np.array([p.get("k0", 0.0030) for p in param_sets], dtype=float)
     s_sat = np.array([p.get("s_sat", S_SAT) for p in param_sets], dtype=float)
@@ -297,7 +356,7 @@ def predict_egfr_at_v2_batched(egfr0, a1c, uacr0, sbp, u, param_sets, t_query):
         s = 1.0 / N
         hf = k_hf * (s ** q) / (1.0 + (s / s_sat) ** q) * (1.0 - eff_hf * u)
         uacr_t = uacr0 * (s / s0) ** beta * (1.0 - eff_alb * u)
-        insult = (w_a1c * a1c_x + w_uacr * np.log1p(uacr_t / 30.0)
+        insult = (w_a1c * a1c_x + k_alb * np.log1p(uacr_t / 30.0)
                   + w_sbp * sbp_x) * (1.0 - eff_met * u)
         return -N * np.minimum(k0 + hf + insult, HAZARD_CAP)
 
