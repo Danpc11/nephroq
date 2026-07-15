@@ -2,6 +2,103 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 17 — the collapse exponent is a property of progressing CKD, not of the whole cohort
+
+### Context
+
+Round 16 left one question open: is the steep collapse exponent (`q ≈ 2.9`) seen under
+`--chronic-only` a real feature of the population, or an artifact of selecting on the
+outcome? `--chronic-only` keeps patients whose eGFR is net-declining, which is selection
+on the dependent variable, and a reviewer will rightly ask whether the whole finding is
+built on that filter. This round runs the controlled experiment: the same MIMIC-IV cohort,
+calibrated with and without the filter, weights free (not anchored), everything else held
+fixed.
+
+### What was run
+
+Two MIMIC-pure calibrations from the same kept cohort (`_mimic_cohort.tsv`), differing only
+in `--chronic-only`. Weights were fitted, not anchored, so this isolates the effect of the
+filter itself rather than confounding it with the trial anchor.
+
+```
+python calibrate_mimic.py --from-cohort ../data/_mimic_cohort.tsv \
+    --n-jobs 20 --q-max 8 --cv-folds 5 --n-bootstrap 10           # full cohort
+python calibrate_mimic.py --from-cohort ../data/_mimic_cohort.tsv \
+    --chronic-only --n-jobs 20 --q-max 8 --cv-folds 5 --n-bootstrap 10   # progressors
+```
+
+### Result
+
+| | Full cohort | `--chronic-only` (progressors) |
+|---|---|---|
+| n patients | 6395 | 2259 |
+| **q (fit)** | **0.90** | **3.30** |
+| q, k-fold CV | 11% | 1% |
+| q pinned at bound? | no | no |
+| k_hf | 0.0103 | 0.0015 |
+| chi²/n | 8.06 | 3.03 |
+| RMSE (mL/min) | 24.3 | 14.9 |
+| quality gate | **warning** | pass |
+
+Both fits identify `q` (neither pins to a bound; CV is 11% and 1% respectively), but they
+converge to opposite regimes:
+
+- `q ≈ 0.90` is **sub-linear** decline — progression that *decelerates* as nephrons are
+  lost. This is what dominates a diabetic cohort that is mostly stable or slowly declining.
+- `q ≈ 3.30` is **super-linear** decline — the accelerating terminal collapse of CKD that
+  is actually progressing.
+
+The quality gate tells the rest of the story. On the full cohort the single-regime model
+fits **badly** (chi²/n = 8.06, three quality warnings including poor 5-year forecast
+accuracy). On the progressor subset it fits cleanly (chi²/n = 3.03, pass). A one-`q` hazard
+cannot describe a mixture of two regimes; forced to, it splits the difference and fits
+everyone poorly.
+
+### Interpretation
+
+`--chronic-only` does **not** manufacture the steep exponent through selection bias. It
+selects the population in which the collapse exponent is *defined*. `q` characterises
+terminal acceleration; for a patient whose kidney function is flat, there is no
+acceleration to measure, and averaging such patients in does not yield a less-biased `q` —
+it yields a different, lower-quality fit of a single regime to a two-regime population.
+
+This is the same logic by which KFRE is calibrated on established CKD rather than on the
+general population. The model's domain of validity is progressing CKD. The full-cohort
+chi²/n = 8.06 is not a failure to be hidden; it **quantifies the cost** of applying the
+model outside that domain, and is itself a reportable number.
+
+The honest caveat, which must be stated and not buried: `--chronic-only` is selection on
+the outcome. The defence is one of framing, not denial — the tool is for patients who are
+progressing, and it is calibrated on that population deliberately.
+
+### Corrects a claim from earlier in the session
+
+An intermediate run with `--anchor-weights` (weights fixed at the trial values) had shown
+`q` un-identifiable on the full cohort (CV 26%, one fold at the bound), and it was tempting
+to conclude that `q` is simply not estimable in non-progressors. **That was an artifact of
+the anchor, not of the population.** With the weights freed (this round), `q` on the full
+cohort is identified (CV 11%, no fold at a bound) — it just lands in the sub-linear regime.
+The degeneracy was `q`↔weights, not `q`↔filter. The finding (two regimes) stands; the
+mechanism was misattributed and is corrected here.
+
+### Not over-claimed
+
+The sensitivity fit on the *imputed* full cohort returned `q = 1.52`, numerically identical
+to the trial-anchored value. This is intriguing — it would fit a picture in which the trial
+populations (broad-inclusion, established CKD) sit at the population-average exponent while
+the progressor and stable subgroups are its extremes — but it is **not reported as a
+finding.** That cohort has ~63% of UACR imputed, which injects an artificial albuminuria
+signal that could pull `q` toward the trial value by construction. Distinguishing a real
+convergence from an imputation artifact would need a cohort with well-measured UACR, which
+is a separate study. It is recorded here as a hypothesis, not a result.
+
+### Also confirmed (unchanged, by a different route)
+
+In both MIMIC-pure fits a metabolic weight pins to its bound — `w_uacr` on the full cohort
+(CV 94%, 2/5 folds) and `w_sbp` on the progressor subset (CV 78%, 3/5 folds). This is the
+same non-identifiability of the metabolic weights seen before, and it reinforces the
+by-domain calibration policy: those weights belong to the trials, not to MIMIC.
+
 ## Round 16 — separating the albuminuric term so one hazard fits two populations
 
 ### Context
