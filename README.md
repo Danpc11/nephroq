@@ -95,22 +95,38 @@ A low-dimensional ODE for the surviving fraction of functional nephrons `N`:
 ```
 dN/dt = -N * h(N)
 
-h(N) = k0 + hyperfiltration(N) + insult(HbA1c, UACR(t), SBP)
+h(N) = k0
+     + k_hf * structural(N)          hyperfiltration (dominant at low UACR)
+     + k_alb * log(1 + UACR(t)/30)   albuminuric (dominant at high UACR)
+     + metabolic(HbA1c, SBP)
 ```
 
-Three ideas do the work:
+Four ideas do the work:
 
 1. **Hyperfiltration feedback.** As nephrons are lost, the survivors are
    overloaded and damaged faster — the source of the accelerating, non-linear
    collapse. It **saturates** at a physiological ceiling (a surviving nephron
-   raises its single-nephron GFR ~3x, not without limit).
-2. **Compensation.** eGFR stays roughly stable while reserve remains, then falls
+   raises its single-nephron GFR ~3x, not without limit; the transition sits near
+   eGFR 44).
+2. **Two coexisting insults.** A structural (hyperfiltration) term and a separate
+   albuminuric term, each with its own coefficient. The patient's own UACR decides
+   which dominates: low UACR → structural, high UACR → albuminuric. This is what
+   lets one parameter set describe both a near-normoalbuminuric primary-care
+   population and the macroalbuminuric populations of the SGLT2i trials.
+3. **Compensation.** eGFR stays roughly stable while reserve remains, then falls
    steeply near the end. This is why a single eGFR snapshot can look reassuring
    while the mechanism is already running.
-3. **Endogenous albuminuria.** UACR is a *consequence* of glomerular
+4. **Endogenous albuminuria.** UACR is a *consequence* of glomerular
    hypertension, not an external driver. The model predicts its trajectory — and
    predicts that renoprotective therapy lowers it ~29% immediately (SGLT2i trials
    published **31–35%**).
+
+**The collapse exponent `q` is population-dependent, and that is a finding, not a
+nuisance.** Calibrated on progressing CKD it is steep and identified (`q ≈ 2.9`,
+k-fold CV 3%); on a broad diabetic cohort dominated by stable kidney function the
+single-regime fit degrades, because `q` describes terminal *acceleration* and is
+undefined for patients who are not progressing. The model's domain is progressing
+CKD — see `docs/CHANGELOG.md`, Rounds 16–17.
 
 Full mathematical specification: [`docs/MODEL_DOCUMENTATION.md`](docs/MODEL_DOCUMENTATION.md).
 
@@ -384,7 +400,7 @@ evidence; all the weight is on DAPA-CKD:
 The run writes `results/insilico_trial_report.md`.
 
 ```bash
-python -m pytest tests -q      # 73 tests
+python -m pytest tests -q      # 93 tests
 ```
 
 ---
@@ -406,7 +422,7 @@ nephroq/
 │   ├── mvp_calibration.py      # calibrate + validate on YOUR data
 │   ├── calibrate_mimic.py      # optional: calibrate on MIMIC-IV
 │   └── mimic_loader.py         # optional: MIMIC-IV cohort builder
-├── tests/                      # 73 tests
+├── tests/                      # 93 tests
 ├── docs/
 │   ├── MODEL_DOCUMENTATION.md  # mathematical specification
 │   ├── CLINICIAN_DEMO.md       # 7-minute clinician demo script
