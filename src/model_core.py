@@ -201,6 +201,47 @@ TRIAL_CALIBRATION_V2 = dict(
 )
 
 
+def hazard_decomposition(N, N0, a1c, uacr0, sbp, u, p):
+    """
+    Break the total hazard into its named mechanistic terms, for explainability.
+
+    This is the model's answer to 'why is THIS patient at risk?', and it needs no
+    SHAP or post-hoc attribution: the terms are literally what the ODE integrates.
+    `renal_hazard_v2` sums exactly these; here they are returned separately, each
+    with its share of the total, so a clinician sees the modelled drivers directly.
+
+    Returns a dict:
+        {'baseline', 'hyperfiltration', 'albuminuria', 'hba1c', 'sbp'}  -> hazard/yr
+        plus 'total' and a parallel 'fractions' dict of the same keys summing to 1.
+
+    The split is computed at the CURRENT state N, so it is the instantaneous
+    contribution, not integrated over the trajectory.
+    """
+    uacr_t = uacr_of_state(N, N0, uacr0, u, p["eff_alb"], p.get("beta", BETA))
+
+    hf = hyperfiltration_hazard_v2(N, p["k_hf"], p["q"], p.get("s_sat", S_SAT))
+    hf *= (1.0 - p["eff_hf"] * u)
+
+    met_mult = (1.0 - p["eff_met"] * u)
+    h_a1c = p["w_a1c"] * max(a1c - 6.5, 0.0) * met_mult
+    h_sbp = p["w_sbp"] * max(sbp - 130.0, 0.0) / 10.0 * met_mult
+    h_alb = albuminuria_hazard(uacr_t, _k_alb_of(p)) * met_mult
+
+    terms = {
+        "baseline": float(p["k0"]),
+        "hyperfiltration": float(hf),
+        "albuminuria": float(h_alb),
+        "hba1c": float(h_a1c),
+        "sbp": float(h_sbp),
+    }
+    total = sum(terms.values())
+    # total here is the UNCAPPED sum; the cap is a numerical guard that should not
+    # bind for a plausible patient, and applying it would distort the fractions.
+    fractions = ({k: v / total for k, v in terms.items()} if total > 0
+                 else {k: 0.0 for k in terms})
+    return {**terms, "total": float(total), "fractions": fractions}
+
+
 def hyperfiltration_hazard_v2(N, k_hf, q, s_sat=S_SAT, n_ref=1.0):
     """Saturating hyperfiltration term. Bounded by k_hf * s_sat**q."""
     N = max(float(N), 1e-3)
