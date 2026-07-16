@@ -312,9 +312,20 @@ def personalize(t, egfr, a1c, uacr0, sbp, estimator=None):
     q, q_sd, scale, scale_sd = est.predict(features(t, egfr, a1c, uacr0, sbp))
     q, q_sd, scale, scale_sd = float(q[0]), float(q_sd[0]), float(scale[0]), float(scale_sd[0])
 
+    # PROJECT WITH POPULATION q, NOT the per-patient estimate.
+    # The repo's own experiments (measurement_strategy.py) show q is essentially
+    # unidentifiable from one patient's routine data (R^2 ~ 0), while almost all
+    # the predictive gain comes from the injury-rate scale s_i. So personalization
+    # rescales the hazard (scale) but leaves q at its population value. The
+    # estimated q and its spread are still returned, but only as a diagnostic /
+    # for the uncertainty display -- they do not drive the projection.
+    q_population = float(core.TRIAL_CALIBRATION_V2["q"])
+    params = patient_params(q_population, scale)
+
     return dict(personalized=True, reason="inferred from this patient's history",
-                params=patient_params(q, scale),
-                q=q, q_sd=q_sd, scale=scale, scale_sd=scale_sd)
+                params=params,
+                q=q_population, q_sd=q_sd, scale=scale, scale_sd=scale_sd,
+                q_estimated=q)
 
 
 # ------------------------------------------------------------------------------
