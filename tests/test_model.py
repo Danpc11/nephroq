@@ -124,3 +124,36 @@ def test_batched_ode_handles_an_empty_bootstrap():
     the caller can report 'no uncertainty band' rather than a fake one."""
     out = core.predict_egfr_at_v2_batched(55., 8., 300., 140., 0.0, [], np.array([5.0]))
     assert out.shape == (0, 1)
+
+
+def test_hazard_decomposition_sums_exactly_to_the_integrated_hazard():
+    """
+    Block 9 (explainability). The mechanistic breakdown must equal, to numerical
+    precision, the total hazard the ODE actually integrates -- otherwise the "why
+    is this patient at risk" panel would be a plausible-looking fiction. This is
+    the property that lets NephroQ explain itself WITHOUT SHAP: the terms are the
+    integrand, not a post-hoc attribution.
+    """
+    p = core.TRIAL_CALIBRATION_V2
+    for egfr in (80.0, 55.0, 40.0, 25.0):
+        for uacr in (20.0, 300.0, 900.0):
+            N = core.N_of_egfr(egfr)
+            N0 = core.N_of_egfr(egfr * 1.2)
+            d = core.hazard_decomposition(N, N0, 8.0, uacr, 140.0, 0.0, p)
+            direct = core.renal_hazard_v2(N, N0, 8.0, uacr, 140.0, 0.0, p)
+            assert d["total"] == pytest.approx(direct, rel=1e-9), (egfr, uacr)
+            # fractions are a genuine partition
+            assert sum(d["fractions"].values()) == pytest.approx(1.0, abs=1e-9)
+            assert all(f >= 0.0 for f in d["fractions"].values())
+
+
+def test_hazard_decomposition_reflects_the_patients_uacr():
+    """A macroalbuminuric patient should have a larger albuminuric share than a
+    normoalbuminuric one at the same eGFR -- the split must track the mechanism,
+    not just return fixed weights."""
+    p = core.TRIAL_CALIBRATION_V2
+    N = core.N_of_egfr(45.0)
+    N0 = core.N_of_egfr(55.0)
+    low = core.hazard_decomposition(N, N0, 8.0, 20.0, 140.0, 0.0, p)
+    high = core.hazard_decomposition(N, N0, 8.0, 900.0, 140.0, 0.0, p)
+    assert high["fractions"]["albuminuria"] > low["fractions"]["albuminuria"]
