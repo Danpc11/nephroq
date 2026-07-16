@@ -153,8 +153,13 @@ with st.sidebar:
     st.header(_("history_header"))
     st.caption(_("history_caption"))
     if "history" not in st.session_state:
+        # Start EMPTY. Pre-filling fictitious creatinines silently switched on
+        # personalization for a patient whose history the clinician never entered,
+        # producing a "personalized" projection built on invented data. A "load
+        # example" button below offers demo values explicitly, on request.
         st.session_state["history"] = pd.DataFrame(
-            {"years_ago": [3.0, 2.0, 1.0], "creatinine": [1.05, 1.15, 1.22]})
+            {"years_ago": pd.Series([], dtype=float),
+             "creatinine": pd.Series([], dtype=float)})
     hist = st.data_editor(
         st.session_state["history"], num_rows="dynamic", use_container_width=True,
         column_config={
@@ -194,13 +199,30 @@ try:
         # today's measurement closes the series
         t_hist = np.append((h["years_ago"].max() - h["years_ago"]).to_numpy(float),
                            float(h["years_ago"].max()))
-        e_hist = np.append(np.array([egfr_cr(c, age, sex) for c in h["creatinine"]]), egfr0)
+        # Historical creatinines must be converted to eGFR using the patient's
+        # age AT THE TIME of each measurement, not their current age. A creatinine
+        # from 3 years ago belongs to a patient who was 3 years younger, and
+        # CKD-EPI is age-dependent; using current age biases the reconstructed
+        # history (it inflates the apparent early decline). today's sample uses
+        # today's age.
+        age_at = (age - h["years_ago"]).to_numpy(float)
+        e_hist = np.append(
+            np.array([egfr_cr(c, a, sex) for c, a in zip(h["creatinine"], age_at)]),
+            egfr0)
         with st.spinner(_("training_estimator")):
             _est = _get_personalizer()
         PERSONAL = pz.personalize(t_hist, e_hist, hba1c, uacr, sbp, estimator=_est)
 except Exception:
     pass                    # never let personalization break the app
 P_PARAMS = PERSONAL["params"]
+
+# The ACTIVE TIER's population parameters, as a dict. This is the base that
+# personalization (s_i) is applied on top of, and the correct precedence root:
+# public -> trial anchors; otherwise the local MIMIC/private calibration.
+P_PARAMS_POP = dict(core.TRIAL_CALIBRATION_V2)
+if CALIB_TIER != "public":
+    P_PARAMS_POP.update(q=Q_POP, k_hf=KHF_POP,
+                        w_a1c=W_POP[0], w_uacr=W_POP[1], w_sbp=W_POP[2])
 
 _active = st.session_state.get("_active_preset")
 _ap = preset_by_id(_active) if _active else None
@@ -228,11 +250,30 @@ def project(a1c, sbp, uacr, egfr0, treated, q=None, khf=None, w=None, years=15):
     the default parameters are anchored to published trials, and a local
     MIMIC calibration (if present) overrides q / k_hf / the covariate weights.
     """
-    p = dict(P_PARAMS)          # personalized if a history was given; population otherwise
+    # Parameter precedence, applied in the correct order:
+    #   1. Start from the ACTIVE calibration tier (public trials, or a local
+    #      MIMIC/private calibration if present). This sets the POPULATION
+    #      parameters: q, k_hf, and the covariate weights.
+    #   2. Apply this patient's individual susceptibility s_i ON TOP, as a
+    #      multiplier of the hazard scale. Personalization rescales the population
+    #      model; it does not replace it, and a MIMIC/private tier must NOT
+    #      overwrite it (that was the bug -- the tier used to clobber the
+    #      personalized parameters after the fact).
+    # q stays at the POPULATION value throughout: the repo's own experiments show
+    # q is not identifiable per patient, so only s_i (scale) is individual.
     if q is not None:
+        # explicit override (used by the scenario controls / tests)
+        p = dict(P_PARAMS_POP)
         p.update(q=q, k_hf=khf, w_a1c=w[0], w_uacr=w[1], w_sbp=w[2])
-    elif CALIB_TIER != "public":
-        p.update(q=Q_POP, k_hf=KHF_POP, w_a1c=W_POP[0], w_uacr=W_POP[1], w_sbp=W_POP[2])
+    else:
+        p = dict(P_PARAMS_POP)          # active tier's population parameters
+        if PERSONAL["personalized"]:
+            s_i = PERSONAL["scale"]     # individual susceptibility, applied on top
+            p["k_hf"]   = P_PARAMS_POP["k_hf"]   * s_i
+            p["w_a1c"]  = P_PARAMS_POP["w_a1c"]  * s_i
+            p["w_uacr"] = P_PARAMS_POP["w_uacr"] * s_i
+            p["w_sbp"]  = P_PARAMS_POP["w_sbp"]  * s_i
+            # q is deliberately left at the population value
     t, egfr, uacr_t, t_thr = core.simulate_trajectory_v2(
         egfr0=egfr0, a1c=a1c, uacr0=uacr, sbp=sbp,
         u=1.0 if treated else 0.0, p=p, years=years)
