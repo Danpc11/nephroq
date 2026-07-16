@@ -344,7 +344,11 @@ def predict_egfr_at_v2(egfr0, a1c, uacr0, sbp, u, p, t_query, years=None):
 
     sol = solve_ivp(rhs, (0.0, t_end), [N0], t_eval=t_unique, method="LSODA",
                     rtol=1e-6, atol=1e-9)
-    if not sol.success or sol.y.shape[1] != len(t_unique):
+    # sol.y is normally an array, but a failed/degenerate solve can leave it as an
+    # empty list with no .shape -- guard on both so a bad draw falls back cleanly
+    # instead of raising AttributeError deep inside a Monte-Carlo loop.
+    y = np.asarray(sol.y)
+    if not sol.success or y.ndim != 2 or y.shape[1] != len(t_unique):
         # fall back to the canonical simulator rather than returning garbage
         t, egfr, _, _ = simulate_trajectory_v2(egfr0, a1c, uacr0, sbp, u=u, p=p,
                                                years=t_end, n=200)
