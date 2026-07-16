@@ -34,3 +34,4 @@ results/system_run_*
 # NOTE: calibration/personalizer.pkl IS committed (so the app starts instantly).
 # It is still fully reproducible -- if it is missing, or unloadable because
 # scikit-learn changed its pickle format, personalize.py retrains it on demand.
+calibration/personalizer.pkl
