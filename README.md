@@ -33,6 +33,7 @@ more honest — claim than "we estimate each patient's `q`".
 - [Quick start (2 minutes)](#quick-start-2-minutes)
 - [How the model works](#how-the-model-works)
 - [**Per-patient personalization (AI)**](#per-patient-personalization-ai)
+- [**The digital-twin system**](#the-digital-twin-system)
 - [Where the parameters come from](#where-the-parameters-come-from)
 - [**Using your own data**](#using-your-own-data) ← start here to calibrate
 - [Optional: calibrating with MIMIC-IV](#optional-calibrating-with-mimic-iv)
@@ -224,6 +225,55 @@ information — and it carries large biological noise.
 
 ---
 
+## The digital-twin system
+
+Beyond a single projection, NephroQ carries a set of layers that turn the
+mechanistic model into a longitudinal, clinically-framed digital twin. Each layer
+is data-and-orchestration only — the biology stays in `model_core.py`.
+
+**Longitudinal patient state** (`patient_state.py`). A `PatientState` holds a
+patient's history as an ordered list of `Visit`s, each lab a `Measured` value that
+records its unit, source, and whether it was observed or imputed. This is the
+object a twin is built around, and it is fed by a clinical data layer
+(`clinical_data.py`) that loads CSV/TSV, reconciles column-name synonyms, reports
+per-field **missingness**, and **flags out-of-range values instead of silently
+trusting or dropping them**. FHIR/OMOP adapters are declared but not faked.
+
+**Continuous update** (`digital_twin.py`). A twin is not projected once and frozen.
+Each new visit runs `forecast → observe → score the previous forecast →
+re-personalize → new forecast`, and it keeps the prediction-vs-observation trace —
+the raw material for earning (or losing) trust over time.
+
+**Treatment scenarios** (`treatment_engine.py`). Named drugs (SGLT2 inhibitor,
+RAAS inhibitor, finerenone, GLP-1 RA), each with its own mechanism, evidence base,
+and uncertainty range, combining multiplicatively so a regimen never exceeds full
+blockade. This is **scenario evaluation, not treatment recommendation** — every
+scenario is shown with the population its effect was estimated in.
+
+**Acute events** (`acute_events.py`). AKI episodes and the SGLT2i initiation dip are
+modelled as transient deflections *on top of* the chronic trajectory
+(`eGFR_observed = eGFR_chronic − D(t)`), so `N(t)` stays monotonic. An AKI episode
+can raise the patient's susceptibility afterward, and a recovering dip can be
+flagged so it is not mistaken for a chronic baseline.
+
+**Full predictive uncertainty** (`uncertainty.py`). The band decomposes into five
+sources — population, personalization, measurement, future covariates, and
+structural model error — kept separate so the interface can say *why* a projection
+is uncertain, and therefore what would reduce it.
+
+**Clinical outputs** (`clinical_outputs.py`). KDIGO-framed quantities a clinician
+reasons with: P(≥40% eGFR decline), P(G4), P(G5) by horizon, time to G3b/G4/G5,
+probability of rapid progression, expected category change, and a referral flag.
+It reports P(eGFR<15), **never a "dialysis start date"**.
+
+**Clinical safety** (`clinical_safety.py`). The twin knows when not to trust
+itself: verdicts of `prediction_available`, `prediction_with_caution`,
+`insufficient_data`, `out_of_validated_domain`, or `do_not_use_for_scenarios`,
+each with specific reasons, always shown with the model's provenance and a
+`research use — not prospectively validated` label.
+
+---
+
 ## Where the parameters come from
 
 NephroQ resolves parameters across **three tiers**, highest priority first. The
@@ -400,7 +450,7 @@ evidence; all the weight is on DAPA-CKD:
 The run writes `results/insilico_trial_report.md`.
 
 ```bash
-python -m pytest tests -q      # 93 tests
+python -m pytest tests -q      # 128 tests
 ```
 
 ---
@@ -410,22 +460,36 @@ python -m pytest tests -q      # 93 tests
 ```
 nephroq/
 ├── app_web.py                  # interactive app (English / Spanish)
-├── risk_notebook.ipynb         # Colab notebook (code hidden, app-like)
+├── risk_notebook.ipynb         # Colab notebook (Nature-style figures)
 ├── requirements.txt
 ├── src/
-│   ├── model_core.py           # THE model — single source of truth
-│   ├── egfr_measurement.py     # CKD-EPI 2021
+│   │  # -- core model --
+│   ├── model_core.py           # THE model — single source of truth (two-term hazard)
+│   ├── egfr_measurement.py     # CKD-EPI 2021/2012 (creatinine / cystatin / combined)
 │   ├── i18n.py                 # UI strings (EN/ES) + example patients
-│   ├── personalize.py          # per-patient AI (amortized inference)
-│   ├── measurement_strategy.py # what is worth measuring (simulation experiments)
+│   │  # -- calibration & validation --
 │   ├── insilico_trial.py       # falsifiable validation against 3 published trials
 │   ├── mvp_calibration.py      # calibrate + validate on YOUR data
 │   ├── calibrate_mimic.py      # optional: calibrate on MIMIC-IV
-│   └── mimic_loader.py         # optional: MIMIC-IV cohort builder
-├── tests/                      # 93 tests
+│   ├── mimic_loader.py         # optional: MIMIC-IV cohort builder
+│   ├── measurement_strategy.py # what is worth measuring (simulation experiments)
+│   ├── audit_calibration.py    # gate: reproduce published placebo arms or don't ship
+│   ├── external_validation.py  # external cohorts (CRIC): population + patient-level
+│   │  # -- personalization & the digital twin --
+│   ├── personalize.py          # per-patient AI (amortized inference; personalizes s_i)
+│   ├── patient_state.py        # longitudinal PatientState / Visit (with provenance)
+│   ├── clinical_data.py        # load CSV/TSV → PatientState; missingness, quality flags
+│   ├── digital_twin.py         # continuous update: forecast → observe → re-personalize
+│   ├── treatment_engine.py     # per-drug scenario engine (SGLT2i/RAASi/finerenone/GLP1)
+│   ├── acute_events.py         # AKI episodes + SGLT2i hemodynamic dip
+│   ├── uncertainty.py          # five-source predictive-uncertainty decomposition
+│   ├── clinical_outputs.py     # KDIGO risk probabilities, category times, referral flag
+│   └── clinical_safety.py      # when NOT to trust the twin (safety verdicts)
+├── tests/                      # 128 tests
 ├── docs/
 │   ├── MODEL_DOCUMENTATION.md  # mathematical specification
-│   ├── CLINICIAN_DEMO.md       # 7-minute clinician demo script
+│   ├── TRIAL_DATA_PROVENANCE.md# every trial value, its source, verification status
+│   ├── CLINICIAN_DEMO.md       # clinician demo script
 │   ├── MIMIC_COMPLIANCE.md     # data-handling rules
 │   ├── WEB_DEPLOYMENT.md       # free deployment
 │   └── CHANGELOG.md
@@ -433,8 +497,11 @@ nephroq/
 └── docker/Dockerfile
 ```
 
-There is **one model**, in `model_core.py`. The app, the calibration scripts and
-the validation all call the same simulator; nothing re-implements it.
+There is **one model**, in `model_core.py` — it is the only place with hazard
+mathematics. The app, the calibration scripts, the validation, and every
+digital-twin module call that same simulator; the twin layers orchestrate and hold
+data, they never re-implement the biology. That separation is what keeps each
+component testable and the whole system auditable.
 
 ---
 
@@ -443,21 +510,38 @@ the validation all call the same simulator; nothing re-implements it.
 Read before citing. These are not boilerplate.
 
 - **Not validated on a prospective clinical cohort.** Trial anchoring is
-  aggregate-level; that is not patient-level external validation.
-- **No acute haemodynamic dip.** SGLT2 inhibitors cause an early, reversible eGFR
-  drop that NephroQ does not model, so it can only be compared against *chronic*
-  slopes, never total slopes.
-- **MIMIC-IV index dates are not AKI-free baselines.** The index visit is the
-  first available creatinine, which in a hospital database is often drawn during
-  an acute episode. This is arguably the biggest threat to any MIMIC-based
-  calibration.
-- **The uncertainty band propagates only parameter uncertainty.** It is *not* a
-  prediction interval: it excludes measurement noise, individual random effects,
-  and unknown future covariates.
+  aggregate-level; that is not patient-level external validation. External
+  validation against CRIC is scaffolded (`external_validation.py`), but the
+  patient-level check is pending the individual-level trajectories, and the
+  population-level check currently uses an **unverified placeholder** for CRIC's
+  observed slope.
+- **MIMIC-IV index dates.** The default is now a KDIGO-style *confirmed* index
+  (`--index-strategy confirmed`): a baseline eGFR must still hold at ≥90 days, which
+  excludes most acute presentations. This mitigates — but does not eliminate — the
+  single biggest threat to any hospital-database calibration.
+- **The metabolic weights (HbA1c, SBP) are not identifiable** from a
+  near-normoalbuminuric cohort and are anchored to the trials rather than reported
+  as MIMIC estimates.
 - **The KFRE comparison is exploratory**, using a proxy outcome (observed
   eGFR<15) rather than treated kidney failure.
-- **Trial values are transcribed from the literature** and were not independently
-  verified. Re-check them against the primary papers before publication.
+- **Trial values were transcribed from the literature.** They have now been
+  **verified against the primary PDFs** (see `docs/TRIAL_DATA_PROVENANCE.md`); two
+  minor transcription errors were found and corrected. Figure read-offs still carry
+  the usual reading uncertainty.
+
+**Resolved since earlier versions** (noted so stale copies of this list are not
+trusted): the SGLT2i acute haemodynamic dip is now modelled (`acute_events.py`);
+the uncertainty band now decomposes five sources into a genuine predictive interval
+(`uncertainty.py`), not just parameter spread.
+
+### Maturity (TRL)
+
+NephroQ is at **TRL 4** — components validated in a controlled setting: the
+integrated system runs, is calibrated on MIMIC-IV, passes a falsifiable in-silico
+trial replication, and is covered by 128 tests. It is **not** TRL 5: that requires
+validation on real data from the target population, which is exactly what the
+pending CRIC individual-level data (and, later, an IMSS-like cohort) would provide.
+Every calibration ships with a `research use — not prospectively validated` label.
 
 ---
 
