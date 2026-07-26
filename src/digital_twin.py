@@ -38,6 +38,7 @@ class Forecast:
     t_years: np.ndarray               # horizon grid, years from as_of
     egfr: np.ndarray                  # projected eGFR on that grid
     egfr0: float                      # baseline eGFR the projection started from
+    scale_sd: Optional[float] = None  # spread (sd) of the personalized susceptibility
 
 
 @dataclass
@@ -131,7 +132,8 @@ class RenalDigitalTwin:
         proj = core.predict_egfr_at_v2(egfr0, a1c, uacr, sbp, 0.0, params, tq,
                                        years=self.horizon_years)
         fc = Forecast(as_of=as_of, scale=scale, personalized=personalized,
-                      t_years=tq, egfr=proj, egfr0=egfr0)
+                      t_years=tq, egfr=proj, egfr0=egfr0,
+                      scale_sd=self._last_scale_sd)
         self.forecasts.append(fc)
         return fc
 
@@ -151,8 +153,10 @@ class RenalDigitalTwin:
             dt_years = (_as_date(v.date) - prev.as_of).days / 365.25
             if dt_years >= 0:
                 predicted = float(np.interp(dt_years, prev.t_years, prev.egfr))
-        # observed eGFR at this visit (from creatinine if needed)
-        observed = _visit_egfr(v, self.state.age, self.state.sex)
+        # observed eGFR at this visit (from creatinine if needed), aged to the
+        # visit's OWN date -- not self.state.age, which is still the age at the
+        # previous latest visit until add_visit() runs below.
+        observed = _visit_egfr(v, self.state.age_at(v.date), self.state.sex)
         if predicted is not None and observed is not None:
             error = observed - predicted
 
@@ -160,9 +164,15 @@ class RenalDigitalTwin:
         self.state.add_visit(v)
         new_fc = self.forecast(estimator=estimator)
 
+        # uncertainty_change is the change in the SPREAD of the susceptibility
+        # estimate (scale_sd), not in its central value -- a shrinking sd means
+        # the twin got more certain as evidence accrued. Using new.scale - prev.scale
+        # (the point estimate) here was the bug: it reported the mean shift under a
+        # field named for the dispersion, which misleads any clinical/audit consumer.
+        prev_sd = prev.scale_sd if prev is not None else None
         unc_change = None
-        if prev_scale is not None and new_fc.scale is not None:
-            unc_change = new_fc.scale - prev_scale
+        if prev_sd is not None and new_fc.scale_sd is not None:
+            unc_change = new_fc.scale_sd - prev_sd
 
         return UpdateResult(
             forecast=new_fc, previous_forecast=prev,
