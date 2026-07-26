@@ -171,3 +171,69 @@ def test_missing_demographics_are_flagged_as_imputed(tmp_path):
     assert states["A"].age_imputed is False and states["A"].sex_imputed is False
     assert states["B"].age_imputed is True and states["B"].sex_imputed is True
     assert states["B"].age == 60.0 and states["B"].sex == "M"
+
+
+# ==============================================================================
+# Loader edge cases (second review): age-by-date, absent sex column
+# ==============================================================================
+def test_descending_csv_keeps_age_from_the_latest_visit_not_the_last_row(tmp_path):
+    """P1: the loader must attach the age from the latest VISIT DATE, not the last
+    row in file order. A descending CSV used to store the oldest age."""
+    f = tmp_path / "desc.csv"
+    f.write_text("patient_id,date,creatinine,age,sex\n"
+                 "A,2024-01-01,1.5,70,M\n"
+                 "A,2020-01-01,1.1,66,M\n")
+    s = cd.load_long_csv(str(f))[0]
+    assert s.latest.date == date(2024, 1, 1)
+    assert s.age == pytest.approx(70.0)
+    assert s.age_imputed is False
+
+
+def test_age_recorded_at_an_earlier_visit_is_carried_forward(tmp_path):
+    """P1 corollary: if only an earlier visit has an age, it is advanced by
+    calendar time to the latest visit (arithmetic, not imputation)."""
+    f = tmp_path / "carry.csv"
+    f.write_text("patient_id,date,creatinine,age\n"
+                 "B,2020-01-01,1.0,60\n"
+                 "B,2025-01-01,1.4,\n")
+    s = cd.load_long_csv(str(f))[0]
+    assert s.age == pytest.approx(65.0, abs=0.02)
+    assert s.age_imputed is False
+
+
+def test_absent_sex_column_is_flagged_imputed(tmp_path):
+    """P2: a fully-missing sex column must default to 'M' AND be flagged imputed.
+    Seeding r.get('sex','M') made it look observed."""
+    f = tmp_path / "nosex.csv"
+    f.write_text("patient_id,date,creatinine,age\n"
+                 "C,2022-01-01,1.2,64\n")
+    s = cd.load_long_csv(str(f))[0]
+    assert s.sex == "M" and s.sex_imputed is True
+
+
+def test_blank_sex_cell_is_still_flagged_imputed(tmp_path):
+    """The column-present-but-empty case must keep working too."""
+    f = tmp_path / "blanksex.csv"
+    f.write_text("patient_id,date,creatinine,age,sex\n"
+                 "D,2022-01-01,1.2,64,\n")
+    s = cd.load_long_csv(str(f))[0]
+    assert s.sex == "M" and s.sex_imputed is True
+
+
+def test_valid_sex_is_not_flagged(tmp_path):
+    f = tmp_path / "sex.csv"
+    f.write_text("patient_id,date,creatinine,age,sex\n"
+                 "E,2022-01-01,1.2,64,F\n")
+    s = cd.load_long_csv(str(f))[0]
+    assert s.sex == "F" and s.sex_imputed is False
+
+
+def test_latest_valid_sex_wins_over_file_order(tmp_path):
+    """If sex differs across rows (typo/correction), the latest valid one by date
+    wins -- consistent with the age-by-date rule."""
+    f = tmp_path / "sexorder.csv"
+    f.write_text("patient_id,date,creatinine,sex\n"
+                 "G,2024-01-01,1.3,F\n"
+                 "G,2019-01-01,1.0,M\n")
+    s = cd.load_long_csv(str(f))[0]
+    assert s.sex == "F" and s.sex_imputed is False
