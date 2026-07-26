@@ -113,3 +113,61 @@ def test_future_adapters_fail_honestly():
         cd.load_fhir({})
     with pytest.raises(NotImplementedError):
         cd.load_omop({})
+
+
+# ==============================================================================
+# Review fixes (age invariant, demographic-imputation provenance)
+# ==============================================================================
+def test_age_advances_when_a_later_visit_becomes_the_latest():
+    """P2 regression: age is the age AT THE LATEST VISIT. Adding a strictly later
+    visit must advance it by the elapsed time; leaving it frozen biases every
+    subsequent CKD-EPI conversion (a younger age reads as a higher eGFR)."""
+    ps = PatientState(patient_id="P", age=60.0, sex="M",
+                      visits=[{"date": "2020-01-01", "creatinine": 1.2}])
+    ps.add_visit({"date": "2023-01-01", "creatinine": 1.4})
+    assert ps.age == pytest.approx(60.0 + (date(2023, 1, 1) - date(2020, 1, 1)).days / 365.25)
+
+
+def test_inserting_an_older_visit_does_not_change_age():
+    """A back-dated visit does not move the latest visit, so the age anchor is
+    unchanged."""
+    ps = PatientState(patient_id="P", age=60.0, sex="M",
+                      visits=[{"date": "2023-01-01", "creatinine": 1.4}])
+    ps.add_visit({"date": "2019-06-01", "creatinine": 1.0})
+    assert ps.age == pytest.approx(60.0)
+
+
+def test_age_at_is_consistent_with_the_latest_anchor():
+    ps = PatientState(patient_id="P", age=70.0, sex="F",
+                      visits=[{"date": "2018-01-01", "creatinine": 1.0},
+                              {"date": "2022-01-01", "creatinine": 1.3}])
+    # latest is 2022; age there is 70 + 4 years of advancement from the 2018 anchor?
+    # No: age was given as age at the latest visit at construction time (2022).
+    assert ps.age_at(date(2022, 1, 1)) == pytest.approx(70.0)
+    assert ps.age_at(date(2018, 1, 1)) == pytest.approx(70.0 - 4.0, abs=0.02)
+
+
+def test_reconstructed_egfr_is_stable_under_a_pure_time_shift():
+    """The deep consequence of P2: if a patient is simply observed again later with
+    the SAME creatinine, the reconstructed baseline eGFR must FALL (they are older),
+    not stay flat. With the frozen-age bug it stayed flat."""
+    from egfr_measurement import egfr_cr
+    ps = PatientState(patient_id="P", age=55.0, sex="M",
+                      visits=[{"date": "2020-01-01", "creatinine": 1.5}])
+    e_before = egfr_cr(1.5, ps.age, ps.sex)
+    ps.add_visit({"date": "2025-01-01", "creatinine": 1.5})
+    e_after = egfr_cr(1.5, ps.age, ps.sex)     # age has advanced 5 yr
+    assert e_after < e_before - 1.0
+
+
+def test_missing_demographics_are_flagged_as_imputed(tmp_path):
+    """P5 regression: a row with no age / no sex must default AND record that it
+    was imputed, because both feed CKD-EPI directly."""
+    f = tmp_path / "c.csv"
+    f.write_text("patient_id,date,creatinine,age,sex\n"
+                 "A,2022-01-01,1.1,64,F\n"
+                 "B,2022-01-01,1.2,,\n")
+    states = {s.patient_id: s for s in cd.load_long_csv(str(f))}
+    assert states["A"].age_imputed is False and states["A"].sex_imputed is False
+    assert states["B"].age_imputed is True and states["B"].sex_imputed is True
+    assert states["B"].age == 60.0 and states["B"].sex == "M"
