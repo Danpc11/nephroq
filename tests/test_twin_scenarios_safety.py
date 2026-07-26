@@ -140,3 +140,43 @@ def test_provenance_block_always_states_research_use():
     p = cs.provenance_block()
     assert "not prospectively validated" in p["status"]
     assert p["validated_domain"]
+
+
+# ---- Review fixes: uncertainty_change semantics + age propagation -----------
+def _multi_visit_state():
+    return PatientState(patient_id="U", age=62.0, sex="M", visits=[
+        {"date": "2019-01-01", "creatinine": 1.0, "hba1c": 8.2, "uacr": 300, "sbp": 145},
+        {"date": "2020-01-01", "creatinine": 1.12, "uacr": 280},
+        {"date": "2021-01-01", "creatinine": 1.25, "hba1c": 8.0, "sbp": 140},
+    ])
+
+
+def test_uncertainty_change_tracks_spread_not_the_point_estimate():
+    """P3 regression: uncertainty_change must be the change in the SPREAD of the
+    susceptibility estimate (scale_sd), never new.scale - prev.scale."""
+    twin = RenalDigitalTwin(_multi_visit_state())
+    twin.forecast()
+    res = twin.update(Visit(date="2022-01-01", creatinine=Measured(1.4), uacr=Measured(320)))
+
+    prev, new = res.previous_forecast, res.forecast
+    # both forecasts must carry a spread field now
+    assert hasattr(new, "scale_sd") and hasattr(prev, "scale_sd")
+    if res.uncertainty_change is not None:
+        assert prev.scale_sd is not None and new.scale_sd is not None
+        assert res.uncertainty_change == pytest.approx(new.scale_sd - prev.scale_sd)
+        # and it must NOT be the point-estimate difference (unless they coincide)
+        point_delta = (new.scale - prev.scale) if (new.scale is not None
+                                                   and prev.scale is not None) else None
+        if point_delta is not None and abs(point_delta - (new.scale_sd - prev.scale_sd)) > 1e-9:
+            assert res.uncertainty_change != pytest.approx(point_delta)
+
+
+def test_twin_update_advances_patient_age():
+    """P2 at the twin level: a new visit one year later must leave the state one
+    year older, so the next reconstruction uses the right age."""
+    ps = _multi_visit_state()
+    twin = RenalDigitalTwin(ps)
+    twin.forecast()
+    age_before = ps.age
+    twin.update(Visit(date="2022-01-01", creatinine=Measured(1.4)))
+    assert ps.age == pytest.approx(age_before + 1.0, abs=0.01)
