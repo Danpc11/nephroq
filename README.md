@@ -161,11 +161,13 @@ The estimator is trained **entirely on simulations from the mechanistic model**
 (*amortized / simulation-based inference*), so **no patient data is required to
 train it**.
 
-A pre-trained estimator ships with the repo (`calibration/personalizer.pkl`,
-0.6 MB) so the app starts instantly. It is **never required**, though: it is
-derived entirely from simulations of the mechanistic model, so if it is missing —
-or unloadable because your scikit-learn pickles differently — it is simply
-**retrained on demand** (~13 s) and cached. Nothing to break, nothing to fetch.
+The estimator is **not** committed to the repo. It is derived entirely from
+simulations of the mechanistic model, so on first use (or whenever it is missing,
+or unloadable because your scikit-learn pickles differently) it is **trained on
+demand** (~13 s) and cached to `calibration/personalizer.pkl` for instant starts
+thereafter. So the first request pays a one-time ~13 s cost; every later one is
+instant. Nothing to fetch, nothing to break — and no stale binary pickle to keep
+in sync with your scikit-learn version.
 
 ```bash
 cd src
