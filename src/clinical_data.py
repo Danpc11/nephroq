@@ -125,14 +125,24 @@ def load_long_csv(path, source="csv", delimiter=None) -> list:
             adherence=_opt_float(r.get("adherence")),
             **{f: _validate(f, r.get(f), source) for f in LAB_FIELDS},
         )
-        rec = by_patient.setdefault(pid, dict(age=_opt_float(r.get("age")),
-                                              sex=r.get("sex", "M"), visits=[]))
+        rec = by_patient.setdefault(pid, dict(visits=[], age_val=None, age_date=None,
+                                              sex_val=None, sex_date=None))
         rec["visits"].append(visit)
-        # keep the most recent age/sex seen
-        if r.get("age"):
-            rec["age"] = _opt_float(r.get("age"))
-        if r.get("sex"):
-            rec["sex"] = str(r.get("sex")).strip().upper()[:1] or "M"
+        # Track the demographics from the LATEST VISIT DATE that supplies them, not
+        # the last row in file order. A descending CSV (newest row first) otherwise
+        # left the OLDEST age attached to the patient, breaking the "age at the most
+        # recent visit" contract and every CKD-EPI conversion downstream.
+        age_here = _opt_float(r.get("age"))
+        if age_here is not None and (rec["age_date"] is None or visit.date >= rec["age_date"]):
+            rec["age_val"], rec["age_date"] = age_here, visit.date
+        # sex is only recorded when a VALID value is present. A missing column
+        # (r.get("sex") is None) or a blank/garbage cell must NOT be silently read
+        # as 'M' -- seeding the default here was why a fully-absent sex column came
+        # back sex='M' with sex_imputed=False.
+        sex_raw = r.get("sex")
+        sex_here = str(sex_raw).strip().upper()[:1] if sex_raw not in (None, "") else None
+        if sex_here in ("M", "F") and (rec["sex_date"] is None or visit.date >= rec["sex_date"]):
+            rec["sex_val"], rec["sex_date"] = sex_here, visit.date
 
     states = []
     for pid, rec in by_patient.items():
@@ -140,10 +150,19 @@ def load_long_csv(path, source="csv", delimiter=None) -> list:
         # allowed (CKD-EPI needs both), but it must be RECORDED, not silent: age
         # and sex drive the eGFR conversion, so a guessed value that looks like a
         # measurement would corrupt the audit trail the design promises.
-        age_imputed = rec["age"] is None
-        age = 60.0 if age_imputed else rec["age"]
-        sex_imputed = rec["sex"] not in ("M", "F")
-        sex = "M" if sex_imputed else rec["sex"]
+        latest_date = max(v.date for v in rec["visits"])
+        age_imputed = rec["age_val"] is None
+        if age_imputed:
+            age = 60.0
+        else:
+            # Carry the measured age forward to the latest visit by calendar time
+            # (the same deterministic arithmetic add_visit uses) so the stored age
+            # honours "age at the most recent visit" even when it was recorded at
+            # an earlier visit -- this is arithmetic, not a population guess, so it
+            # is not flagged as imputed.
+            age = rec["age_val"] + (latest_date - rec["age_date"]).days / 365.25
+        sex_imputed = rec["sex_val"] is None
+        sex = "M" if sex_imputed else rec["sex_val"]
         states.append(PatientState(patient_id=pid, age=age, sex=sex,
                                    visits=rec["visits"],
                                    age_imputed=age_imputed, sex_imputed=sex_imputed))
