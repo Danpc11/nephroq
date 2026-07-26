@@ -13,4 +13,9 @@ COPY . .
 RUN python -m pytest tests/ -v
 
 WORKDIR /app/src
-CMD ["python", "system_twin.py", "--skip-slow", "--skip-bayes"]
+# Default run: the in-silico trial replication -- a fast, deterministic, self-
+# contained validation that reproduces the three published placebo arms and
+# writes results/insilico_trial_report.md. (The previous entrypoint,
+# system_twin.py, was removed when the pipeline was restructured; its orchestrated
+# stage scripts no longer exist, so pointing here keeps `docker run` working.)
+CMD ["python", "insilico_trial.py"]
