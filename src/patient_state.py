@@ -97,6 +97,12 @@ class PatientState:
     visits: list = field(default_factory=list)
     comorbidities: tuple = ()
     events: list = field(default_factory=list)  # e.g. AKI episodes, hospitalizations
+    # Provenance for the demographics. age and sex both feed CKD-EPI directly, so
+    # whether either was measured or filled with a population default has to travel
+    # with the record -- a clinical tool cannot silently pretend a guessed age is
+    # data. Set by the loader when it substitutes a default (see clinical_data.py).
+    age_imputed: bool = False
+    sex_imputed: bool = False
 
     def __post_init__(self):
         if self.sex not in ("M", "F"):
@@ -106,10 +112,32 @@ class PatientState:
     # -- building the record ---------------------------------------------------
     def add_visit(self, visit) -> "PatientState":
         """Add a visit and keep the list ordered. Returns self so calls can chain.
-        This is the entry point a twin's `update(new_visit)` will call."""
+        This is the entry point a twin's `update(new_visit)` will call.
+
+        `age` is defined as the age at the LATEST visit, and the whole eGFR
+        reconstruction (age_at / creatinine_history) relies on that invariant. A
+        new visit that becomes the latest therefore ADVANCES the age by the gap
+        since the previous latest -- otherwise `age` silently stays frozen at the
+        old latest date and every subsequent CKD-EPI conversion uses an age that
+        is too young, biasing eGFR upward by a growing amount on each update.
+        A visit inserted before the current latest does not change `age` (the
+        latest visit, and hence the age-anchor date, is unchanged)."""
+        prev_latest = self.latest.date if self.visits else None
         self.visits.append(_as_visit(visit))
         self.visits.sort(key=lambda v: v.date)
+        if prev_latest is not None:
+            new_latest = self.latest.date
+            if new_latest > prev_latest:
+                self.age += (new_latest - prev_latest).days / 365.25
         return self
+
+    def age_at(self, d) -> float:
+        """The patient's age at date `d`, derived from the age-at-latest-visit
+        anchor. This is the single correct way to age-adjust a CKD-EPI conversion
+        for a measurement (or a scoring visit) that is not the latest one."""
+        if not self.visits:
+            return self.age
+        return self.age + (_as_date(d) - self.latest.date).days / 365.25
 
     @property
     def latest(self) -> Optional[Visit]:
