@@ -136,10 +136,17 @@ def load_long_csv(path, source="csv", delimiter=None) -> list:
 
     states = []
     for pid, rec in by_patient.items():
-        age = rec["age"] if rec["age"] is not None else 60.0
-        sex = rec["sex"] if rec["sex"] in ("M", "F") else "M"
+        # Substituting a population default for a missing/invalid demographic is
+        # allowed (CKD-EPI needs both), but it must be RECORDED, not silent: age
+        # and sex drive the eGFR conversion, so a guessed value that looks like a
+        # measurement would corrupt the audit trail the design promises.
+        age_imputed = rec["age"] is None
+        age = 60.0 if age_imputed else rec["age"]
+        sex_imputed = rec["sex"] not in ("M", "F")
+        sex = "M" if sex_imputed else rec["sex"]
         states.append(PatientState(patient_id=pid, age=age, sex=sex,
-                                   visits=rec["visits"]))
+                                   visits=rec["visits"],
+                                   age_imputed=age_imputed, sex_imputed=sex_imputed))
     return states
 
 
