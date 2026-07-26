@@ -2,6 +2,31 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 19 — two loader edge cases the Round 18 provenance fix missed
+
+A follow-up review found the CSV loader still violated the "age at the most recent visit"
+contract and could mislabel an imputed sex. Both lived in the per-row demographic accumulation,
+which decided by FILE ORDER rather than by visit date. Both reproduced directly; both now have
+regression tests.
+
+### P1 — age could bind to the wrong visit in an unordered CSV
+The loader kept the last age seen in file order and only afterwards sorted visits by date. A
+descending CSV (newest row first) therefore stored the OLDEST age: a patient whose latest visit
+(2024) recorded age 70 came back with 66. That silently re-broke the age contract and shifted
+every CKD-EPI conversion. The loader now tracks the age from the latest visit DATE that supplies
+one, and carries it forward to the latest visit by calendar time when it was recorded earlier
+(the same arithmetic add_visit uses -- not a population guess, so not flagged imputed).
+
+### P2 — a fully-absent sex column was not flagged imputed
+`sex=r.get("sex", "M")` seeded the default 'M' at accumulation time, so when the column was
+missing entirely, `sex_imputed` came back False -- a guessed sex presented as observed. (The
+column-present-but-blank case worked, because a blank cell is "" rather than a missing key.) Sex
+is now recorded only from a VALID 'M'/'F' cell; a missing column, blank cell, or garbage value
+leaves it unset and it is defaulted to 'M' with `sex_imputed=True`. The latest valid sex by date
+wins, consistent with the age rule.
+
+Suite: 145 tests green (139 + 6 new). Fix is confined to `src/clinical_data.py`.
+
 ## Round 18 — deployment-review fixes (Docker, twin state, provenance, packaging, CI)
 
 An external review of the deployment layer found six issues plus a flaky test and no CI. Each
