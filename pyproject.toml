@@ -35,6 +35,18 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q"
 
+# src/ is a flat collection of research modules rather than a package tree, so
+# they are installed as top-level modules from src/ (package-dir maps the empty
+# package to src/). With py-modules = [] a `pip install .` installed only
+# metadata + dependencies and NONE of the code. The list is kept in sync with
+# src/*.py by test_pyproject_lists_all_src_modules, so it cannot silently drift.
 [tool.setuptools]
-# src/ is a flat collection of research modules, not an installable package tree.
-py-modules = []
+package-dir = { "" = "src" }
+py-modules = [
+    "acute_events", "audit_calibration", "calibrate_mimic", "clinical_data",
+    "clinical_outputs", "clinical_safety", "digital_twin", "egfr_measurement",
+    "external_validation", "i18n", "insilico_trial", "measurement_strategy",
+    "mimic_loader", "model_core", "mvp_calibration", "patient_state",
+    "personalize", "plot_cric_validation", "plot_key_results", "treatment_engine",
+    "uncertainty",
+]
