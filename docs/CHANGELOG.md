@@ -2,6 +2,69 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 18 — deployment-review fixes (Docker, twin state, provenance, packaging, CI)
+
+An external review of the deployment layer found six issues plus a flaky test and no CI. Each
+was verified against the code before fixing, and each fix carries a regression test.
+
+### P1 — the Docker image could not start
+`docker/Dockerfile` set `CMD ["python", "system_twin.py", ...]`, but `system_twin.py` was
+removed when the pipeline was restructured (commit "Delete src/system_twin.py"), and its
+orchestrated stage scripts no longer exist either -- so no current script accepts the old
+`--skip-slow/--skip-bayes` flags. The build could finish; the container failed immediately on
+`docker run`. CMD now runs `insilico_trial.py`, a fast, deterministic, self-contained
+validation that reproduces the three published placebo arms and writes a report. Verified it
+exits 0.
+
+### P2 — patient age was frozen across twin updates
+`PatientState.age` is defined as the age at the latest visit, but `add_visit()` appended
+without advancing it, and `RenalDigitalTwin.update()` / `_model_inputs()` then reconstructed the
+whole eGFR history through CKD-EPI with that stale age. Because CKD-EPI eGFR falls with age, a
+too-young age inflates eGFR -- a bias that grew with every longitudinal update. `add_visit`
+now advances `age` by the gap whenever a strictly later visit becomes the latest (and leaves it
+unchanged for a back-dated insert); a new `age_at(date)` helper gives the correct age for any
+visit, and `update()` scores the incoming visit at its own age. Regression tests assert the age
+advances, that a back-dated visit does not move it, and that the same creatinine observed five
+years later reconstructs to a LOWER eGFR (it stayed flat under the bug).
+
+### P3 — `uncertainty_change` reported the wrong quantity
+The field is documented as the change in the spread of the susceptibility estimate, but it
+stored `new.scale - previous.scale` -- the shift in the POINT estimate, which could mislead a
+clinical or audit consumer. `Forecast` now carries `scale_sd` (the personalizer already
+computed it; it was just never stored), and `uncertainty_change` is `new.scale_sd -
+prev.scale_sd`. Regression test pins the spread semantics and guards against the point-estimate
+difference.
+
+### P4 — README claimed a shipped artifact that is not in git
+The README described `calibration/personalizer.pkl` as a pre-trained model that "ships with the
+repo", but only `calibration/README.md` is committed. The auto-retrain path prevents a crash
+but pays a one-time ~13 s training cost on first use and contradicts the "starts instantly"
+promise. The README now states the estimator is trained on demand on first use and cached, with
+the one-time cost stated -- matching what the code actually does.
+
+### P5 — missing demographics were imputed silently
+The CSV loader turned a missing age into 60 and a missing/invalid sex into 'M' with no record
+that either was a guess -- and both feed CKD-EPI directly, so this corrupted the audit trail the
+design promises. `PatientState` now carries `age_imputed` / `sex_imputed` flags, set by the
+loader whenever it substitutes a default. Regression test checks both the value and the flag.
+
+### P6 — the declared package installed no code
+`pyproject.toml` had `py-modules = []`, so `pip install .` installed metadata and dependencies
+but none of the modules in `src/`. Fixed with `package-dir = {"" = "src"}` and an explicit
+`py-modules` list; a test (`test_packaging.py`) asserts that list stays exactly in sync with
+`src/*.py` so it cannot silently drift. Verified in a clean venv that the modules import after
+`pip install .`.
+
+### Flaky k-fold assertion + no CI
+The "false green" k-fold test asserted the pinned-`q` CV was `< 0.05`; that exact value depends
+on BLAS/optimizer tie-breaking and was reported at ~0.065 on Python 3.10/3.12. The bound is now
+`< 0.12` (still small enough to demonstrate the deceptively-tidy spread), while the load-bearing
+assertions -- `q` in `at_bound` and in `unstable` -- are unchanged. A GitHub Actions workflow
+(`.github/workflows/ci.yml`) now runs the suite on Python 3.10 and 3.12, so these regressions are
+caught automatically.
+
+Suite: 139 tests green (130 + 9 new). No new ML dependency introduced.
+
 ## Round 17 — the collapse exponent is a property of progressing CKD, not of the whole cohort
 
 ### Context
