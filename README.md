@@ -30,6 +30,7 @@ more honest — claim than "we estimate each patient's `q`".
 
 ## Table of contents
 
+- [**Workflow**](#Workflow)
 - [Quick start (2 minutes)](#quick-start-2-minutes)
 - [How the model works](#how-the-model-works)
 - [**Per-patient personalization (AI)**](#per-patient-personalization-ai)
@@ -41,6 +42,10 @@ more honest — claim than "we estimate each patient's `q`".
 - [Repository structure](#repository-structure)
 - [Limitations](#limitations)
 
+---
+## Workflow
+
+![lung-nematic repository workflow](assets/nefroq_workflow.png)
 ---
 
 ## Quick start (2 minutes)
