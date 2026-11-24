@@ -20,6 +20,10 @@ the MIMIC-IV cohort built by mimic_loader.py:
         MLP ensemble    the app's current personalizer
         NPE             amortized neural posterior; posterior predictive
                         (+ measurement noise, since the targets are observations)
+        NPE + EB prior  the same NPE draws, importance-reweighted to a population
+                        prior over (q, log injury rate) learned from the TRAINING
+                        patients by empirical Bayes (population_prior.py); the
+                        network is not retrained
         OLS slope       per-patient straight line through the early window
         LMM-EB slope    empirical-Bayes shrinkage of the per-patient slope toward
                         the population slope (a random-slope mixed model fitted
@@ -58,6 +62,7 @@ from scipy import stats
 import fast_sim
 import personalize as pz
 import npe_posterior as npe
+import population_prior as popprior
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS = os.path.join(HERE, "..", "results")
@@ -67,9 +72,11 @@ WINDOW_DAYS = 90
 HORIZONS = {"1y": (0.5, 2.0, 1.0), "3y": (2.0, 4.0, 3.0), "5y": (4.0, 6.5, 5.0)}
 LEVELS = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95])
 COV_RANGES = dict(a1c=(5.5, 12.0), uacr0=(5.0, 3000.0), sbp=(105.0, 185.0))
-METHODS = ["population", "ls_rate", "mlp", "npe", "ols", "lmm_eb", "gbm"]
+METHODS = ["population", "ls_rate", "mlp", "npe", "npe_eb", "ols", "lmm_eb", "gbm"]
+REFERENCE = "npe_eb"          # bootstrap differences are reported against this
 LABELS = {"population": "Population parameters", "ls_rate": "Least squares, rate only",
-          "mlp": "MLP ensemble (current app)", "npe": "NPE (posterior predictive)",
+          "mlp": "MLP ensemble (current app)", "npe": "NPE, uniform prior",
+          "npe_eb": "NPE + population prior (empirical Bayes)",
           "ols": "Per-patient OLS slope", "lmm_eb": "Mixed-model slope (empirical Bayes)",
           "gbm": "Gradient boosting (trained on MIMIC)"}
 
@@ -204,7 +211,34 @@ def fit_gbm(train, seed=0):
 # ==============================================================================
 # Predictions for one patient
 # ==============================================================================
-def predict_patient(p, net, mlp, lmm, gbm, noise_sd, n_draws=400, seed=0):
+def fit_population_prior(train, net, n_draws=300, seed=0, verbose=True):
+    """Empirical-Bayes prior from the training patients' NPE draws. K (1 or 2
+    components) is chosen by the held-out marginal likelihood on 20 % of the
+    training patients, then refitted on all of them."""
+    draws = [npe.posterior_samples(net, p["t"], p["e"], p["a1c"], p["uacr0"], p["sbp"],
+                                   n=n_draws, seed=10_000 + i) for i, p in enumerate(train)]
+    rng = np.random.default_rng(seed)
+    hold = rng.uniform(size=len(draws)) < 0.2
+    fit_d = [d for d, h in zip(draws, hold) if not h]
+    val_d = [d for d, h in zip(draws, hold) if h]
+    best_k, best_ll, val_ll = 1, -np.inf, {}
+    lu = popprior._uniform_logpdf()
+    from scipy import special as _sp
+    for K in (1, 2):
+        pr = popprior.fit(fit_d, K=K, seed=seed)
+        lr = np.stack([pr.logpdf(d[:, 0], d[:, 1]) - lu for d in val_d])
+        ll = float(np.mean(_sp.logsumexp(lr, axis=1) - np.log(lr.shape[1])))
+        val_ll[K] = ll
+        if ll > best_ll:
+            best_k, best_ll = K, ll
+    prior = popprior.fit(draws, K=best_k, seed=seed)
+    prior.extra.update(K=best_k, heldout_loglik_per_patient=val_ll)
+    if verbose:
+        print(f"Population prior: K={best_k} (held-out log-lik/patient {val_ll})")
+    return prior
+
+
+def predict_patient(p, net, mlp, lmm, gbm, noise_sd, prior=None, n_draws=1000, seed=0):
     """Returns {method: dict(mu=array, sd=array|None, draws=array|None)} over the
     patient's scored future times (sorted by horizon key)."""
     keys = sorted(p["future"])
@@ -233,6 +267,12 @@ def predict_patient(p, net, mlp, lmm, gbm, noise_sd, n_draws=400, seed=0):
     rng = np.random.default_rng(seed)
     obs = lat + rng.normal(0.0, noise_sd, lat.shape)
     out["npe"] = dict(mu=lat.mean(0), sd=None, draws=obs)
+    if prior is not None:
+        w, ess = popprior.reweight(post, prior)
+        idx = rng.choice(len(post), size=len(post), p=w)
+        lat_eb = lat[idx]
+        out["npe_eb"] = dict(mu=lat_eb.mean(0), sd=None,
+                             draws=lat_eb + rng.normal(0.0, noise_sd, lat_eb.shape), ess=ess)
 
     a, b, s2, tb, sxx, n = _ols(t, e)
     var_ols = s2 * (1 + 1 / n + (tf - tb) ** 2 / sxx)
@@ -266,18 +306,20 @@ def _crps_draws(x, y):
     return np.mean(np.abs(x - y)) - np.sum(x * (2 * np.arange(1, n + 1) - n - 1)) / (n * n)
 
 
-def score_rows(test, net, mlp, lmm, gbm, noise_sd, verbose=True):
+def score_rows(test, net, mlp, lmm, gbm, noise_sd, prior=None, verbose=True):
     """One row per (patient, horizon, method)."""
     rows = []
+    methods = [m for m in METHODS if m != "npe_eb" or prior is not None]
     for i, p in enumerate(test):
-        keys, tf, pred = predict_patient(p, net, mlp, lmm, gbm, noise_sd, seed=i)
+        keys, tf, pred = predict_patient(p, net, mlp, lmm, gbm, noise_sd, prior=prior, seed=i)
         e_end = p["e"][-1]
         for j, h in enumerate(keys):
             y = p["future"][h][1]
-            for m in METHODS:
+            for m in methods:
                 d = pred[m]
                 r = dict(pid=p["pid"], horizon=h, method=m, y=y, mu=float(d["mu"][j]),
-                         at_risk=bool(e_end >= 30.0), event=bool(y < 30.0))
+                         at_risk=bool(e_end >= 30.0), event=bool(y < 30.0),
+                         ess=d.get("ess", np.nan))
                 if d["draws"] is not None:
                     x = d["draws"][:, j]
                     r["crps"] = _crps_draws(x, y)
@@ -313,14 +355,16 @@ def summarize(df, n_boot=1000, seed=0):
         res["crps"] = float(d.crps.mean()) if "crps" in d and d.crps.notna().all() else np.nan
         return res
 
+    methods = [m for m in METHODS if m in set(df.method)]
+    ref = REFERENCE if REFERENCE in methods else "npe"
     tables = {}
     for h in list(HORIZONS) + ["all"]:
         sub = df if h == "all" else df[df.horizon == h]
-        tables[h] = {m: block(sub[sub.method == m]) for m in METHODS}
+        tables[h] = {m: block(sub[sub.method == m]) for m in methods}
 
     ev = {}
     risk = df[df.at_risk]
-    for m in METHODS:
+    for m in methods:
         d = risk[risk.method == m]
         if "p_event" in d and d.p_event.notna().all() and len(d):
             ev[m] = dict(n=len(d), events=int(d.event.sum()),
@@ -333,20 +377,21 @@ def summarize(df, n_boot=1000, seed=0):
     pids = np.sort(df.pid.unique())
     idx = {pid: k for k, pid in enumerate(pids)}
     sse, cnt = {}, None
-    for m in METHODS:
+    for m in methods:
         d = df[df.method == m]
         k = d.pid.map(idx).to_numpy()
         sse[m] = np.bincount(k, weights=(d.mu - d.y).to_numpy() ** 2, minlength=len(pids))
         if cnt is None:
             cnt = np.bincount(k, minlength=len(pids)).astype(float)
-    boot = {m: [] for m in METHODS if m != "npe"}
+    boot = {m: [] for m in methods if m != ref}
     for _ in range(n_boot):
         w = np.bincount(rng.integers(0, len(pids), len(pids)), minlength=len(pids))
         n_tot = np.sum(w * cnt)
-        r_npe = np.sqrt(np.sum(w * sse["npe"]) / n_tot)
+        r_npe = np.sqrt(np.sum(w * sse[ref]) / n_tot)
         for m in boot:
             boot[m].append(np.sqrt(np.sum(w * sse[m]) / n_tot) - r_npe)
     ci = {m: (float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5))) for m, v in boot.items()}
+    ci["_reference"] = ref
     return tables, ev, ci
 
 
@@ -360,28 +405,41 @@ def report(tables, ev, ci, meta):
              f"by the mechanistic methods: {meta['noise_sd']:g} mL/min/1.73 m².\n")
     for h in list(HORIZONS) + ["all"]:
         title = "All horizons pooled" if h == "all" else f"Horizon {h} after the last observed visit"
-        n = tables[h]["npe"]["n"]
+        n = next(iter(tables[h].values()))["n"]
         L.append(f"## {title} (n = {n} patient-visits)\n")
         L.append("| Method | RMSE | MAE | Bias | 90 % coverage | CRPS |")
         L.append("|---|---|---|---|---|---|")
-        for m in METHODS:
-            r = tables[h][m]
+        for m, r in tables[h].items():
             cov = "—" if np.isnan(r["cov90"]) else f"{100 * r['cov90']:.0f} %"
             crps = "—" if np.isnan(r["crps"]) else f"{r['crps']:.2f}"
-            name = f"**{LABELS[m]}**" if m == "npe" else LABELS[m]
+            name = f"**{LABELS[m]}**" if m == ci.get("_reference") else LABELS[m]
             L.append(f"| {name} | {r['rmse']:.2f} | {r['mae']:.2f} | {r['bias']:+.2f} | {cov} | {crps} |")
         L.append("")
-    L.append("## RMSE difference versus NPE (patient bootstrap, 95 % CI)\n")
-    L.append("Positive = the method is worse than NPE.\n")
+    ref = LABELS[ci["_reference"]]
+    L.append(f"## RMSE difference versus {ref} (patient bootstrap, 95 % CI)\n")
+    L.append("Positive = the method is worse than the reference.\n")
     L.append("| Method | ΔRMSE 95 % CI |")
     L.append("|---|---|")
-    for m, (lo, hi) in ci.items():
-        L.append(f"| {LABELS[m]} | {lo:+.2f} to {hi:+.2f} |")
+    for m, v in ci.items():
+        if m.startswith("_"):
+            continue
+        L.append(f"| {LABELS[m]} | {v[0]:+.2f} to {v[1]:+.2f} |")
     L.append("\n## Event: eGFR < 30 at a held-out visit (patients ≥ 30 at the end of the window)\n")
     L.append("| Method | Visits | Events | AUC | Brier |")
     L.append("|---|---|---|---|---|")
     for m, r in ev.items():
         L.append(f"| {LABELS[m]} | {r['n']} | {r['events']} | {r['auc']:.3f} | {r['brier']:.3f} |")
+    pr = meta.get("prior")
+    if pr is not None:
+        L.append("\n## Population prior learned from the training patients (empirical Bayes)\n")
+        L.append(f"K = {pr['K']} component(s), chosen by held-out marginal likelihood "
+                 f"({pr['heldout']}); mean importance-sampling efficiency on the test "
+                 f"patients {100 * meta['ess']:.0f} %.\n")
+        L.append("| Component | Weight | Mean q | SD q | Median injury rate | SD log rate |")
+        L.append("|---|---|---|---|---|---|")
+        for k, c in enumerate(pr["components"]):
+            L.append(f"| {k + 1} | {c['weight']:.2f} | {c['q_mean']:.2f} | {c['q_sd']:.2f} | "
+                     f"{c['rate_median']:.2f}× | {c['log_rate_sd']:.2f} |")
     return "\n".join(L) + "\n"
 
 
@@ -391,20 +449,22 @@ def plot(df, tables, path):
     import matplotlib.pyplot as plt
     plt.rcParams.update({"font.size": 7, "axes.spines.top": False, "axes.spines.right": False,
                          "savefig.dpi": 300})
+    methods = [m for m in METHODS if m in set(df.method)]
     col = {"population": "#999999", "ls_rate": "#56B4E9", "mlp": "#D55E00", "npe": "#0072B2",
+           "npe_eb": "#000000",
            "ols": "#E69F00", "lmm_eb": "#CC79A7", "gbm": "#009E73"}
     fig, ax = plt.subplots(1, 2, figsize=(7.2, 2.4))
     hs = list(HORIZONS)
-    w = 0.8 / len(METHODS)
-    for k, m in enumerate(METHODS):
-        ax[0].bar(np.arange(len(hs)) + (k - len(METHODS) / 2 + 0.5) * w,
+    w = 0.8 / len(methods)
+    for k, m in enumerate(methods):
+        ax[0].bar(np.arange(len(hs)) + (k - len(methods) / 2 + 0.5) * w,
                   [tables[h][m]["rmse"] for h in hs], w, color=col[m], label=LABELS[m])
     ax[0].set_xticks(range(len(hs)), hs)
     ax[0].set_xlabel("horizon after the last observed visit")
     ax[0].set_ylabel("RMSE (mL/min/1.73 m²)")
     ax[0].set_title("a  forecast error on held-out visits", loc="left", fontsize=7)
     ax[0].legend(frameon=False, fontsize=5)
-    for m in METHODS:
+    for m in methods:
         d = df[df.method == m]
         if "hit_0.9" in d and d["hit_0.9"].notna().all():
             ax[1].plot(LEVELS, [d[f"hit_{lv:g}"].mean() for lv in LEVELS], "o-", ms=2.5, lw=1,
@@ -419,7 +479,7 @@ def plot(df, tables, path):
 
 
 def run(cohort, patients_csv=None, noise_sd=8.7, net=None, mlp=None, seed=0,
-        n_boot=1000, verbose=True):
+        n_boot=1000, verbose=True, eb_prior=True):
     patients, excl = build_patients(cohort)
     if len(patients) < 20:
         raise ValueError(f"only {len(patients)} eligible patients; check the cohort")
@@ -435,11 +495,17 @@ def run(cohort, patients_csv=None, noise_sd=8.7, net=None, mlp=None, seed=0,
         mlp = pz.get_estimator()
     lmm = fit_lmm_eb(train)
     gbm = fit_gbm(train, seed=seed)
-    df = score_rows(test, net, mlp, lmm, gbm, noise_sd, verbose=verbose)
+    prior = fit_population_prior(train, net, seed=seed, verbose=verbose) if eb_prior else None
+    df = score_rows(test, net, mlp, lmm, gbm, noise_sd, prior=prior, verbose=verbose)
     tables, ev, ci = summarize(df, n_boot=n_boot, seed=seed)
     meta = dict(n_cohort=int(cohort.patient_id.nunique()), n_eligible=len(patients),
                 excl=excl, split=split, n_train=len(train), n_test=len(test),
                 noise_sd=noise_sd)
+    if prior is not None:
+        meta["prior"] = dict(K=prior.extra["K"], components=prior.summary(),
+                             heldout={k: round(v, 3) for k, v in
+                                      prior.extra["heldout_loglik_per_patient"].items()})
+        meta["ess"] = float(df.loc[df.method == "npe_eb", "ess"].mean())
     return df, tables, ev, ci, meta
 
 

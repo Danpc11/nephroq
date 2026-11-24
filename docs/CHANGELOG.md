@@ -2,6 +2,42 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 23 — a population prior learned from the data removes the decline bias seen on MIMIC-IV (v0.15.0)
+
+### What the first real-data run showed
+`validate_mimic_patients.py` on MIMIC-IV 3.1 (25 062 patients from the loader; 9 530 eligible;
+temporal split, test = anchor_year_group 2017-2019 and 2020-2022: 8 672 train / 858 test; NPE
+trained for noise SD 8.7). Pooled over 1 261 held-out patient-visits, RMSE: population 18.21,
+least squares (rate) 16.25, MLP ensemble 16.42, **NPE 15.54**, per-patient OLS 28.09,
+empirical-Bayes random slope 20.57, gradient boosting trained on MIMIC 14.39. Patient-bootstrap
+ΔRMSE vs NPE: population +1.58 to +3.84, MLP +0.18 to +1.64, OLS +10.09 to +15.07, random slope
++3.95 to +6.11, least squares −0.04 to +1.48 (tie), gradient boosting −1.86 to −0.49 (better).
+NPE 90 % coverage 84 % (GBM 85 %, MLP 71 %). eGFR < 30 at a held-out visit (57 events / 1 157):
+AUC NPE 0.877, MLP 0.887, GBM 0.889; Brier 0.050, 0.040, 0.038.
+
+The NPE error was dominated by a **bias toward too-fast decline that grew with the horizon**
+(−2.5, −5.5, −8.3 mL/min/1.73 m² at ~1, ~3, ~5 y). That is the signature of the uniform prior on
+`q` (mean 2.15): `q` is barely identified per patient, so its posterior inherits the prior,
+while Round 17 measured q ≈ 0.9 for the MIMIC cohort as a whole.
+
+### New — `population_prior.py` (empirical Bayes over the amortized posterior)
+Learns the population distribution of (q, log injury rate) from the TRAINING patients' NPE
+draws, as a mixture of K components (Beta for q on its box × truncated normal for the log rate),
+by EM with exact weighted-MLE M-steps (components constrained unimodal and not sharper than
+q SD ≈ 0.12). New patients get the posterior under that prior by importance reweighting the same
+draws — the network is not retrained. K ∈ {1, 2} is chosen by held-out marginal likelihood on
+20 % of the training patients. Recovers a known two-regime population (weights 0.67/0.33 vs
+0.70/0.30; mean q 1.06/3.07 vs 1.19/2.96). On a synthetic low-q cohort it moves the pooled bias
+from −1.11 to +0.80 and brings 90 % coverage from 95 % to 90 % (CRPS 5.14 → 5.05).
+
+### Validation now reports "NPE + population prior" and uses it as the reference
+`validate_mimic_patients.py` fits the prior on the training split (300 draws per patient),
+scores the reweighted posterior predictive as an eighth method, reports the fitted components
+and the mean importance-sampling efficiency, and computes the bootstrap ΔRMSE of every method
+against it.
+
+Suite: 160 tests (159 + 1 new).
+
 ## Round 22 — patient-level validation on real trajectories, ready to run on MIMIC-IV (v0.14.0)
 
 ### New — `validate_mimic_patients.py`

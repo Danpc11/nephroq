@@ -65,3 +65,23 @@ def test_no_held_out_visit_leaks_into_the_observed_window():
         assert p["t"][0] == 0.0 and p["t"][-1] <= vm.EARLY_YEARS
         for t_f, _ in p["future"].values():
             assert t_f - p["t"][-1] > vm.HORIZONS["1y"][0]
+
+
+def test_population_prior_recovers_two_regimes_from_posterior_draws():
+    """Empirical Bayes over NPE-style draws must recover a known two-regime
+    population (the structure Round 17 found in MIMIC-IV)."""
+    import population_prior as pp
+    rng = np.random.default_rng(0)
+    N, J = 1200, 300
+    reg = rng.uniform(size=N) < 0.7
+    qt = np.where(reg, 0.8 + 2.7 * rng.beta(2, 12, N), 0.8 + 2.7 * rng.beta(12, 3, N))
+    st = np.clip(rng.normal(np.where(reg, -0.3, 0.4), 0.35), np.log(0.25) + 0.01, np.log(3) - 0.01)
+    z = npe.to_unbounded(np.column_stack([qt, st, np.full(N, 60.0)]))
+    zh = z + rng.normal(0, [0.8, 0.5, 0.0], (N, 3))
+    draws = [npe.from_unbounded(zz + rng.normal(0, [0.8, 0.5, 0.0], (J, 3))) for zz in zh]
+    pr = pp.fit(draws, K=2)
+    lo, hi = pr.summary()
+    assert lo["weight"] == pytest.approx(0.7, abs=0.08)
+    assert lo["q_mean"] < 1.5 < 2.6 < hi["q_mean"]
+    w, ess = pp.reweight(draws[0], pr)
+    assert w.sum() == pytest.approx(1.0) and 0.0 < ess <= 1.0

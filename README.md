@@ -265,11 +265,14 @@ value per 90 days, every method personalizes on the **first 2 years** after the
 confirmed index and nothing later, and held-out visits are scored at ~1, ~3 and
 ~5 years after the last observed visit (one visit per patient per horizon). The
 split is **temporal** (the most recent `anchor_year_group` is the test set) when
-`patients.csv.gz` is given. Seven methods are compared on the same visits: the
+`patients.csv.gz` is given. Eight methods are compared on the same visits: the
 population model, one-parameter least squares, the MLP ensemble, the NPE
-posterior predictive, a per-patient OLS slope, an empirical-Bayes random-slope
-model and gradient boosting — the last two trained on the training patients;
-the mechanistic methods are not fitted on MIMIC at all. Scores: RMSE, MAE, bias,
+posterior predictive, the same NPE under a **population prior learned from the
+training patients** (`population_prior.py`: empirical Bayes over the NPE draws,
+applied by importance reweighting, no retraining), a per-patient OLS slope, an
+empirical-Bayes random-slope model and gradient boosting — the last two trained
+on the training patients. The mechanistic network itself is never fitted on
+MIMIC; only the 9-parameter population prior is. Scores: RMSE, MAE, bias,
 interval coverage and CRPS by horizon, AUC and Brier for eGFR < 30, and a
 patient-bootstrap CI for every RMSE difference against NPE.
 
@@ -551,7 +554,7 @@ evidence; all the weight is on DAPA-CKD:
 The run writes `results/insilico_trial_report.md`.
 
 ```bash
-python -m pytest tests -q      # 159 tests
+python -m pytest tests -q      # 160 tests
 ```
 
 ---
@@ -581,6 +584,8 @@ nephroq/
 │   ├── npe_posterior.py        # full Bayesian personalization (neural posterior, optional)
 │   ├── benchmark_posterior.py  # NPE vs exact posterior vs classical baselines
 │   ├── fast_sim.py             # vectorized copy of the hazard, for simulation-based inference
+│   ├── population_prior.py     # empirical-Bayes population prior over the NPE draws
+│   ├── validate_mimic_patients.py # patient-level validation on MIMIC-IV (8 methods)
 │   ├── patient_state.py        # longitudinal PatientState / Visit (with provenance)
 │   ├── clinical_data.py        # load CSV/TSV → PatientState; missingness, quality flags
 │   ├── digital_twin.py         # continuous update: forecast → observe → re-personalize
@@ -589,7 +594,7 @@ nephroq/
 │   ├── uncertainty.py          # five-source predictive-uncertainty decomposition
 │   ├── clinical_outputs.py     # KDIGO risk probabilities, category times, referral flag
 │   └── clinical_safety.py      # when NOT to trust the twin (safety verdicts)
-├── tests/                      # 159 tests
+├── tests/                      # 160 tests
 ├── docs/
 │   ├── MODEL_DOCUMENTATION.md  # mathematical specification
 │   ├── TRIAL_DATA_PROVENANCE.md# every trial value, its source, verification status
@@ -646,7 +651,7 @@ the uncertainty band now decomposes five sources into a genuine predictive inter
 
 NephroQ is at **TRL 4** — components validated in a controlled setting: the
 integrated system runs, is calibrated on MIMIC-IV, passes a falsifiable in-silico
-trial replication, and is covered by 159 tests. It is **not** TRL 5: that requires
+trial replication, and is covered by 160 tests. It is **not** TRL 5: that requires
 validation on real data from the target population, which is exactly what the
 pending CRIC individual-level data (and, later, an IMSS-like cohort) would provide.
 Every calibration ships with a `research use — not prospectively validated` label.
