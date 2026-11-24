@@ -103,8 +103,9 @@ def fig_trajectories(path):
 
 
 if __name__ == "__main__":
-    out = os.path.join(os.path.dirname(__file__), "..", "results")
+    import outputs
+    out = outputs.results_dir()
     os.makedirs(out, exist_ok=True)
     fig_slope_comparison(os.path.join(out, "cric_slope_comparison.png"))
     fig_trajectories(os.path.join(out, "cric_trajectories.png"))
-    print("saved cric_slope_comparison.png and cric_trajectories.png to results/")
+    print(f"saved cric_slope_comparison.png and cric_trajectories.png to {out}")

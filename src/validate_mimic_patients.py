@@ -47,9 +47,10 @@ the MIMIC-IV cohort built by mimic_loader.py:
      mechanistic reference and against GBM.
 
 DATA PROTECTION (PhysioNet Credentialed Health Data License 1.5.0): run this on
-the machine that holds MIMIC. It writes per-patient rows to results/*.csv, which
-is git-ignored and must stay there. Only the AGGREGATE report
-(results/mimic_patient_validation.md / .png) may be shared or published.
+the machine that holds MIMIC. It writes per-patient rows to a *.csv in the output
+directory (results/, or --out-dir, or $NEPHROQ_OUT_DIR), which must stay on that
+machine. Only the AGGREGATE report (mimic_patient_validation.md / .png) may be
+shared or published.
 
 Run (trains and caches both networks on first use, ~30 min on a CPU node):
     python mimic_loader.py --mimic-dir <mimic>/hosp --out ../data/_mimic_cohort.tsv
@@ -68,9 +69,9 @@ import fast_sim
 import personalize as pz
 import npe_posterior as npe
 import population_prior as popprior
+import outputs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-RESULTS = os.path.join(HERE, "..", "results")
 
 EARLY_YEARS = 2.0
 WINDOW_DAYS = 90
@@ -608,11 +609,14 @@ if __name__ == "__main__":
     ap.add_argument("--noise-model", choices=["t", "gaussian"], default="t")
     ap.add_argument("--noise-sd", type=float, default=8.7, help="only with --noise-model gaussian")
     ap.add_argument("--n-boot", type=int, default=1000)
+    ap.add_argument("--out-dir", default=None,
+                    help="output directory (default: $NEPHROQ_OUT_DIR, else results/)")
     a = ap.parse_args()
+    RESULTS = outputs.results_dir(a.out_dir)
+    print(f"Writing outputs to {RESULTS}")
     cohort = pd.read_csv(a.cohort, sep=None, engine="python", dtype={"patient_id": str})
     df, tables, ev, ci, meta = run(cohort, a.patients, a.noise_model, a.noise_sd, n_boot=a.n_boot)
-    os.makedirs(RESULTS, exist_ok=True)
-    df.to_csv(os.path.join(RESULTS, "mimic_patient_validation_rows.csv"), index=False)  # git-ignored
+    df.to_csv(os.path.join(RESULTS, "mimic_patient_validation_rows.csv"), index=False)  # never share
     text = report(tables, ev, ci, meta)
     with open(os.path.join(RESULTS, "mimic_patient_validation.md"), "w", encoding="utf8") as f:
         f.write(text)

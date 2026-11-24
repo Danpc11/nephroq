@@ -22,8 +22,8 @@ prior (each patient has its own q, injury rate and true baseline eGFR):
   exact (grid)          brute-force Bayesian posterior on a 3-D grid under the
                         same prior and likelihood -- the gold standard
 
-Outputs results/posterior_benchmark.md and results/posterior_benchmark.png.
-Run:  python benchmark_posterior.py [--n-test 300]
+Outputs posterior_benchmark.md and .png in results/ (or --out-dir, or $NEPHROQ_OUT_DIR).
+Run:  python benchmark_posterior.py [--n-test 300] [--out-dir DIR]
 """
 import argparse
 import os
@@ -37,9 +37,9 @@ import model_core as core
 import fast_sim
 import personalize as pz
 import npe_posterior as npe
+import outputs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-RESULTS = os.path.join(HERE, "..", "results")
 HORIZON = 5.0
 LEVELS = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95])
 N_RANK = 99                       # posterior draws used for SBC ranks
@@ -265,8 +265,11 @@ if __name__ == "__main__":
     ap.add_argument("--n-test", type=int, default=300)
     ap.add_argument("--plot-only", action="store_true",
                     help="redraw the figure and report from the saved run")
+    ap.add_argument("--out-dir", default=None,
+                    help="output directory (default: $NEPHROQ_OUT_DIR, else results/)")
     a = ap.parse_args()
-    os.makedirs(RESULTS, exist_ok=True)
+    RESULTS = outputs.results_dir(a.out_dir)
+    print(f"Writing outputs to {RESULTS}")
     raw = os.path.join(RESULTS, "posterior_benchmark_raw.npz")
     rows = os.path.join(RESULTS, "posterior_benchmark_rows.csv")
     if a.plot_only:

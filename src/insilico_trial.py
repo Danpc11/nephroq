@@ -40,9 +40,9 @@ import numpy as np
 
 import model_core as core
 from model_core import N_of_egfr
+import outputs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-RESULTS = os.path.join(HERE, "..", "results")
 
 # Public research calibration (same parameters the app ships with).
 # Base (unscaled) hazard parameters; the progression `scale` below is what the
@@ -252,7 +252,7 @@ def fit(n=400, seed=11):
     return dict(scale=scale, eff_met=eff_met, eff_hf=eff_hf, eff_alb=eff_alb)
 
 
-def run(n=400, seed=11):
+def run(n=400, seed=11, out_dir=None):
     f = fit(n=n, seed=seed)
     print("=" * 76)
     print("IN-SILICO TRIAL REPLICATION -- NephroQ (model_core v2)")
@@ -290,13 +290,12 @@ def run(n=400, seed=11):
         results[name] = r
 
     print(f"\n>>> {n_pass}/{n_test} CI-testable endpoints PASS")
-    write_report(f, results, n)
+    write_report(f, results, n, out_dir=out_dir)
     return f, results
 
 
-def write_report(f, results, n):
-    os.makedirs(RESULTS, exist_ok=True)
-    path = os.path.join(RESULTS, "insilico_trial_report.md")
+def write_report(f, results, n, out_dir=None):
+    path = outputs.results_path("insilico_trial_report.md", out_dir)
     lines = [
         "# In-silico trial replication — NephroQ",
         "",
@@ -346,12 +345,14 @@ def write_report(f, results, n):
     ]
     with open(path, "w") as fh:
         fh.write("\n".join(lines))
-    print(f"\nReport written: results/insilico_trial_report.md")
+    print(f"\nReport written: {path}")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="In-silico trial replication (model_core v2)")
     ap.add_argument("--n", type=int, default=400, help="virtual patients per arm")
     ap.add_argument("--seed", type=int, default=11)
+    ap.add_argument("--out-dir", default=None,
+                    help="output directory (default: $NEPHROQ_OUT_DIR, else results/)")
     a = ap.parse_args()
-    run(n=a.n, seed=a.seed)
+    run(n=a.n, seed=a.seed, out_dir=a.out_dir)

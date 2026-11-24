@@ -151,8 +151,9 @@ def fig_insilico(path):
 
 
 if __name__ == "__main__":
-    out = os.path.join(os.path.dirname(__file__), "..", "results")
+    import outputs
+    out = outputs.results_dir()
     os.makedirs(out, exist_ok=True)
     fig_two_regimes(os.path.join(out, "two_regimes_q.png"))
     fig_insilico(os.path.join(out, "insilico_dapackd.png"))
-    print("saved two_regimes_q.png and insilico_dapackd.png to results/")
+    print(f"saved two_regimes_q.png and insilico_dapackd.png to {out}")

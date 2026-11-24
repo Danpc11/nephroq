@@ -261,10 +261,11 @@ mx=max(rm_lin.max(),rm_model.max())*1.05
 axes[2].plot([0,mx],[0,mx],"k--",lw=1); axes[2].set_xlim(0,mx); axes[2].set_ylim(0,mx)
 axes[2].set_xlabel("linear extrapolation RMSE"); axes[2].set_ylabel("mechanistic model RMSE")
 axes[2].set_title(f"(C) Forecast: model wins {100*win:.0f}%\n(below diagonal = model is better)")
-plt.tight_layout(); plt.savefig("../results/mvp_validation.png",dpi=130)
+import outputs
+plt.tight_layout(); plt.savefig(outputs.results_path("mvp_validation.png"),dpi=130)
 
 # .md report
-with open("../results/validation_report.md","w") as f:
+with open(outputs.results_path("validation_report.md"),"w") as f:
     f.write(f"""# NephroQ — Validation Report
 
 **Data source:** {"synthetic (demonstration)" if SYNTH else DATA}

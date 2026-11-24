@@ -2,6 +2,18 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 26 — analysis outputs can live outside the clone (v0.16.2)
+
+On the cluster, running the benchmark and the MIMIC validation rewrote `results/*.md` and
+`results/*.png`, files the repository also tracks, so the next `git pull` aborted. New module
+`outputs.py` resolves the output directory as `--out-dir` > `$NEPHROQ_OUT_DIR` > `results/`; it is
+used by `benchmark_posterior.py`, `validate_mimic_patients.py`, `insilico_trial.py`,
+`mvp_calibration.py`, `plot_cric_validation.py` and `plot_key_results.py` (the first three also
+take `--out-dir`). With `NEPHROQ_OUT_DIR` set on a compute node, its clone stays identical to the
+remote. Committed results are updated deliberately from the aggregate reports.
+
+Suite: 166 tests (162 + 4 new).
+
 ## Round 25 — results of the two-stage, Student-t and hybrid run on MIMIC-IV (v0.16.1)
 
 Aggregate results committed in `results/mimic_patient_validation.md` and summarized in the README.

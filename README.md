@@ -296,9 +296,10 @@ python validate_mimic_patients.py --cohort ../data/_mimic_cohort.tsv \
     --patients <mimic>/hosp/patients.csv.gz
 ```
 
-It writes per-patient rows to `results/*.csv` (git-ignored; they must stay on
-that machine) and the **aggregate** report `results/mimic_patient_validation.md`
-and `.png`, which are the only outputs that may be shared.
+It writes per-patient rows to a `.csv` in the output directory (they must stay
+on that machine) and the **aggregate** report `mimic_patient_validation.md` and
+`.png`, which are the only outputs that may be shared. On a compute node, set
+`NEPHROQ_OUT_DIR` (see *Running analyses on a compute node*).
 
 **Result** (MIMIC-IV 3.1; 8 672 training and 858 temporally held-out test
 patients; 1 261 held-out visits; full report in
@@ -595,8 +596,26 @@ evidence; all the weight is on DAPA-CKD:
 The run writes `results/insilico_trial_report.md`.
 
 ```bash
-python -m pytest tests -q      # 162 tests
+python -m pytest tests -q      # 166 tests
 ```
+
+---
+
+## Running analyses on a compute node
+
+Every analysis script writes its reports and figures to `results/` by default.
+On a machine that only *runs* analyses (a cluster node), point them outside the
+clone so the clone stays identical to the remote and `git pull` never collides
+with generated files:
+
+```bash
+export NEPHROQ_OUT_DIR=/path/outside/the/repo/nephroq_runs   # e.g. in ~/.bashrc
+```
+
+Precedence is `--out-dir` (on `benchmark_posterior.py`, `validate_mimic_patients.py`
+and `insilico_trial.py`) > `NEPHROQ_OUT_DIR` > `results/`. The files committed under
+`results/` are updated deliberately from the aggregate reports, never as a side
+effect of a run. Per-patient outputs from MIMIC-IV must stay on the node.
 
 ---
 
@@ -625,6 +644,7 @@ nephroq/
 │   ├── npe_posterior.py        # full Bayesian personalization (neural posterior, optional)
 │   ├── benchmark_posterior.py  # NPE vs exact posterior vs classical baselines
 │   ├── fast_sim.py             # vectorized copy of the hazard, for simulation-based inference
+│   ├── outputs.py              # where scripts write (--out-dir > $NEPHROQ_OUT_DIR > results/)
 │   ├── population_prior.py     # empirical-Bayes population prior over the NPE draws
 │   ├── validate_mimic_patients.py # patient-level validation on MIMIC-IV (10 methods)
 │   ├── patient_state.py        # longitudinal PatientState / Visit (with provenance)
@@ -635,7 +655,7 @@ nephroq/
 │   ├── uncertainty.py          # five-source predictive-uncertainty decomposition
 │   ├── clinical_outputs.py     # KDIGO risk probabilities, category times, referral flag
 │   └── clinical_safety.py      # when NOT to trust the twin (safety verdicts)
-├── tests/                      # 162 tests
+├── tests/                      # 166 tests
 ├── docs/
 │   ├── MODEL_DOCUMENTATION.md  # mathematical specification
 │   ├── TRIAL_DATA_PROVENANCE.md# every trial value, its source, verification status
@@ -692,7 +712,7 @@ the uncertainty band now decomposes five sources into a genuine predictive inter
 
 NephroQ is at **TRL 4** — components validated in a controlled setting: the
 integrated system runs, is calibrated on MIMIC-IV, passes a falsifiable in-silico
-trial replication, and is covered by 162 tests. It is **not** TRL 5: that requires
+trial replication, and is covered by 166 tests. It is **not** TRL 5: that requires
 validation on real data from the target population, which is exactly what the
 pending CRIC individual-level data (and, later, an IMSS-like cohort) would provide.
 Every calibration ships with a `research use — not prospectively validated` label.

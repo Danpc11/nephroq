@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nephroq"
-version = "0.16.1"
+version = "0.16.2"
 description = "A mechanistic digital twin for type 2 diabetes -> chronic kidney disease progression"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -51,7 +51,7 @@ py-modules = [
     "clinical_data", "clinical_outputs", "clinical_safety", "digital_twin",
     "egfr_measurement", "external_validation", "fast_sim", "i18n", "insilico_trial",
     "measurement_strategy", "mimic_loader", "model_core", "mvp_calibration",
-    "npe_posterior", "patient_state", "personalize", "plot_cric_validation",
+    "npe_posterior", "outputs", "patient_state", "personalize", "plot_cric_validation",
     "population_prior",
     "plot_key_results", "treatment_engine", "uncertainty", "validate_mimic_patients",
 ]
