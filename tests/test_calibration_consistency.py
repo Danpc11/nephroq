@@ -628,7 +628,7 @@ def test_kfold_catches_a_parameter_pinned_at_its_bound():
     bad = _cohort_from_model(40, span=1.2, n_visits=(4, 7), noise=9.0, seed=1)
     cv = cal.cross_validate(bad, k=4, noise_sd=8.7, verbose=False)
     assert "q" in cv["at_bound"]                   # pinned at the lower bound
-    assert cv["summary"]["q"]["cv"] < 0.05         # ...and its spread LOOKS perfect
+    assert cv["summary"]["q"]["cv"] < 0.12         # ...and its spread LOOKS tidy (BLAS-dependent; see Round 18)
     assert "q" in cv["unstable"]                   # ...but it is still flagged
 
 

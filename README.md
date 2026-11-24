@@ -255,7 +255,38 @@ it inherits every assumption of the model; the SBC test for the log injury rate
 is borderline (p = 0.04), and the network contracts `q` slightly more than the
 exact posterior (22 % vs 14 %), so a larger training set or an ensemble of flows
 may be needed; and the app still uses the MLP ensemble until the module is wired
-in. Install with `pip install -r requirements-npe.txt`.
+in. The fit to real patients is tested by the MIMIC-IV validation below. Install with `pip install -r requirements-npe.txt`.
+
+### Patient-level validation on real trajectories (MIMIC-IV)
+
+`src/validate_mimic_patients.py` runs the patient-level protocol on the MIMIC-IV
+cohort built by `mimic_loader.py`: each eGFR series is thinned to one median
+value per 90 days, every method personalizes on the **first 2 years** after the
+confirmed index and nothing later, and held-out visits are scored at ~1, ~3 and
+~5 years after the last observed visit (one visit per patient per horizon). The
+split is **temporal** (the most recent `anchor_year_group` is the test set) when
+`patients.csv.gz` is given. Seven methods are compared on the same visits: the
+population model, one-parameter least squares, the MLP ensemble, the NPE
+posterior predictive, a per-patient OLS slope, an empirical-Bayes random-slope
+model and gradient boosting — the last two trained on the training patients;
+the mechanistic methods are not fitted on MIMIC at all. Scores: RMSE, MAE, bias,
+interval coverage and CRPS by horizon, AUC and Brier for eGFR < 30, and a
+patient-bootstrap CI for every RMSE difference against NPE.
+
+Run it where MIMIC lives (credentialed access required; see
+`docs/MIMIC_COMPLIANCE.md`):
+
+```bash
+cd src
+python mimic_loader.py --mimic-dir <mimic>/hosp --out ../data/_mimic_cohort.tsv
+python -c "import npe_posterior as n; n.train(noise_sd=8.7)"     # hospital noise
+python validate_mimic_patients.py --cohort ../data/_mimic_cohort.tsv \
+    --patients <mimic>/hosp/patients.csv.gz --noise-sd 8.7
+```
+
+It writes per-patient rows to `results/*.csv` (git-ignored; they must stay on
+that machine) and the **aggregate** report `results/mimic_patient_validation.md`
+and `.png`, which are the only outputs that may be shared.
 
 ### Honest limits
 
@@ -520,7 +551,7 @@ evidence; all the weight is on DAPA-CKD:
 The run writes `results/insilico_trial_report.md`.
 
 ```bash
-python -m pytest tests -q      # 155 tests
+python -m pytest tests -q      # 159 tests
 ```
 
 ---
@@ -558,7 +589,7 @@ nephroq/
 │   ├── uncertainty.py          # five-source predictive-uncertainty decomposition
 │   ├── clinical_outputs.py     # KDIGO risk probabilities, category times, referral flag
 │   └── clinical_safety.py      # when NOT to trust the twin (safety verdicts)
-├── tests/                      # 155 tests
+├── tests/                      # 159 tests
 ├── docs/
 │   ├── MODEL_DOCUMENTATION.md  # mathematical specification
 │   ├── TRIAL_DATA_PROVENANCE.md# every trial value, its source, verification status
@@ -615,7 +646,7 @@ the uncertainty band now decomposes five sources into a genuine predictive inter
 
 NephroQ is at **TRL 4** — components validated in a controlled setting: the
 integrated system runs, is calibrated on MIMIC-IV, passes a falsifiable in-silico
-trial replication, and is covered by 155 tests. It is **not** TRL 5: that requires
+trial replication, and is covered by 159 tests. It is **not** TRL 5: that requires
 validation on real data from the target population, which is exactly what the
 pending CRIC individual-level data (and, later, an IMSS-like cohort) would provide.
 Every calibration ships with a `research use — not prospectively validated` label.

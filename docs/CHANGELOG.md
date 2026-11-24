@@ -2,6 +2,43 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 22 — patient-level validation on real trajectories, ready to run on MIMIC-IV (v0.14.0)
+
+### New — `validate_mimic_patients.py`
+Implements the patient-level protocol of `external_validation.validate_patient_level` on the
+cohort written by `mimic_loader.py`. eGFR series are thinned to one median per 90 days; every
+method personalizes on the first 2 years after the confirmed index; held-out visits are scored at
+~1, ~3 and ~5 years after the last observed visit, one visit per patient per horizon. Split by
+`anchor_year_group` (temporal; most recent group = test) when `patients.csv.gz` is supplied,
+otherwise random 30 %. Seven methods on identical visits: population model, one-parameter least
+squares, MLP ensemble, NPE posterior predictive (with measurement noise added for scoring against
+observations), per-patient OLS slope, empirical-Bayes random-slope model and quantile gradient
+boosting (the last two fitted on the training split only; the mechanistic methods are not fitted
+on MIMIC). Reports RMSE/MAE/bias/90 % coverage/CRPS by horizon, AUC and Brier for eGFR < 30 at a
+held-out visit, and patient-bootstrap 95 % CIs of every RMSE difference against NPE. Per-patient
+rows go to git-ignored `results/*.csv`; only the aggregate `.md`/`.png` are meant to be shared.
+Tested end to end on a synthetic cohort in the loader format (no real data in the repository),
+including a check that no held-out visit leaks into the observed window.
+
+### NPE trained for the data's noise level
+`npe_posterior.train(noise_sd=...)` and `load(noise_sd=...)`; weights are stored per noise level
+(`npe_posterior_sd8.7.pt` for hospital creatinine) and the checkpoint records the level.
+
+### NPE training runs its full learning-rate schedule
+On the cluster, early stopping (patience 6) fired at epoch 15 of 40, during the high-rate phase of
+the one-cycle schedule, before the annealing third where the validation loss improves most (best
+val NLL 3.854 vs 3.750 for the full run). The posterior stayed calibrated (90 % coverage 93 %, all
+SBC p > 0.05) but forecast less sharply (RMSE 9.51 vs 8.91). `train()` now runs the full schedule
+and keeps the best checkpoint; `patience`, if given, is honoured only after 80 % of the epochs.
+
+### The cached personalizer can no longer outlive the model it learned
+`personalizer.pkl` now stores a fingerprint of `patient_params`, priors, noise and training
+sizes. A mismatched or cross-version cache (warnings during unpickling are now errors) is
+retrained instead of reused. This is what let a pre-Round-21 cache, trained before the
+albuminuric scaling fix, load silently on a cluster with a newer scikit-learn.
+
+Suite: 159 tests (155 + 4 new).
+
 ## Round 21 — full Bayesian personalization, and the injury rate now reaches the albuminuric term (v0.13.0)
 
 ### P1 — the personal injury rate did not scale the albuminuric hazard
@@ -41,6 +78,10 @@ across the prior; < 0.01 enforced). 20 000 patients over 8 years in < 1 s.
 the NPE tests run; NPE tests skip cleanly when torch is absent. New modules listed in
 `pyproject.toml`. Trained weights (`calibration/npe_posterior.pt`) are git-ignored and
 reproducible with `python -c "import npe_posterior as n; n.train()"`.
+
+The k-fold "false green" test still asserted the pre-Round-18 bound (`< 0.05`) although Round 18
+records it as relaxed to `< 0.12`; it failed on macOS/Accelerate (0.065). The test now uses the
+documented bound.
 
 Suite: 155 tests (148 + 7 new).
 

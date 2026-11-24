@@ -107,7 +107,7 @@ def simulate_histories(theta, a1c, uacr0, sbp, times, mask, rng, noise_sd=NOISE_
     return np.where(mask, obs, 0.0)
 
 
-def simulate_dataset(n, seed=0, chunk=20000):
+def simulate_dataset(n, seed=0, chunk=20000, noise_sd=NOISE_SD):
     """Full training set: theta, covariates, schedules and noisy histories."""
     rng = np.random.default_rng(seed)
     out = {k: [] for k in ("theta", "a1c", "uacr0", "sbp", "times", "mask", "egfr")}
@@ -116,7 +116,7 @@ def simulate_dataset(n, seed=0, chunk=20000):
         th = sample_prior(m, rng)
         a1c, uacr0, sbp = sample_covariates(m, rng)
         times, mask = sample_schedules(m, rng)
-        egfr = simulate_histories(th, a1c, uacr0, sbp, times, mask, rng)
+        egfr = simulate_histories(th, a1c, uacr0, sbp, times, mask, rng, noise_sd=noise_sd)
         for k, v in zip(out, (th, a1c, uacr0, sbp, times, mask, egfr)):
             out[k].append(v)
     return {k: np.concatenate(v) for k, v in out.items()}
@@ -215,17 +215,32 @@ class TrainReport:
     seconds: float
 
 
+def model_path(noise_sd=NOISE_SD):
+    """Weights file for a given measurement-noise level (6 = the default)."""
+    if float(noise_sd) == NOISE_SD:
+        return MODEL_PATH
+    return MODEL_PATH.replace(".pt", f"_sd{float(noise_sd):g}.pt")
+
+
 def train(n_train=200_000, epochs=40, batch=512, lr=1e-3, seed=0, save=True,
-          verbose=True, patience=6):
+          verbose=True, patience=None, noise_sd=NOISE_SD):
     """Simulate, then fit the summary network and flow jointly (maximum
-    likelihood on the unbounded parameters). Early-stops on a held-out 5 %."""
+    likelihood on the unbounded parameters). Early-stops on a held-out 5 %.
+    `noise_sd` is the per-measurement eGFR noise the network is trained for;
+    match it to the data it will read (hospital creatinine is noisier).
+
+    The one-cycle learning-rate schedule only anneals in its final third, where
+    the validation loss reaches its best values; stopping during the high-rate
+    phase leaves the flow under-trained. So by default the full schedule runs
+    and the best validation checkpoint is kept; `patience` (epochs without
+    improvement) is honoured only after 80 % of the schedule."""
     torch, _ = _torch()
     torch.manual_seed(seed)
     torch.set_num_threads(max(1, os.cpu_count() or 1))
     t0 = time.perf_counter()
     if verbose:
         print(f"Simulating {n_train} virtual patients...")
-    d = simulate_dataset(n_train, seed=seed)
+    d = simulate_dataset(n_train, seed=seed, noise_sd=noise_sd)
     seq, lengths, static = encode(d["times"], d["egfr"], d["mask"],
                                   d["a1c"], d["uacr0"], d["sbp"])
     z = to_unbounded(d["theta"]).astype(np.float32)
@@ -262,25 +277,30 @@ def train(n_train=200_000, epochs=40, batch=512, lr=1e-3, seed=0, save=True,
             best_state = {k: v.clone() for k, v in net.state_dict().items()}
         else:
             bad += 1
-            if bad >= patience:
+            if patience is not None and bad >= patience and ep + 1 >= int(0.8 * epochs):
                 break
     net.load_state_dict(best_state)
     net.eval()
+    net.noise_sd = float(noise_sd)
     rep = TrainReport(n_train, ep + 1, best, time.perf_counter() - t0)
     if save:
-        os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-        torch.save({"state": net.state_dict(), "report": rep.__dict__}, MODEL_PATH)
+        path = model_path(noise_sd)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save({"state": net.state_dict(), "report": rep.__dict__,
+                    "noise_sd": float(noise_sd)}, path)
     if verbose:
         print(f"Trained in {rep.seconds:.0f} s (best val NLL {best:.4f})")
     return net, rep
 
 
-def load(path=MODEL_PATH):
+def load(path=None, noise_sd=NOISE_SD):
     torch, _ = _torch()
+    path = model_path(noise_sd) if path is None else path
     ck = torch.load(path, map_location="cpu", weights_only=False)
     net = build_network()
     net.load_state_dict(ck["state"])
     net.eval()
+    net.noise_sd = float(ck.get("noise_sd", NOISE_SD))
     return net
 
 

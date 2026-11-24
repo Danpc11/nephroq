@@ -98,6 +98,25 @@ MEAS_NOISE_SD = 6.0            # mL/min/1.73m2, per measurement
 N_FEATURES = 11
 
 
+def model_fingerprint():
+    """
+    Short hash of everything the trained estimator depends on: the personal
+    parameter map, the priors, the observation noise and the training sizes. A
+    cached estimator whose fingerprint differs was trained on a different model
+    and is retrained instead of silently reused.
+    """
+    import hashlib
+    import json
+    ref = patient_params(1.37, 1.91)
+    blob = json.dumps(dict(
+        params={k: (round(v, 12) if isinstance(v, float) else v)
+                for k, v in sorted(ref.items()) if not isinstance(v, str)},
+        q_range=Q_RANGE, scale_range=SCALE_RANGE, noise=MEAS_NOISE_SD,
+        n_train=N_TRAIN_DEFAULT, hidden=HIDDEN_DEFAULT, n_models=N_MODELS_DEFAULT,
+        features=N_FEATURES), sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
 def patient_params(q, scale):
     """A personal parameter set = the trial-anchored population model, rescaled.
 
@@ -224,12 +243,18 @@ class Personalizer:
         with open(path, "wb") as f:
             pickle.dump(dict(scaler=self.scaler, models=self.models,
                              n_models=self.n_models, hidden=self.hidden,
-                             seed=self.seed), f)
+                             seed=self.seed, fingerprint=model_fingerprint()), f)
 
     @staticmethod
     def load(path=MODEL_PATH):
-        with open(path, "rb") as f:
+        import warnings as _w
+        with open(path, "rb") as f, _w.catch_warnings():
+            # a scikit-learn version change is handled below by the fingerprint
+            # and the retrain fallback, not by trusting a cross-version unpickle
+            _w.simplefilter("error")
             d = pickle.load(f)
+        if d.get("fingerprint") != model_fingerprint():
+            raise ValueError("cached estimator was trained on a different model")
         est = Personalizer(n_models=d["n_models"], hidden=d["hidden"], seed=d["seed"])
         est.scaler, est.models = d["scaler"], d["models"]
         return est
@@ -274,7 +299,7 @@ def get_estimator(force_retrain=False):
             _CACHE["est"] = Personalizer.load()
             return _CACHE["est"]
         except Exception:
-            pass          # missing, or a stale pickle from another sklearn version
+            pass          # missing, stale (other model or sklearn version) -> retrain
     _CACHE["est"] = train()
     return _CACHE["est"]
 

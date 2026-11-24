@@ -115,3 +115,16 @@ def test_validation_scores_the_deployed_path_against_the_fair_rival():
     # injury rate -- reproduce it for one patient
     r = df.iloc[0]
     assert r.e_nn != pytest.approx(r.e_nn_qhat) or abs(r.q_nn - q_pop) < 1e-6
+
+
+def test_a_cache_trained_on_a_different_model_is_not_reused(tmp_path, monkeypatch):
+    """The cached estimator carries a fingerprint of the model it was trained on;
+    a mismatch (e.g. a changed patient_params) must force a retrain, not a silent
+    reuse of an estimator that learned a different simulator."""
+    path = str(tmp_path / "personalizer.pkl")
+    est = pz.train(n_train=300, save=False)
+    est.save(path)
+    assert pz.Personalizer.load(path) is not None
+    monkeypatch.setattr(pz, "model_fingerprint", lambda: "changed-model")
+    with pytest.raises(ValueError):
+        pz.Personalizer.load(path)
