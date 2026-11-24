@@ -1,0 +1,5 @@
+# Optional: amortized neural posterior (src/npe_posterior.py) and its benchmark.
+# CPU wheels are enough:  pip install -r requirements-npe.txt \
+#     --extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.2
+zuko>=1.2

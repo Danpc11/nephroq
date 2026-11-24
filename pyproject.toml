@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nephroq"
-version = "0.11.0"
+version = "0.13.0"
 description = "A mechanistic digital twin for type 2 diabetes -> chronic kidney disease progression"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,6 +25,10 @@ dependencies = [
     "streamlit>=1.35",
 ]
 
+[project.optional-dependencies]
+# Amortized neural posterior (src/npe_posterior.py) and its benchmark.
+npe = ["torch>=2.2", "zuko>=1.2"]
+
 [project.urls]
 Repository = "https://github.com/Danpc11/nephroq"
 
@@ -43,10 +47,10 @@ addopts = "-q"
 [tool.setuptools]
 package-dir = { "" = "src" }
 py-modules = [
-    "acute_events", "audit_calibration", "calibrate_mimic", "clinical_data",
-    "clinical_outputs", "clinical_safety", "digital_twin", "egfr_measurement",
-    "external_validation", "i18n", "insilico_trial", "measurement_strategy",
-    "mimic_loader", "model_core", "mvp_calibration", "patient_state",
-    "personalize", "plot_cric_validation", "plot_key_results", "treatment_engine",
-    "uncertainty",
+    "acute_events", "audit_calibration", "benchmark_posterior", "calibrate_mimic",
+    "clinical_data", "clinical_outputs", "clinical_safety", "digital_twin",
+    "egfr_measurement", "external_validation", "fast_sim", "i18n", "insilico_trial",
+    "measurement_strategy", "mimic_loader", "model_core", "mvp_calibration",
+    "npe_posterior", "patient_state", "personalize", "plot_cric_validation",
+    "plot_key_results", "treatment_engine", "uncertainty",
 ]

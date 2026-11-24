@@ -90,3 +90,28 @@ def test_a_falling_patient_gets_a_worse_projection_than_a_flat_one():
     _, _, _, td_flat = core.simulate_trajectory_v2(55.0, 8.0, 300.0, 145.0, u=0.0,
                                                    p=flat["params"], years=20)
     assert td_falling < td_flat
+
+
+def test_scale_only_rival_holds_q_at_the_population_value():
+    """The fair classical rival must solve the same problem as the deployed
+    personalizer: infer the injury rate with q fixed at its population value."""
+    q_pop = core.TRIAL_CALIBRATION_V2["q"]
+    t = np.array([0.0, 1.0, 2.0, 3.0])
+    p = pz.patient_params(q_pop, 2.0)
+    e = core.predict_egfr_at_v2(80.0, 8.0, 300.0, 145.0, 0.0, p, t, years=3.0)
+    s = pz.least_squares_scale_only(t, e, 8.0, 300.0, 145.0)
+    assert s == pytest.approx(2.0, rel=0.05)      # noise-free data: exact recovery
+
+
+def test_validation_scores_the_deployed_path_against_the_fair_rival():
+    """validate() must forecast with the population q (what the app does) and
+    report the one-parameter least-squares rival alongside it."""
+    est = pz.train(n_train=600, save=False)
+    df = pz.validate(est, n_test=12, verbose=False)
+    for col in ("e_pop", "e_nn", "e_ls1", "e_nn_qhat", "e_ls2"):
+        assert col in df and np.isfinite(df[col]).all()
+    q_pop = core.TRIAL_CALIBRATION_V2["q"]
+    # the deployed forecast is the projection with q_pop and the network's
+    # injury rate -- reproduce it for one patient
+    r = df.iloc[0]
+    assert r.e_nn != pytest.approx(r.e_nn_qhat) or abs(r.q_nn - q_pop) < 1e-6

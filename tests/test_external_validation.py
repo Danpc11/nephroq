@@ -63,3 +63,15 @@ def test_cohorts_are_inside_the_models_validated_domain():
     for c in ev.CRIC_COHORTS.values():
         assert 15 <= c["egfr"] <= 90
         assert 5 <= c["hba1c"] <= 14
+
+
+def test_compatibility_flag_checks_the_predicted_range_against_the_band():
+    """`within_observed_range` answers "is the model compatible with what CRIC
+    observed?": the predicted range lies inside the published plausible band.
+    The stricter point-in-range check is reported separately."""
+    for key in ev.CRIC_COHORTS:
+        r = ev.validate_population(key)
+        lo, hi = sorted(r.predicted_slope_range)
+        olo, ohi = sorted(r.observed_range)
+        assert r.within_observed_range == (olo <= lo and hi <= ohi)
+        assert r.observed_in_predicted_range == (lo <= r.observed_slope <= hi)

@@ -74,11 +74,10 @@ import model_core as core
 warnings.filterwarnings("ignore", category=UserWarning)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# The trained estimator IS committed to the repository, so the app starts
-# instantly. But it is never REQUIRED: it is derived entirely from simulations of
-# the mechanistic model, so if it is missing -- or unloadable because scikit-learn
-# changed its pickle format -- get_estimator() simply retrains it (~13 s). That
-# removes the usual fragility of shipping a pickle.
+# The trained estimator is NOT committed. It is derived entirely from
+# simulations of the mechanistic model, so get_estimator() trains it on first use
+# (~13 s) and caches it; a missing or unloadable cache (e.g. a scikit-learn
+# pickle-format change) simply triggers a retrain.
 MODEL_PATH = os.path.join(HERE, "..", "calibration", "personalizer.pkl")
 
 # Training configuration. Chosen by measuring the cost/accuracy trade-off:
@@ -100,14 +99,21 @@ N_FEATURES = 11
 
 
 def patient_params(q, scale):
-    """A personal parameter set = the trial-anchored population model, rescaled."""
+    """A personal parameter set = the trial-anchored population model, rescaled.
+
+    `scale` multiplies every INJURY coefficient -- hyperfiltration (k_hf),
+    metabolic (w_a1c, w_sbp) and albuminuric (k_alb) -- and leaves the baseline
+    loss k0 and the structure (q, s_sat, beta) untouched. The hazard reads the
+    albuminuric coefficient from `k_alb` (Round 16), so that is the key scaled;
+    the legacy `w_uacr` is kept in step for code that still reads it."""
     p = dict(core.TRIAL_CALIBRATION_V2)
-    base_k, base_w = 0.0141 * 0.730, np.array([0.0144, 0.0180, 0.0108]) * 0.730
+    base = core.TRIAL_CALIBRATION_V2
     p.update(q=float(q),
-             k_hf=float(base_k * scale),
-             w_a1c=float(base_w[0] * scale),
-             w_uacr=float(base_w[1] * scale),
-             w_sbp=float(base_w[2] * scale))
+             k_hf=float(base["k_hf"] * scale),
+             w_a1c=float(base["w_a1c"] * scale),
+             k_alb=float(core._k_alb_of(base) * scale),
+             w_uacr=float(core._k_alb_of(base) * scale),
+             w_sbp=float(base["w_sbp"] * scale))
     return p
 
 
@@ -332,8 +338,11 @@ def personalize(t, egfr, a1c, uacr0, sbp, estimator=None):
 # Validation -- the estimator has to EARN its place
 # ------------------------------------------------------------------------------
 def least_squares_baseline(t, egfr, a1c, uacr0, sbp):
-    """The classical alternative: fit (q, scale) per patient with an optimizer.
-    This is the rival the network has to beat -- on accuracy or on speed."""
+    """Classical two-parameter fit of (q, scale) per patient.
+
+    Kept as a DIAGNOSTIC rival only: q is not identifiable from one patient's
+    routine data, so fitting it inflates forecast error. The fair rival of the
+    deployed personalizer is `least_squares_scale_only`."""
     from scipy.optimize import least_squares
 
     def resid(z):
@@ -350,14 +359,51 @@ def least_squares_baseline(t, egfr, a1c, uacr0, sbp):
     return q, scale
 
 
-def validate(est, n_test=400, seed=999, horizon=5.0):
+def least_squares_scale_only(t, egfr, a1c, uacr0, sbp, q=None):
+    """The FAIR classical rival of the deployed personalizer.
+
+    It solves exactly the problem the app solves -- infer the patient's injury
+    rate with q held at its population value -- by one-parameter least squares.
+    The network has to beat THIS on accuracy, or justify itself on speed and on
+    the uncertainty it reports."""
+    from scipy.optimize import least_squares
+    q = float(core.TRIAL_CALIBRATION_V2["q"] if q is None else q)
+    lo, hi = np.log(SCALE_RANGE[0]), np.log(SCALE_RANGE[1])
+
+    def resid(z):
+        p = patient_params(q, float(np.exp(np.clip(z[0], lo, hi))))
+        pred = core.predict_egfr_at_v2(egfr[0], a1c, uacr0, sbp, 0.0, p, t,
+                                       years=max(float(t[-1]), 0.5))
+        return pred - egfr
+
+    sol = least_squares(resid, [0.0], max_nfev=200)
+    return float(np.exp(np.clip(sol.x[0], lo, hi)))
+
+
+def validate(est, n_test=400, seed=999, horizon=5.0, verbose=True):
     """
-    Two questions, both of which the estimator can fail:
-      1. Does it RECOVER the parameters it was asked to infer?
-      2. Does personalizing actually FORECAST better than population parameters
-         -- and how does it compare to the classical least-squares fit?
+    Validate the personalizer AS DEPLOYED, against its fair rival.
+
+    The app projects with the POPULATION q and the patient's inferred injury
+    rate (see `personalize`). The headline comparison therefore uses that path:
+
+      population          q_pop, scale = 1
+      network (deployed)  q_pop, scale inferred by the network
+      LS scale-only       q_pop, scale fitted by one-parameter least squares
+
+    Two further rows are DIAGNOSTICS, not claims: the network with its own q
+    estimate, and the two-parameter least-squares fit. Comparing the deployed
+    network against the two-parameter fit would flatter the network, because
+    that rival spends its noise budget on q, which is not identifiable.
+
+    Virtual patients carry their own true q drawn from the prior, so fixing q
+    at the population value is itself tested as a modelling choice.
+    Returns a DataFrame with one row per virtual patient.
     """
     import time
+    import pandas as pd
+
+    q_pop = float(core.TRIAL_CALIBRATION_V2["q"])
     rng = np.random.default_rng(seed)
     rows = []
     for _ in range(n_test):
@@ -379,16 +425,18 @@ def validate(est, n_test=400, seed=999, horizon=5.0):
         e_obs = np.clip(e_obs, 3.0, None)
         e_future_true = float(np.interp(span + horizon, t, egfr))     # the held-out future
 
-        # --- 1. amortized network
         t0 = time.perf_counter()
         q_hat, _, s_hat, _ = est.predict(features(t_obs, e_obs, a1c, uacr0, sbp))
         t_nn = time.perf_counter() - t0
         q_hat, s_hat = float(q_hat[0]), float(s_hat[0])
 
-        # --- 2. classical per-patient least squares
         t0 = time.perf_counter()
-        q_ls, s_ls = least_squares_baseline(t_obs, e_obs, a1c, uacr0, sbp)
-        t_ls = time.perf_counter() - t0
+        s_ls1 = least_squares_scale_only(t_obs, e_obs, a1c, uacr0, sbp, q=q_pop)
+        t_ls1 = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        q_ls2, s_ls2 = least_squares_baseline(t_obs, e_obs, a1c, uacr0, sbp)
+        t_ls2 = time.perf_counter() - t0
 
         def forecast(q, scale):
             p = patient_params(q, scale)
@@ -397,17 +445,20 @@ def validate(est, n_test=400, seed=999, horizon=5.0):
                                                  years=span + horizon)[0])
 
         rows.append(dict(
-            q_true=q_true, q_nn=q_hat, q_ls=q_ls,
-            scale_true=scale_true, scale_nn=s_hat, scale_ls=s_ls,
+            q_true=q_true, scale_true=scale_true,
+            q_nn=q_hat, scale_nn=s_hat, scale_ls1=s_ls1, q_ls2=q_ls2, scale_ls2=s_ls2,
             e_true=e_future_true,
-            e_nn=forecast(q_hat, s_hat),
-            e_ls=forecast(q_ls, s_ls),
-            e_pop=forecast(core.TRIAL_CALIBRATION_V2["q"], 1.0),
-            t_nn=t_nn, t_ls=t_ls,
+            e_pop=forecast(q_pop, 1.0),
+            e_nn=forecast(q_pop, s_hat),          # deployed path
+            e_ls1=forecast(q_pop, s_ls1),         # fair rival
+            e_nn_qhat=forecast(q_hat, s_hat),     # diagnostic
+            e_ls2=forecast(q_ls2, s_ls2),         # diagnostic
+            t_nn=t_nn, t_ls1=t_ls1, t_ls2=t_ls2,
         ))
 
-    import pandas as pd
     df = pd.DataFrame(rows)
+    if not verbose:
+        return df
 
     def r2(a, b):
         return 1 - np.sum((a - b) ** 2) / np.sum((a - np.mean(a)) ** 2)
@@ -415,29 +466,40 @@ def validate(est, n_test=400, seed=999, horizon=5.0):
     def rmse(a, b):
         return float(np.sqrt(np.mean((a - b) ** 2)))
 
-    print("\n" + "=" * 74)
-    print("VALIDATION -- held-out virtual patients (n=%d)" % len(df))
-    print("=" * 74)
-    print("\n1) PARAMETER RECOVERY (can it infer what it was asked to infer?)")
-    print(f"   {'':10}{'network':>12}{'least-squares':>16}")
-    print(f"   {'q  (R2)':10}{r2(df.q_true, df.q_nn):12.3f}{r2(df.q_true, df.q_ls):16.3f}")
-    print(f"   {'scale (R2)':10}{r2(df.scale_true, df.scale_nn):12.3f}"
-          f"{r2(df.scale_true, df.scale_ls):16.3f}")
+    pop = rmse(df.e_true, df.e_pop)
+    print("\n" + "=" * 78)
+    print("VALIDATION -- held-out virtual patients (n=%d), personalizer AS DEPLOYED" % len(df))
+    print("=" * 78)
+    print("\n1) INJURY-RATE RECOVERY (log-scale R2 against each patient's true rate)")
+    ls = np.log(df.scale_true)
+    print(f"   network                      {r2(ls, np.log(df.scale_nn)):6.3f}")
+    print(f"   least squares, scale only    {r2(ls, np.log(df.scale_ls1)):6.3f}"
+          "   (fits the rate that best compensates a fixed q, so a low R2 here is"
+          " expected; judge it by the forecast)")
+    print(f"   q recovery (diagnostic): network R2 {r2(df.q_true, df.q_nn):.3f}, "
+          f"2-parameter LS R2 {r2(df.q_true, df.q_ls2):.3f}")
 
-    print(f"\n2) FORECAST at +{horizon:.0f} years beyond the last visit (mL/min/1.73m2)")
-    pop, nn, ls = rmse(df.e_true, df.e_pop), rmse(df.e_true, df.e_nn), rmse(df.e_true, df.e_ls)
-    print(f"   {'population parameters (current app)':<38}RMSE {pop:6.2f}")
-    print(f"   {'amortized network (personalized)':<38}RMSE {nn:6.2f}   "
-          f"({100*(1-nn/pop):+.0f}% vs population)")
-    print(f"   {'per-patient least squares':<38}RMSE {ls:6.2f}   "
-          f"({100*(1-ls/pop):+.0f}% vs population)")
+    print(f"\n2) FORECAST at +{horizon:.0f} years beyond the last visit (RMSE, mL/min/1.73m2)")
+    for col, label in [("e_pop", "population parameters"),
+                       ("e_nn", "network, q population (DEPLOYED)"),
+                       ("e_ls1", "least squares, scale only (fair rival)"),
+                       ("e_nn_qhat", "network, own q (diagnostic)"),
+                       ("e_ls2", "least squares, q + scale (diagnostic)")]:
+        v = rmse(df.e_true, df[col])
+        print(f"   {label:<42}{v:6.2f}   ({100*(1-v/pop):+.0f}% vs population)")
 
     print(f"\n3) SPEED per patient")
-    print(f"   network        {1000*df.t_nn.mean():7.2f} ms")
-    print(f"   least squares  {1000*df.t_ls.mean():7.2f} ms   "
-          f"({df.t_ls.mean()/max(df.t_nn.mean(),1e-9):.0f}x slower)")
+    for col, label in [("t_nn", "network"), ("t_ls1", "LS scale only"), ("t_ls2", "LS q + scale")]:
+        print(f"   {label:<16}{1000*df[col].mean():8.2f} ms")
 
-    verdict = "EARNS ITS PLACE" if nn < pop else "DOES NOT BEAT POPULATION PARAMETERS"
+    nn, ls1 = rmse(df.e_true, df.e_nn), rmse(df.e_true, df.e_ls1)
+    if nn >= pop:
+        verdict = "DOES NOT BEAT POPULATION PARAMETERS"
+    elif nn < 0.95 * ls1:
+        verdict = "BEATS POPULATION AND THE FAIR CLASSICAL RIVAL"
+    else:
+        verdict = ("BEATS POPULATION; MATCHES THE FAIR CLASSICAL RIVAL "
+                   "(advantage is speed, not accuracy)")
     print(f"\n>>> {verdict}")
     return df
 

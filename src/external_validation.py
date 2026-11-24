@@ -181,7 +181,14 @@ class PopulationValidationResult:
     predicted_slope_range: tuple
     observed_slope: Optional[float]
     observed_range: tuple
+    # True when the model's predicted slope range lies inside the observed
+    # plausible band (the question a reader asks: "is the model compatible with
+    # what CRIC observed?").
     within_observed_range: Optional[bool]
+    # Stricter: True only when the observed POINT estimate falls inside the
+    # model's predicted range. That range spans only the proteinuria->UACR
+    # conversion uncertainty, so it is narrow and this is usually False.
+    observed_in_predicted_range: Optional[bool] = None
     caveats: list = field(default_factory=list)
 
 
@@ -199,15 +206,16 @@ def validate_population(cohort_key, params=None,
 
     obs_val = observed.get("value")
     obs_range = observed.get("plausible_range")
+    plo, phi = sorted(pred["slope_range"])
     within = None
-    if obs_val is not None:
-        lo, hi = pred["slope_range"]
-        within = (lo <= obs_val <= hi) or (min(lo, hi) <= obs_val <= max(lo, hi))
-    elif obs_range is not None:
-        # overlap of the two ranges
-        plo, phi = sorted(pred["slope_range"])
+    if obs_range is not None:
         olo, ohi = sorted(obs_range)
-        within = not (phi < olo or plo > ohi)
+        within = bool(olo <= plo and phi <= ohi)
+    point_in = None
+    if obs_val is not None:
+        point_in = bool(plo <= obs_val <= phi)
+        if within is None:
+            within = point_in
 
     caveats = [
         "CROSS-REGIME reference, NOT patient-level validation of the twin. CRIC is a "
@@ -228,7 +236,8 @@ def validate_population(cohort_key, params=None,
         cohort=cohort["label"], n=cohort["n"],
         predicted_slope_range=pred["slope_range"],
         observed_slope=obs_val, observed_range=obs_range,
-        within_observed_range=within, caveats=caveats)
+        within_observed_range=within, observed_in_predicted_range=point_in,
+        caveats=caveats)
 
 
 # ------------------------------------------------------------------------------

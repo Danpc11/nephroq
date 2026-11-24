@@ -22,6 +22,7 @@ env/
 
 # Local run artifacts
 results/*.npy
+results/*.npz
 results/system_run_*
 .ipynb_checkpoints/
 .pytest_cache/
@@ -31,7 +32,11 @@ results/system_run_*
 .vscode/
 .idea/
 
-# NOTE: calibration/personalizer.pkl IS committed (so the app starts instantly).
-# It is still fully reproducible -- if it is missing, or unloadable because
-# scikit-learn changed its pickle format, personalize.py retrains it on demand.
+# The personalizer is NOT committed: personalize.py trains it on demand from
+# simulations (~13 s) and caches it here.
 calibration/personalizer.pkl
+calibration/npe_posterior.pt
+
+# Outputs written by the test suite and validation scripts
+results/validation_report.md
+results/mvp_validation.png

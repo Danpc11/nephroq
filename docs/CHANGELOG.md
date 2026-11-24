@@ -2,6 +2,84 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 21 — full Bayesian personalization, and the injury rate now reaches the albuminuric term (v0.13.0)
+
+### P1 — the personal injury rate did not scale the albuminuric hazard
+Round 16 moved the albuminuric coefficient from `w_uacr` to `k_alb`, and the hazard now reads
+`k_alb`. `personalize.patient_params` kept scaling only `w_uacr`, so since Round 16 a patient's
+injury rate multiplied the hyperfiltration and metabolic terms but **not** the albuminuric one,
+which dominates in macroalbuminuric patients. `patient_params` now scales `k_alb` (and keeps
+`w_uacr` in step). A regression test checks that doubling the rate doubles `k_alb` and speeds
+decline in an albuminuria-dominated patient. Deployed-path validation after the fix (400 virtual
+patients, eGFR 5 years after the last visit): population 16.01; network 10.33 (−35 %);
+one-parameter least squares 11.27 (−30 %). The measurement-strategy experiment was re-run and its
+README table is unchanged to two decimals.
+
+### New — amortized neural posterior (`npe_posterior.py`, optional dependency)
+Full posterior over (`q`, log injury rate, true baseline eGFR) from an irregular history: GRU
+summary network over the visit sequence plus a conditional neural spline flow (zuko), trained by
+maximum likelihood on 200 000 simulated patients (val NLL 3.750; ~9 min on 2 CPU cores). The
+prior on `q` is widened to 0.8–3.5 so it covers the progressor regime found in Round 17
+(q ≈ 3.3). Forecasts are posterior-predictive: every draw, `q` included, is projected with the
+ODE.
+
+### New — exact reference and benchmark (`benchmark_posterior.py`)
+`grid_posterior` computes the exact posterior under the same prior and likelihood on a 3-D grid
+(57 024 points per patient). On 300 held-out virtual patients: NPE RMSE 8.91, 90 % coverage
+93 %, CRPS 4.09, 47 ms/patient; exact posterior 8.73, 95 %, 4.03, 910 ms; MLP ensemble 13.33
+with 18 % coverage (overconfident); least squares 10.60 (rate only) and 10.09 (rate + baseline
+eGFR); NPE with `q` fixed at the population value 12.07 with 68 % coverage. Outputs:
+`results/posterior_benchmark.md` and `.png`.
+
+### New — vectorized simulator (`fast_sim.py`)
+RK4 on log N for whole batches of patients, the only re-expression of the hazard outside
+`model_core`. Pinned by test to the LSODA reference (max disagreement 5e-4 mL/min/1.73 m²
+across the prior; < 0.01 enforced). 20 000 patients over 8 years in < 1 s.
+
+### Packaging
+`requirements-npe.txt` and the `npe` optional extra (torch, zuko); CI installs the CPU wheels so
+the NPE tests run; NPE tests skip cleanly when torch is absent. New modules listed in
+`pyproject.toml`. Trained weights (`calibration/npe_posterior.pt`) are git-ignored and
+reproducible with `python -c "import npe_posterior as n; n.train()"`.
+
+Suite: 155 tests (148 + 7 new).
+
+## Round 20 — the personalizer is validated as it runs, against a fair rival (v0.12.0)
+
+### P1 — the reported personalization gain measured a path the app does not use
+`validate()` forecast with the network's OWN `q` estimate, but `personalize()` projects with the
+POPULATION `q` and the inferred injury rate (Round 17: `q` is not identifiable per patient). The
+README's −43 % therefore described a configuration the app never runs. `validate()` now scores
+the deployed path; the own-`q` forecast is kept as a labelled diagnostic.
+
+### P2 — the classical rival was not the fair one
+The only classical baseline fitted BOTH `q` and the injury rate. Because `q` is not identifiable,
+that rival spends its noise budget on the wrong parameter and is easy to beat. The new
+`least_squares_scale_only()` solves exactly the deployed problem (injury rate, `q` at population
+value) and is now the headline comparator; the two-parameter fit is kept as a diagnostic.
+
+Result on 400 held-out virtual patients (each with its own true `q`), eGFR 5 years past the last
+visit: population 13.20; network as deployed 9.82 (−26 %); one-parameter least squares 10.08
+(−24 %); network with own `q` 9.19 (diagnostic); two-parameter least squares 11.15 (diagnostic).
+Personalization clearly earns its place; against the fair rival the network matches accuracy and
+is ~4× faster (0.9 vs 4.1 ms). README updated accordingly.
+
+### P3 — the CRIC compatibility flag answered a different question
+`within_observed_range` tested whether CRIC's observed POINT slope fell inside the model's
+predicted range, which spans only the proteinuria→UACR conversion and is very narrow, so it came
+back False for both phases even though both predicted ranges (Phase I −2.57 to −2.45; Phase III
+−3.17 to −2.99) lie inside the published plausible band (−3.5 to −1.9). The flag now means
+"predicted range inside the observed band"; the strict check is reported separately as
+`observed_in_predicted_range`. The README no longer calls the CRIC slope an unverified
+placeholder (it is the published AJKD 2020 value, `verified=True`).
+
+### Housekeeping
+Test-count references updated (148); stale comments about a committed `personalizer.pkl` fixed;
+files written by the test suite (`results/validation_report.md`, `results/mvp_validation.png`)
+are now git-ignored; version 0.12.0 in `pyproject.toml`, `CITATION.cff` and the provenance block.
+
+Suite: 148 tests green (145 + 3 new).
+
 ## Round 19 — two loader edge cases the Round 18 provenance fix missed
 
 A follow-up review found the CSV loader still violated the "age at the most recent visit"

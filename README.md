@@ -157,10 +157,11 @@ The headline output is the **injury rate**, not `q`:
 ### How it works
 
 A neural network solves the **inverse problem**: given a handful of noisy eGFR
-measurements, it infers the patient's personal injury rate and collapse exponent
-`q`. The **forward projection is still the mechanistic ODE** — the network never
-predicts the trajectory itself. This is a hybrid model, not a black box: its
-output is two physically meaningful numbers.
+measurements, it infers the patient's personal injury rate (and, as a diagnostic
+only, an estimate of `q`). The **forward projection is still the mechanistic
+ODE**, run with the **population `q`** and the patient's inferred injury rate — the
+network never predicts the trajectory itself. This is a hybrid model, not a black
+box: its output is a physically meaningful number.
 
 The estimator is trained **entirely on simulations from the mechanistic model**
 (*amortized / simulation-based inference*), so **no patient data is required to
@@ -182,17 +183,79 @@ python personalize.py              # validate the shipped estimator
 
 ### Does it earn its place?
 
-Validated on held-out virtual patients, forecasting eGFR **5 years past the last
-visit**:
+Validated on 400 held-out virtual patients, forecasting eGFR **5 years past the
+last visit**, with the personalizer **exactly as the app runs it** (population
+`q`, inferred injury rate). Each virtual patient carries its own true `q`, so
+fixing `q` at the population value is itself under test.
 
-| Method | Forecast RMSE | Speed |
+| Method | Forecast RMSE (mL/min/1.73 m²) | Speed per patient |
 |---|---|---|
-| Population parameters (no personalization) | 16.26 | — |
-| **Amortized network** | **9.24** (**−43 %**) | 1.3 ms |
-| Per-patient least-squares fit (classical) | 10.64 (−35 %) | 39 ms (30× slower) |
+| Population parameters (no personalization) | 16.01 | — |
+| **Amortized network (deployed)** | **10.33** (−35 %) | 0.9 ms |
+| Least squares, injury rate only (fair classical rival) | 11.27 (−30 %) | 4.4 ms |
 
-It beats both the population model and the classical per-patient optimizer, and
-it is fast enough to run on every keystroke.
+Personalization earns its place: about a third less forecast error than the
+population model. Against the fair classical rival — one-parameter least
+squares solving the same problem — the network is modestly more accurate and
+about 5× faster. Two diagnostic rows printed by `python personalize.py` show why
+the structural exponent is left at its population value in this path: a
+two-parameter least-squares fit that also chases `q` does worse (12.24), because
+`q` is not identifiable and fitting it spends the noise budget on the wrong
+parameter.
+
+What this deployed estimator does **not** give is honest uncertainty: its
+ensemble spread is far too narrow (see the next section). The full Bayesian
+personalizer below fixes that.
+
+### Full Bayesian personalization (research module)
+
+`src/npe_posterior.py` infers the patient's **full posterior** over the collapse
+exponent `q`, the log injury rate and the true (noise-free) baseline eGFR, by
+**amortized neural posterior estimation**: a GRU reads the visit sequence
+directly (any number of visits, any spacing), and a conditional neural spline
+flow returns the posterior. It is trained once on 200 000 virtual patients
+(~9 min on 2 CPU cores) and then answers in milliseconds. The forecast is the
+**posterior predictive**: every posterior draw, including the uncertain `q`, is
+projected with the mechanistic ODE. Nothing is fixed that the data cannot pin
+down; the unidentifiable exponent is integrated over instead.
+
+The benchmark (`python benchmark_posterior.py`) scores every method on 300
+held-out virtual patients (2–9 visits over 0.5–8 years, noise SD 6) against an
+**exact Bayesian posterior** computed by brute force on a 3-D grid under the same
+prior and likelihood:
+
+| Method | Forecast RMSE | 90 % interval coverage | CRPS | ms / patient |
+|---|---|---|---|---|
+| Population parameters | 20.52 | — | — | — |
+| MLP ensemble (current app) | 13.33 | **18 %** | 9.12 | 2.6 |
+| Least squares, rate only | 10.60 | — | — | 5.1 |
+| Least squares, rate + baseline eGFR | 10.09 | — | — | 137 |
+| **NPE (posterior predictive)** | **8.91** | **93 %** | **4.09** | 47 |
+| NPE with `q` fixed at population (ablation) | 12.07 | 68 % | 6.53 | — |
+| Exact posterior (grid reference) | 8.73 | 95 % | 4.03 | 910 |
+
+![Posterior benchmark](results/posterior_benchmark.png)
+
+Three results:
+
+1. **The neural posterior matches the exact one** in accuracy and calibration
+   (RMSE 8.91 vs 8.73; 90 % intervals cover 93 % vs 95 %) at ~1/19 of the cost.
+   Simulation-based calibration ranks (panels a–c) are close to uniform.
+2. **The current MLP ensemble is badly overconfident**: its nominal 90 %
+   intervals contain the truth 18 % of the time (panel d). Ensemble spread is not
+   a posterior.
+3. **Integrating over `q` beats fixing it.** Replacing the posterior draws of `q`
+   by the population value raises the error from 8.91 to 12.07 and drops the
+   90 % coverage to 68 %. `q` is weakly identified per patient (the data shrink
+   its prior variance by only 14–22 %), but the forecast still needs its
+   uncertainty.
+
+Honest limits of this module: it is trained on simulations of *this* model, so
+it inherits every assumption of the model; the SBC test for the log injury rate
+is borderline (p = 0.04), and the network contracts `q` slightly more than the
+exact posterior (22 % vs 14 %), so a larger training set or an ensemble of flows
+may be needed; and the app still uses the MLP ensemble until the module is wired
+in. Install with `pip install -r requirements-npe.txt`.
 
 ### Honest limits
 
@@ -457,7 +520,7 @@ evidence; all the weight is on DAPA-CKD:
 The run writes `results/insilico_trial_report.md`.
 
 ```bash
-python -m pytest tests -q      # 128 tests
+python -m pytest tests -q      # 155 tests
 ```
 
 ---
@@ -484,6 +547,9 @@ nephroq/
 │   ├── external_validation.py  # external cohorts (CRIC): population + patient-level
 │   │  # -- personalization & the digital twin --
 │   ├── personalize.py          # per-patient AI (amortized inference; personalizes s_i)
+│   ├── npe_posterior.py        # full Bayesian personalization (neural posterior, optional)
+│   ├── benchmark_posterior.py  # NPE vs exact posterior vs classical baselines
+│   ├── fast_sim.py             # vectorized copy of the hazard, for simulation-based inference
 │   ├── patient_state.py        # longitudinal PatientState / Visit (with provenance)
 │   ├── clinical_data.py        # load CSV/TSV → PatientState; missingness, quality flags
 │   ├── digital_twin.py         # continuous update: forecast → observe → re-personalize
@@ -492,7 +558,7 @@ nephroq/
 │   ├── uncertainty.py          # five-source predictive-uncertainty decomposition
 │   ├── clinical_outputs.py     # KDIGO risk probabilities, category times, referral flag
 │   └── clinical_safety.py      # when NOT to trust the twin (safety verdicts)
-├── tests/                      # 128 tests
+├── tests/                      # 155 tests
 ├── docs/
 │   ├── MODEL_DOCUMENTATION.md  # mathematical specification
 │   ├── TRIAL_DATA_PROVENANCE.md# every trial value, its source, verification status
@@ -500,12 +566,15 @@ nephroq/
 │   ├── MIMIC_COMPLIANCE.md     # data-handling rules
 │   ├── WEB_DEPLOYMENT.md       # free deployment
 │   └── CHANGELOG.md
-├── calibration/                # personalizer.pkl (shipped); your MIMIC JSON (git-ignored)
+├── calibration/                # cached estimators (trained on demand); your MIMIC JSON (git-ignored)
 └── docker/Dockerfile
 ```
 
 There is **one model**, in `model_core.py` — it is the only place with hazard
-mathematics. The app, the calibration scripts, the validation, and every
+mathematics, with one documented exception: `fast_sim.py` re-expresses the same
+hazard in vectorized form so that simulation-based inference can integrate
+hundreds of thousands of patients at once. A test pins it to `model_core`
+(maximum disagreement < 0.01 mL/min/1.73 m² across the prior). The app, the calibration scripts, the validation, and every
 digital-twin module call that same simulator; the twin layers orchestrate and hold
 data, they never re-implement the biology. That separation is what keeps each
 component testable and the whole system auditable.
@@ -519,9 +588,10 @@ Read before citing. These are not boilerplate.
 - **Not validated on a prospective clinical cohort.** Trial anchoring is
   aggregate-level; that is not patient-level external validation. External
   validation against CRIC is scaffolded (`external_validation.py`), but the
-  patient-level check is pending the individual-level trajectories, and the
-  population-level check currently uses an **unverified placeholder** for CRIC's
-  observed slope.
+  patient-level check is pending the individual-level trajectories. The
+  population-level check compares against CRIC's **published** diabetic-subgroup
+  slope (−2.7 mL/min/1.73 m²/yr, AJKD 2020); it locates CRIC relative to the
+  calibrated regime and is not a pass/fail validation of the twin.
 - **MIMIC-IV index dates.** The default is now a KDIGO-style *confirmed* index
   (`--index-strategy confirmed`): a baseline eGFR must still hold at ≥90 days, which
   excludes most acute presentations. This mitigates — but does not eliminate — the
@@ -545,7 +615,7 @@ the uncertainty band now decomposes five sources into a genuine predictive inter
 
 NephroQ is at **TRL 4** — components validated in a controlled setting: the
 integrated system runs, is calibrated on MIMIC-IV, passes a falsifiable in-silico
-trial replication, and is covered by 128 tests. It is **not** TRL 5: that requires
+trial replication, and is covered by 155 tests. It is **not** TRL 5: that requires
 validation on real data from the target population, which is exactly what the
 pending CRIC individual-level data (and, later, an IMSS-like cohort) would provide.
 Every calibration ships with a `research use — not prospectively validated` label.
