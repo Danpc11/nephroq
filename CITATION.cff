@@ -11,7 +11,7 @@ authors:
   - family-names: "Tovar-Romero"
     given-names: "Hugo Antonio"
     affiliation: "INMEGEN / UNAM, Facultad de Ciencias"
-version: "0.16.0"
+version: "0.16.1"
 date-released: 2026-11-24
 license: MIT
 repository-code: "https://github.com/Danpc11/nephroq"

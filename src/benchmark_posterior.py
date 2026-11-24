@@ -184,8 +184,10 @@ def summarize(df, ranks_npe, ranks_grid, hits):
 
     L = []
     L.append("# Per-patient inference benchmark\n")
+    lo, hi = npe.PRIOR_LO, npe.PRIOR_HI
     L.append(f"{len(df)} held-out virtual patients drawn from the NPE prior "
-             f"(q ~ U(0.8, 3.5); injury rate ~ log-U(0.25, 3); true baseline eGFR ~ U(20, 110)); "
+             f"(q ~ U({lo[0]:g}, {hi[0]:g}); injury rate ~ log-U({np.exp(lo[1]):.3g}, "
+             f"{np.exp(hi[1]):.3g}); true baseline eGFR ~ U({lo[2]:g}, {hi[2]:g})); "
              f"2-9 visits over 0.5-8 years; measurement noise SD {npe.NOISE_SD:g} mL/min/1.73 m2. "
              f"Target: latent eGFR {HORIZON:g} years after the last visit.\n")
     L.append("## Forecast\n")

@@ -226,39 +226,36 @@ prior and likelihood:
 
 | Method | Forecast RMSE | 90 % interval coverage | CRPS | ms / patient |
 |---|---|---|---|---|
-| Population parameters | 20.52 | — | — | — |
-| MLP ensemble (current app) | 13.33 | **18 %** | 9.12 | 2.6 |
-| Least squares, rate only | 10.60 | — | — | 5.1 |
-| Least squares, rate + baseline eGFR | 10.09 | — | — | 137 |
-| **NPE (posterior predictive)** | **8.91** | **93 %** | **4.09** | 47 |
-| NPE with `q` fixed at population (ablation) | 12.07 | 68 % | 6.53 | — |
-| Exact posterior (grid reference) | 8.73 | 95 % | 4.03 | 910 |
+| Population parameters | 24.87 | — | — | — |
+| MLP ensemble (current app) | 12.46 | **33 %** | 7.11 | 2.7 |
+| Least squares, rate only | 11.29 | — | — | 5.5 |
+| Least squares, rate + baseline eGFR | 10.39 | — | — | 172 |
+| **NPE (posterior predictive)** | **9.47** | **91 %** | **3.63** | 61 |
+| NPE with `q` fixed at population (ablation) | 11.87 | 83 % | 5.49 | — |
+| Exact posterior (grid reference) | 9.35 | 92 % | 3.59 | 962 |
 
 ![Posterior benchmark](results/posterior_benchmark.png)
 
 Three results:
 
 1. **The neural posterior matches the exact one** in accuracy and calibration
-   (RMSE 8.91 vs 8.73; 90 % intervals cover 93 % vs 95 %) at ~1/19 of the cost.
-   Simulation-based calibration ranks (panels a–c) are close to uniform.
+   (RMSE 9.47 vs 9.35; 90 % intervals cover 91 % vs 92 %) at ~1/16 of the cost.
+   Simulation-based calibration ranks (panels a–c) are consistent with uniform
+   (all SBC p ≥ 0.05).
 2. **The current MLP ensemble is badly overconfident**: its nominal 90 %
-   intervals contain the truth 18 % of the time (panel d). Ensemble spread is not
+   intervals contain the truth 33 % of the time (panel d). Ensemble spread is not
    a posterior.
 3. **Integrating over `q` beats fixing it.** Replacing the posterior draws of `q`
-   by the population value raises the error from 8.91 to 12.07 and drops the
-   90 % coverage to 68 %. `q` is weakly identified per patient (the data shrink
-   its prior variance by only 14–22 %), but the forecast still needs its
+   by the population value raises the error from 9.47 to 11.87 and drops the
+   90 % coverage to 83 %. `q` is weakly identified per patient (the data shrink
+   its prior variance by only 12–21 %), but the forecast still needs its
    uncertainty.
 
-The injury-rate box was widened from 3× to 6× in v0.16.0 (on MIMIC-IV the
-progressor regime pressed against the 3× ceiling); the table above was produced
-with the 3× box and is regenerated with `python benchmark_posterior.py`.
-
 Honest limits of this module: it is trained on simulations of *this* model, so
-it inherits every assumption of the model; the SBC test for the log injury rate
-is borderline (p = 0.04), and the network contracts `q` slightly more than the
-exact posterior (22 % vs 14 %), so a larger training set or an ensemble of flows
-may be needed; and the app still uses the MLP ensemble until the module is wired
+it inherits every assumption of the model; the network contracts `q` somewhat
+more than the exact posterior (21 % vs 12 %) and the SBC test for the baseline
+eGFR is at the threshold (p = 0.05), so a larger training set or an ensemble of
+flows may help; and the app still uses the MLP ensemble until the module is wired
 in. The fit to real patients is tested by the MIMIC-IV validation below. Install with `pip install -r requirements-npe.txt`.
 
 ### Patient-level validation on real trajectories (MIMIC-IV)
@@ -302,6 +299,38 @@ python validate_mimic_patients.py --cohort ../data/_mimic_cohort.tsv \
 It writes per-patient rows to `results/*.csv` (git-ignored; they must stay on
 that machine) and the **aggregate** report `results/mimic_patient_validation.md`
 and `.png`, which are the only outputs that may be shared.
+
+**Result** (MIMIC-IV 3.1; 8 672 training and 858 temporally held-out test
+patients; 1 261 held-out visits; full report in
+[`results/mimic_patient_validation.md`](results/mimic_patient_validation.md)):
+
+| Method | RMSE | MAE | 90 % coverage | CRPS | AUC, eGFR < 30 |
+|---|---|---|---|---|---|
+| Population parameters | 18.21 | 13.59 | — | — | — |
+| MLP ensemble (current app) | 16.42 | 12.14 | 70 % | 9.18 | 0.887 |
+| Least squares, rate only | 16.25 | 11.84 | — | — | — |
+| NPE, uniform prior | 16.86 | 12.26 | 80 % | 8.79 | 0.869 |
+| **NPE, retrained on the learned prior** | 15.34 | 10.85 | 79 % | 8.16 | 0.858 |
+| **Hybrid (NPE + residual correction)** | **14.24** | **10.25** | **86 %** | **7.45** | **0.891** |
+| Mixed-model slope (empirical Bayes) | 20.57 | 14.18 | 73 % | 10.80 | 0.851 |
+| Gradient boosting (trained on MIMIC) | 14.39 | 10.39 | 85 % | 7.56 | 0.889 |
+
+- The mechanistic posterior, which learns only a noise model and a 9-parameter
+  population prior from MIMIC, beats every classical per-patient method and the
+  current app (bootstrap ΔRMSE vs least squares +0.07 to +1.64; vs the MLP
+  ensemble +0.24 to +1.86), and removes the uniform prior's decline bias
+  (−5.37 → −0.15 mL/min/1.73 m²). It remains behind gradient boosting trained on
+  the same hospital (+0.39 to +1.60) and under-covers (79 %).
+- The **hybrid** matches gradient boosting in RMSE (−0.40 to +0.11) and is best
+  on MAE, CRPS, coverage and AUC, while every forecast still runs through the
+  mechanistic model.
+- The learned population prior has **two progression regimes**: 87 % of patients
+  with a median injury rate of 0.40× the trial-anchored population and 13 % at
+  4.23×. How the fast decline divides between a higher injury rate and a steeper
+  collapse exponent depends on the prior box and the noise model (with a 3×
+  ceiling and Gaussian noise the split appeared in `q`, 1.02 vs 2.93), so the
+  regimes are a robust finding while their attribution to `q` is not.
+- The 5-year horizon has only 39 held-out visits; its numbers are indicative.
 
 ### Honest limits
 

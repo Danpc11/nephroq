@@ -2,6 +2,27 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 25 — results of the two-stage, Student-t and hybrid run on MIMIC-IV (v0.16.1)
+
+Aggregate results committed in `results/mimic_patient_validation.md` and summarized in the README.
+Noise learned from 27 782 short-interval pairs: Student-t, scale 5.26, 3.3 df (SD 8.38) — heavy
+tails, as the acute spikes suggested. Pooled over 1 261 held-out visits (858 test patients):
+retrained NPE RMSE 15.34 (bias −0.15, 90 % coverage 79 %); hybrid 14.24 (coverage 86 %, CRPS
+7.45, AUC 0.891); gradient boosting 14.39 (85 %, 7.56, 0.889). Bootstrap ΔRMSE: hybrid vs NPE
+−1.66 to −0.57; hybrid vs GBM −0.40 to +0.11 (tie); NPE vs least squares +0.07 to +1.64 and vs
+the MLP ensemble +0.24 to +1.86 in favour of NPE; GBM vs NPE −1.60 to −0.39 in favour of GBM.
+Retraining on the prior and reweighting to it are equivalent here (−0.47 to +0.05).
+
+The learned prior again chose K = 2 (held-out log-lik/patient 0.225 vs 0.162), now as 87 % with
+median injury rate 0.40× (mean q 1.38) and 13 % at 4.23× (mean q 1.73, SD 0.59). With the
+injury rate free to exceed 3×, the fast regime moved from a high `q` to a high injury rate: the
+existence of two regimes is robust, their attribution to `q` is not, consistent with `q` being
+weakly identified. The README states it that way.
+
+Posterior benchmark regenerated with the 0.25–6× box: NPE 9.47 vs exact 9.35 RMSE, 91 % vs 92 %
+coverage, all SBC p ≥ 0.05; MLP ensemble 33 % coverage; `q` fixed 11.87 and 83 %. The benchmark
+header now reads the prior box from the code instead of a hard-coded string.
+
 ## Round 24 — two-stage empirical Bayes, heavy-tailed noise and a hybrid residual model (v0.16.0)
 
 ### What the v0.15.0 run on MIMIC-IV showed
