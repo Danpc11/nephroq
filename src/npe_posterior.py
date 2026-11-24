@@ -54,7 +54,9 @@ MODEL_PATH = os.path.join(HERE, "..", "calibration", "npe_posterior.pt")
 # ---- prior -------------------------------------------------------------------
 PARAM_NAMES = ("q", "log_scale", "egfr0")
 PRIOR_LO = np.array([0.8, np.log(0.25), 20.0])
-PRIOR_HI = np.array([3.5, np.log(3.0), 110.0])
+# injury rate up to 6x population: on MIMIC-IV the learned progressor regime sat
+# at 2.7x with its spread squeezed against a 3x ceiling (Round 24)
+PRIOR_HI = np.array([3.5, np.log(6.0), 110.0])
 Q_POP = float(core.TRIAL_CALIBRATION_V2["q"])
 
 # ---- observation model ---------------------------------------------------------
@@ -69,9 +71,23 @@ STATIC_FEATURES = 5
 # ==============================================================================
 # Simulation
 # ==============================================================================
-def sample_prior(n, rng):
-    """Draws theta = (q, log_scale, eGFR0) uniformly over the prior box."""
-    return rng.uniform(PRIOR_LO, PRIOR_HI, size=(n, 3))
+def sample_prior(n, rng, prior=None):
+    """Draws theta = (q, log_scale, eGFR0): uniform over the prior box, or, if a
+    `population_prior.PopulationPrior` is given, (q, log_scale) from it (eGFR0
+    stays uniform)."""
+    th = rng.uniform(PRIOR_LO, PRIOR_HI, size=(n, 3))
+    if prior is not None:
+        th[:, 0], th[:, 1] = prior.sample(n, rng)
+    return th
+
+
+def observation_noise(shape, rng, noise_sd=NOISE_SD, noise_df=None):
+    """Measurement noise: Gaussian with SD `noise_sd`, or, if `noise_df` is given,
+    Student-t with that many degrees of freedom and scale `noise_sd` (heavy tails
+    absorb acute spikes in hospital creatinine)."""
+    if noise_df is None:
+        return rng.normal(0.0, noise_sd, shape)
+    return noise_sd * rng.standard_t(noise_df, shape)
 
 
 def sample_covariates(n, rng):
@@ -99,24 +115,26 @@ def sample_schedules(n, rng, visits_range=VISITS_RANGE, span_range=SPAN_RANGE):
     return times, mask
 
 
-def simulate_histories(theta, a1c, uacr0, sbp, times, mask, rng, noise_sd=NOISE_SD):
+def simulate_histories(theta, a1c, uacr0, sbp, times, mask, rng, noise_sd=NOISE_SD,
+                       noise_df=None):
     """Noisy eGFR observations for each patient at its own visit times."""
     q, log_s, egfr0 = theta[:, 0], theta[:, 1], theta[:, 2]
     latent = fast_sim.simulate_egfr(q, np.exp(log_s), egfr0, a1c, uacr0, sbp, times)
-    obs = np.clip(latent + rng.normal(0.0, noise_sd, latent.shape), 3.0, None)
+    obs = np.clip(latent + observation_noise(latent.shape, rng, noise_sd, noise_df), 3.0, None)
     return np.where(mask, obs, 0.0)
 
 
-def simulate_dataset(n, seed=0, chunk=20000, noise_sd=NOISE_SD):
+def simulate_dataset(n, seed=0, chunk=20000, noise_sd=NOISE_SD, noise_df=None, prior=None):
     """Full training set: theta, covariates, schedules and noisy histories."""
     rng = np.random.default_rng(seed)
     out = {k: [] for k in ("theta", "a1c", "uacr0", "sbp", "times", "mask", "egfr")}
     for start in range(0, n, chunk):
         m = min(chunk, n - start)
-        th = sample_prior(m, rng)
+        th = sample_prior(m, rng, prior)
         a1c, uacr0, sbp = sample_covariates(m, rng)
         times, mask = sample_schedules(m, rng)
-        egfr = simulate_histories(th, a1c, uacr0, sbp, times, mask, rng, noise_sd=noise_sd)
+        egfr = simulate_histories(th, a1c, uacr0, sbp, times, mask, rng,
+                                  noise_sd=noise_sd, noise_df=noise_df)
         for k, v in zip(out, (th, a1c, uacr0, sbp, times, mask, egfr)):
             out[k].append(v)
     return {k: np.concatenate(v) for k, v in out.items()}
@@ -215,19 +233,29 @@ class TrainReport:
     seconds: float
 
 
-def model_path(noise_sd=NOISE_SD):
-    """Weights file for a given measurement-noise level (6 = the default)."""
-    if float(noise_sd) == NOISE_SD:
-        return MODEL_PATH
-    return MODEL_PATH.replace(".pt", f"_sd{float(noise_sd):g}.pt")
+def model_path(noise_sd=NOISE_SD, noise_df=None, tag=None):
+    """Weights file for a noise model (Gaussian SD 6 = the default file) and an
+    optional tag (e.g. the key of a learned population prior)."""
+    parts = []
+    if float(noise_sd) != NOISE_SD or noise_df is not None:
+        parts.append(f"sd{float(noise_sd):.3g}")
+    if noise_df is not None:
+        parts.append(f"t{float(noise_df):.3g}")
+    if tag:
+        parts.append(str(tag))
+    return MODEL_PATH if not parts else MODEL_PATH.replace(".pt", "_" + "_".join(parts) + ".pt")
 
 
 def train(n_train=200_000, epochs=40, batch=512, lr=1e-3, seed=0, save=True,
-          verbose=True, patience=None, noise_sd=NOISE_SD):
+          verbose=True, patience=None, noise_sd=NOISE_SD, noise_df=None, prior=None,
+          tag=None, path=None):
     """Simulate, then fit the summary network and flow jointly (maximum
     likelihood on the unbounded parameters). Early-stops on a held-out 5 %.
     `noise_sd` is the per-measurement eGFR noise the network is trained for;
-    match it to the data it will read (hospital creatinine is noisier).
+    match it to the data it will read (hospital creatinine is noisier);
+    `noise_df` switches to Student-t noise. `prior` (a PopulationPrior) trains the
+    network under a learned population prior instead of the uniform box -- the
+    second stage of the two-stage empirical-Bayes scheme.
 
     The one-cycle learning-rate schedule only anneals in its final third, where
     the validation loss reaches its best values; stopping during the high-rate
@@ -240,7 +268,7 @@ def train(n_train=200_000, epochs=40, batch=512, lr=1e-3, seed=0, save=True,
     t0 = time.perf_counter()
     if verbose:
         print(f"Simulating {n_train} virtual patients...")
-    d = simulate_dataset(n_train, seed=seed, noise_sd=noise_sd)
+    d = simulate_dataset(n_train, seed=seed, noise_sd=noise_sd, noise_df=noise_df, prior=prior)
     seq, lengths, static = encode(d["times"], d["egfr"], d["mask"],
                                   d["a1c"], d["uacr0"], d["sbp"])
     z = to_unbounded(d["theta"]).astype(np.float32)
@@ -282,26 +310,55 @@ def train(n_train=200_000, epochs=40, batch=512, lr=1e-3, seed=0, save=True,
     net.load_state_dict(best_state)
     net.eval()
     net.noise_sd = float(noise_sd)
+    net.noise_df = None if noise_df is None else float(noise_df)
+    net.prior = prior
     rep = TrainReport(n_train, ep + 1, best, time.perf_counter() - t0)
     if save:
-        path = model_path(noise_sd)
+        path = path or model_path(noise_sd, noise_df, tag)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save({"state": net.state_dict(), "report": rep.__dict__,
-                    "noise_sd": float(noise_sd)}, path)
+                    "noise_sd": float(noise_sd), "noise_df": net.noise_df,
+                    "box": [PRIOR_LO.tolist(), PRIOR_HI.tolist()],
+                    "prior": None if prior is None else prior.to_dict()}, path)
     if verbose:
         print(f"Trained in {rep.seconds:.0f} s (best val NLL {best:.4f})")
     return net, rep
 
 
-def load(path=None, noise_sd=NOISE_SD):
+def load(path=None, noise_sd=NOISE_SD, noise_df=None, tag=None):
+    """Loads trained weights. Refuses weights trained on a different prior box,
+    because the network's outputs live in that box's unbounded coordinates."""
     torch, _ = _torch()
-    path = model_path(noise_sd) if path is None else path
+    path = model_path(noise_sd, noise_df, tag) if path is None else path
     ck = torch.load(path, map_location="cpu", weights_only=False)
+    box = ck.get("box")
+    if box is None or not (np.allclose(box[0], PRIOR_LO) and np.allclose(box[1], PRIOR_HI)):
+        raise ValueError(f"{os.path.basename(path)} was trained on a different prior box; retrain")
     net = build_network()
     net.load_state_dict(ck["state"])
     net.eval()
     net.noise_sd = float(ck.get("noise_sd", NOISE_SD))
+    net.noise_df = ck.get("noise_df")
+    net.prior = None
+    if ck.get("prior") is not None:
+        import population_prior
+        net.prior = population_prior.PopulationPrior.from_dict(ck["prior"])
     return net
+
+
+def load_or_train(noise_sd=NOISE_SD, noise_df=None, prior=None, tag=None, save=True,
+                  verbose=True, **train_kw):
+    """Cached weights for this noise model and prior if they exist and match,
+    otherwise train (and cache) them."""
+    if prior is not None and tag is None:
+        tag = "pop" + prior.key()
+    if save:
+        try:
+            return load(noise_sd=noise_sd, noise_df=noise_df, tag=tag)
+        except Exception:
+            pass
+    return train(noise_sd=noise_sd, noise_df=noise_df, prior=prior, tag=tag, save=save,
+                 verbose=verbose, **train_kw)[0]
 
 
 # ==============================================================================

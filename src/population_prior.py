@@ -68,6 +68,33 @@ class PopulationPrior:
         """Log density over (q, log_s) on the prior box (eGFR0 stays uniform)."""
         return special.logsumexp(self.component_logpdf(q, log_s), axis=0)
 
+    def sample(self, n, rng):
+        """Draws (q, log_s) from the prior (used to train the stage-2 network)."""
+        k = rng.choice(len(self.weights), size=n, p=self.weights)
+        a, b = self.q_ab[k, 0], self.q_ab[k, 1]
+        q = Q_LO + (Q_HI - Q_LO) * rng.beta(a, b)
+        mu, sd = self.s_mu_sd[k, 0], self.s_mu_sd[k, 1]
+        ls = stats.truncnorm.rvs((S_LO - mu) / sd, (S_HI - mu) / sd, loc=mu, scale=sd,
+                                 random_state=rng)
+        return q, ls
+
+    def to_dict(self):
+        return dict(weights=self.weights.tolist(), q_ab=self.q_ab.tolist(),
+                    s_mu_sd=self.s_mu_sd.tolist(), box=[Q_LO, Q_HI, S_LO, S_HI])
+
+    @staticmethod
+    def from_dict(d):
+        return PopulationPrior(np.array(d["weights"]), np.array(d["q_ab"]),
+                               np.array(d["s_mu_sd"]))
+
+    def key(self):
+        """Short hash identifying the prior (names cached stage-2 weights)."""
+        import hashlib
+        import json
+        blob = json.dumps({k: np.round(np.asarray(v, float), 6).tolist()
+                           for k, v in self.to_dict().items()}, sort_keys=True)
+        return hashlib.sha256(blob.encode()).hexdigest()[:10]
+
     def summary(self):
         """Component means in natural units (shareable aggregate)."""
         rows = []

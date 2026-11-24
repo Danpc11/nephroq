@@ -250,6 +250,10 @@ Three results:
    its prior variance by only 14–22 %), but the forecast still needs its
    uncertainty.
 
+The injury-rate box was widened from 3× to 6× in v0.16.0 (on MIMIC-IV the
+progressor regime pressed against the 3× ceiling); the table above was produced
+with the 3× box and is regenerated with `python benchmark_posterior.py`.
+
 Honest limits of this module: it is trained on simulations of *this* model, so
 it inherits every assumption of the model; the SBC test for the log injury rate
 is borderline (p = 0.04), and the network contracts `q` slightly more than the
@@ -264,27 +268,35 @@ cohort built by `mimic_loader.py`: each eGFR series is thinned to one median
 value per 90 days, every method personalizes on the **first 2 years** after the
 confirmed index and nothing later, and held-out visits are scored at ~1, ~3 and
 ~5 years after the last observed visit (one visit per patient per horizon). The
-split is **temporal** (the most recent `anchor_year_group` is the test set) when
-`patients.csv.gz` is given. Eight methods are compared on the same visits: the
-population model, one-parameter least squares, the MLP ensemble, the NPE
-posterior predictive, the same NPE under a **population prior learned from the
-training patients** (`population_prior.py`: empirical Bayes over the NPE draws,
-applied by importance reweighting, no retraining), a per-patient OLS slope, an
-empirical-Bayes random-slope model and gradient boosting — the last two trained
-on the training patients. The mechanistic network itself is never fitted on
-MIMIC; only the 9-parameter population prior is. Scores: RMSE, MAE, bias,
-interval coverage and CRPS by horizon, AUC and Brier for eGFR < 30, and a
-patient-bootstrap CI for every RMSE difference against NPE.
+split is **temporal** (the most recent `anchor_year_group`s are the test set)
+when `patients.csv.gz` is given.
+
+Only the training patients are used to learn four things, in order: a
+**Student-t measurement-noise model** (from short-interval eGFR differences; it
+absorbs acute spikes), a **stage-1 neural posterior** under the uniform prior
+box, a **population prior** over (`q`, log injury rate) by empirical Bayes over
+the stage-1 draws (`population_prior.py`), and a **stage-2 neural posterior
+retrained on simulations from that prior**. The mechanistic network is never
+fitted to MIMIC trajectories; only the noise model and the population prior are
+estimated from them. On top, a **hybrid** adds a gradient-boosting correction
+learned on the residuals of the stage-2 forecast.
+
+Ten methods are compared on the same visits: population model, one-parameter
+least squares, the MLP ensemble, NPE under the uniform prior, NPE reweighted to
+the learned prior, NPE retrained on it, the hybrid, a per-patient OLS slope, an
+empirical-Bayes random-slope model and gradient boosting. Scores: RMSE, MAE,
+bias, interval coverage and CRPS by horizon, AUC and Brier for eGFR < 30, and
+patient-bootstrap CIs of every RMSE difference against the retrained NPE and
+against gradient boosting.
 
 Run it where MIMIC lives (credentialed access required; see
-`docs/MIMIC_COMPLIANCE.md`):
+`docs/MIMIC_COMPLIANCE.md`). Both networks are trained and cached on first use:
 
 ```bash
 cd src
 python mimic_loader.py --mimic-dir <mimic>/hosp --out ../data/_mimic_cohort.tsv
-python -c "import npe_posterior as n; n.train(noise_sd=8.7)"     # hospital noise
 python validate_mimic_patients.py --cohort ../data/_mimic_cohort.tsv \
-    --patients <mimic>/hosp/patients.csv.gz --noise-sd 8.7
+    --patients <mimic>/hosp/patients.csv.gz
 ```
 
 It writes per-patient rows to `results/*.csv` (git-ignored; they must stay on
@@ -554,7 +566,7 @@ evidence; all the weight is on DAPA-CKD:
 The run writes `results/insilico_trial_report.md`.
 
 ```bash
-python -m pytest tests -q      # 160 tests
+python -m pytest tests -q      # 162 tests
 ```
 
 ---
@@ -585,7 +597,7 @@ nephroq/
 │   ├── benchmark_posterior.py  # NPE vs exact posterior vs classical baselines
 │   ├── fast_sim.py             # vectorized copy of the hazard, for simulation-based inference
 │   ├── population_prior.py     # empirical-Bayes population prior over the NPE draws
-│   ├── validate_mimic_patients.py # patient-level validation on MIMIC-IV (8 methods)
+│   ├── validate_mimic_patients.py # patient-level validation on MIMIC-IV (10 methods)
 │   ├── patient_state.py        # longitudinal PatientState / Visit (with provenance)
 │   ├── clinical_data.py        # load CSV/TSV → PatientState; missingness, quality flags
 │   ├── digital_twin.py         # continuous update: forecast → observe → re-personalize
@@ -594,7 +606,7 @@ nephroq/
 │   ├── uncertainty.py          # five-source predictive-uncertainty decomposition
 │   ├── clinical_outputs.py     # KDIGO risk probabilities, category times, referral flag
 │   └── clinical_safety.py      # when NOT to trust the twin (safety verdicts)
-├── tests/                      # 160 tests
+├── tests/                      # 162 tests
 ├── docs/
 │   ├── MODEL_DOCUMENTATION.md  # mathematical specification
 │   ├── TRIAL_DATA_PROVENANCE.md# every trial value, its source, verification status
@@ -651,7 +663,7 @@ the uncertainty band now decomposes five sources into a genuine predictive inter
 
 NephroQ is at **TRL 4** — components validated in a controlled setting: the
 integrated system runs, is calibrated on MIMIC-IV, passes a falsifiable in-silico
-trial replication, and is covered by 160 tests. It is **not** TRL 5: that requires
+trial replication, and is covered by 162 tests. It is **not** TRL 5: that requires
 validation on real data from the target population, which is exactly what the
 pending CRIC individual-level data (and, later, an IMSS-like cohort) would provide.
 Every calibration ships with a `research use — not prospectively validated` label.

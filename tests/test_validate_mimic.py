@@ -43,15 +43,17 @@ def test_pipeline_runs_and_reports_only_aggregates(tmp_path):
     cohort, groups = _synthetic_cohort()
     pfile = tmp_path / "patients.csv.gz"
     groups.to_csv(pfile, index=False)
-    net, _ = npe.train(n_train=3000, epochs=1, save=False, verbose=False)
     mlp = pz.train(n_train=600, save=False)
-    df, tables, ev, ci, meta = vm.run(cohort, str(pfile), noise_sd=8.0, net=net, mlp=mlp,
-                                      n_boot=50, verbose=False)
+    df, tables, ev, ci, meta = vm.run(cohort, str(pfile), noise_model="t", mlp=mlp, n_boot=50,
+                                      verbose=False,
+                                      npe_kwargs=dict(n_train=3000, epochs=1, save=False))
     assert meta["split"].startswith("temporal")
     assert set(df.method) == set(vm.METHODS)
     for m in vm.METHODS:
         assert np.isfinite(tables["all"][m]["rmse"])
-    assert 0.0 <= tables["all"]["npe"]["cov90"] <= 1.0
+    assert 0.0 <= tables["all"]["npe_pop"]["cov90"] <= 1.0
+    assert set(ci) == {"npe_pop", "gbm"}
+    assert meta["noise"]["df"] is not None and meta["noise"]["scale"] > 0
     text = vm.report(tables, ev, ci, meta)
     assert "NPE" in text
     assert not any(f"p{i}" in text for i in range(80))   # no patient ids
@@ -85,3 +87,28 @@ def test_population_prior_recovers_two_regimes_from_posterior_draws():
     assert lo["q_mean"] < 1.5 < 2.6 < hi["q_mean"]
     w, ess = pp.reweight(draws[0], pr)
     assert w.sum() == pytest.approx(1.0) and 0.0 < ess <= 1.0
+
+
+def test_noise_model_recovers_a_known_student_t():
+    """The noise fit uses only short-interval differences in the observed window."""
+    rng = np.random.default_rng(4)
+    train = []
+    for _ in range(600):
+        t = np.sort(rng.uniform(0, 2, 8)); t[0] = 0.0
+        train.append(dict(t=t, e=60.0 + 5.0 * rng.standard_t(4, len(t))))
+    scale, df, n = vm.estimate_noise(train)
+    assert n > 500
+    assert scale == pytest.approx(5.0, rel=0.15)
+    assert 2.5 <= df <= 8.0
+
+
+def test_stage_two_network_is_trained_under_the_learned_prior():
+    import population_prior as pp
+    pr = pp.PopulationPrior(np.array([0.9, 0.1]), np.array([[3.0, 20.0], [15.0, 3.0]]),
+                            np.array([[-0.5, 0.3], [1.0, 0.3]]))
+    th = npe.sample_prior(4000, np.random.default_rng(0), pr)
+    assert th[:, 0].mean() < 1.6                      # mostly the low-q regime
+    assert np.all(th >= npe.PRIOR_LO) and np.all(th <= npe.PRIOR_HI)
+    net = npe.load_or_train(noise_sd=7.0, noise_df=4.0, prior=pr, save=False, verbose=False,
+                            n_train=2000, epochs=1)
+    assert net.prior is pr and net.noise_df == 4.0
