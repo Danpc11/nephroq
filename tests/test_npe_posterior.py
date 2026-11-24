@@ -48,3 +48,14 @@ def test_exact_grid_posterior_concentrates_on_the_truth_with_rich_data():
     mean = (w[:, None] * pts).sum(0)
     assert mean[1] == pytest.approx(ls, abs=0.15)
     assert mean[2] == pytest.approx(e0, abs=2.0)
+
+
+def test_weights_from_another_model_configuration_are_refused(tmp_path, monkeypatch):
+    """Audit P0.5: an artifact records the configuration hash it was trained on."""
+    import model_core as core
+    path = str(tmp_path / "w.pt")
+    npe.train(n_train=1500, epochs=1, save=True, verbose=False, path=path)
+    assert npe.load(path).sim_config_hash == core.config_hash()
+    monkeypatch.setattr(core, "config_hash", lambda p=None: "another-model")
+    with pytest.raises(ValueError):
+        npe.load(path)

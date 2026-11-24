@@ -99,7 +99,7 @@ def test_noise_model_recovers_a_known_student_t():
     scale, df, n = vm.estimate_noise(train)
     assert n > 500
     assert scale == pytest.approx(5.0, rel=0.15)
-    assert 2.5 <= df <= 8.0
+    assert df == pytest.approx(4.0, rel=0.35)
 
 
 def test_stage_two_network_is_trained_under_the_learned_prior():
@@ -112,3 +112,65 @@ def test_stage_two_network_is_trained_under_the_learned_prior():
     net = npe.load_or_train(noise_sd=7.0, noise_df=4.0, prior=pr, save=False, verbose=False,
                             n_train=2000, epochs=1)
     assert net.prior is pr and net.noise_df == 4.0
+
+
+def test_post_origin_data_cannot_change_anything_before_the_origin():
+    """Audit P0.4: rewrite every value after the forecast origin (eGFR and the
+    covariate columns) and the observed window, the covariates and the
+    eligibility must be identical, except the held-out targets themselves."""
+    cohort, _ = _synthetic_cohort(n=60, seed=9)
+    cohort["hba1c_imputed"] = False
+    late = cohort.time_years > vm.EARLY_YEARS
+    altered = cohort.copy()
+    altered.loc[late, "egfr"] = 5.0 + 100.0 * np.random.default_rng(0).uniform(size=late.sum())
+    for c in ("hba1c", "uacr", "sbp"):
+        altered.loc[late, c] = altered.loc[late, c] * 3.0
+    a, ea = vm.build_patients(cohort)
+    b, eb = vm.build_patients(altered)
+    assert [p["pid"] for p in a] == [p["pid"] for p in b] and ea == eb
+    pb = {p["pid"]: p for p in b}
+    for p in a:
+        if p["pid"] in pb:
+            q = pb[p["pid"]]
+            assert np.array_equal(p["t"], q["t"]) and np.array_equal(p["e"], q["e"])
+            for k in ("a1c", "uacr0", "sbp"):
+                assert p[k] == q[k] or (np.isnan(p[k]) and np.isnan(q[k]))
+
+
+def test_a_window_straddling_the_origin_does_not_leak():
+    """The case that leaked before cutting first: draws just before and just
+    after the origin fall in the same 90-day bin."""
+    t = np.array([0.0, 0.5, 1.0, 1.975, 1.98, 1.99, 2.2])
+    e = np.array([60.0, 60, 60, 50, 50, 20, 20])
+    rows = [dict(patient_id="x", time_years=a, egfr=b, hba1c=8.0, uacr=100.0, sbp=140.0)
+            for a, b in zip(t, e)]
+    rows += [dict(patient_id="x", time_years=3.2, egfr=40.0, hba1c=8.0, uacr=100.0, sbp=140.0)]
+    import pandas as pd
+    p0 = vm.build_patients(pd.DataFrame(rows))[0][0]
+    rows[6]["egfr"] = 999.0                     # the draw after the origin
+    p1 = vm.build_patients(pd.DataFrame(rows))[0][0]
+    assert np.array_equal(p0["e"], p1["e"])
+
+
+def test_covariates_are_imputed_with_training_medians_only():
+    train = [dict(a1c=7.0, uacr0=50.0, sbp=130.0), dict(a1c=9.0, uacr0=np.nan, sbp=150.0)]
+    test = [dict(a1c=np.nan, uacr0=np.nan, sbp=np.nan)]
+    med, n = vm.impute_covariates(train, test)
+    assert med["a1c"] == 8.0 and med["uacr0"] == 50.0 and med["sbp"] == 140.0
+    assert test[0]["a1c"] == 8.0 and n["uacr0"] == 2
+
+
+def test_prior_density_is_minus_infinity_outside_its_support_and_integrates_to_one():
+    """Audit P1.4."""
+    import population_prior as pp
+    pr = pp.PopulationPrior(np.array([0.7, 0.3]), np.array([[2.0, 9.0], [8.0, 2.5]]),
+                            np.array([[-0.6, 0.4], [1.0, 0.5]]))
+    assert np.isneginf(pr.logpdf(pp.Q_HI + 0.01, 0.0))
+    assert np.isneginf(pr.logpdf(1.5, pp.S_LO - 0.01))
+    assert np.isneginf(pr.logpdf(np.nan, 0.0))
+    q = np.linspace(pp.Q_LO, pp.Q_HI, 801)
+    s = np.linspace(pp.S_LO, pp.S_HI, 801)
+    Q, S = np.meshgrid(q, s, indexing="ij")
+    trap = getattr(np, "trapezoid", None) or np.trapz
+    mass = trap(trap(np.exp(pr.logpdf(Q, S)), s, axis=1), q)
+    assert mass == pytest.approx(1.0, abs=5e-3)

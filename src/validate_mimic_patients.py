@@ -93,58 +93,119 @@ LABELS = {"population": "Population parameters", "ls_rate": "Least squares, rate
 # ==============================================================================
 # Cohort -> per-patient early window and held-out visits
 # ==============================================================================
-def _first_valid(g, cols):
-    for c in cols:
-        if c in g and g[c].notna().any():
-            return float(g[c].dropna().iloc[0])
+COVARIATES = {"a1c": ("hba1c", "hba1c_baseline_strict", "hba1c_imputed"),
+              "uacr0": ("uacr", "uacr_baseline_strict", "uacr_imputed"),
+              "sbp": ("sbp", "sbp_baseline_strict", "sbp_imputed")}
+
+
+def _baseline_covariate(g_early, col, strict_col, imputed_col):
+    """
+    Baseline covariate from the OBSERVED WINDOW ONLY (audit P0.4): the strict,
+    backward-only value at the index if the loader recorded one; otherwise the
+    first row's value unless the loader imputed it (its imputation used the whole
+    cohort, test patients included). Returns NaN when neither exists; NaNs are
+    imputed later with TRAINING medians only.
+    """
+    if strict_col in g_early and g_early[strict_col].notna().any():
+        return float(g_early[strict_col].dropna().iloc[0])
+    if col in g_early and len(g_early):
+        row = g_early.iloc[0]
+        imputed = bool(row.get(imputed_col, False)) if imputed_col in g_early else False
+        if not imputed and np.isfinite(row[col]):
+            return float(row[col])
     return np.nan
 
 
 def thin(t, e, window_days=WINDOW_DAYS):
     """One value per window: the median time and the median eGFR of the draws in it."""
+    if len(t) == 0:
+        return np.asarray(t, float), np.asarray(e, float)
     b = np.floor(np.asarray(t) * 365.25 / window_days).astype(int)
     df = pd.DataFrame(dict(b=b, t=t, e=e)).groupby("b").median()
     return df.t.to_numpy(), df.e.to_numpy()
 
 
+def _index_confirmed_in_window(t, e, confirm_days=90, max_recovery=0.30):
+    """KDIGO-style confirmation of the index eGFR using ONLY the observed window:
+    a later value at >= 90 days must not have recovered by more than 30 %. The
+    loader may have confirmed the index with a value from after the forecast
+    origin; this re-check makes the cohort definition use only data available
+    at the origin."""
+    later = np.flatnonzero(t - t[0] >= confirm_days / 365.25)
+    if later.size == 0:
+        return False
+    j = later[0]
+    return bool((e[j] - e[0]) / e[0] <= max_recovery)
+
+
 def build_patients(cohort, early_years=EARLY_YEARS, window_days=WINDOW_DAYS):
     """
     Returns a list of dicts, one per eligible patient, and a dict of exclusion
-    counts. Eligible: >= 3 thinned visits spanning >= 0.75 y inside the early
-    window, >= 1 held-out visit inside a scoring horizon, and a first eGFR inside
-    the model's validated range (20-110).
+    counts.
+
+    Temporal integrity (audit P0.4): each trajectory is CUT at the forecast
+    origin (EARLY_YEARS after the index) BEFORE anything is computed, and the two
+    sides are thinned separately, so no observed-window value can contain a draw
+    from after the origin. The index confirmation and every covariate use the
+    observed window only. Changing or deleting any data after the origin leaves
+    the observed window, the covariates and every prediction unchanged
+    (tests/test_validate_mimic.py).
+
+    Eligible: index confirmable within the window, >= 3 thinned visits spanning
+    >= 0.75 y inside it, >= 1 held-out visit inside a scoring horizon, and a first
+    eGFR inside the model's validated range (20-110).
     """
-    out, excl = [], dict(too_few_early=0, no_future=0, egfr0_out_of_domain=0)
+    out = []
+    excl = dict(index_not_confirmed_in_window=0, too_few_early=0, no_future=0,
+                egfr0_out_of_domain=0)
     for pid, g in cohort.groupby("patient_id", sort=False):
         g = g.sort_values("time_years")
-        t, e = thin(g.time_years.to_numpy(float), g.egfr.to_numpy(float), window_days)
-        early = t <= early_years
-        te, ee = t[early], e[early]
+        tt = g.time_years.to_numpy(float)
+        g_early, g_fut = g[tt <= early_years], g[tt > early_years]
+        te_raw, ee_raw = g_early.time_years.to_numpy(float), g_early.egfr.to_numpy(float)
+        if len(te_raw) == 0 or not _index_confirmed_in_window(te_raw, ee_raw):
+            excl["index_not_confirmed_in_window"] += 1
+            continue
+        te, ee = thin(te_raw, ee_raw, window_days)
         if len(te) < pz.MIN_VISITS or te[-1] - te[0] < pz.MIN_SPAN_YEARS:
             excl["too_few_early"] += 1
             continue
         if not (npe.PRIOR_LO[2] <= ee[0] <= npe.PRIOR_HI[2]):
             excl["egfr0_out_of_domain"] += 1
             continue
-        te, t_fut, e_fut = te - te[0], t[~early] - t[early][0], e[~early]
+        tf, ef = thin(g_fut.time_years.to_numpy(float), g_fut.egfr.to_numpy(float), window_days)
+        t0 = te[0]
+        te, tf = te - t0, tf - t0
         picks = {}
         for h, (lo, hi, centre) in HORIZONS.items():
-            dt = t_fut - te[-1]
+            dt = tf - te[-1]
             ok = (dt > lo) & (dt <= hi)
             if ok.any():
                 j = np.flatnonzero(ok)[np.argmin(np.abs(dt[ok] - centre))]
-                picks[h] = (float(t_fut[j]), float(e_fut[j]))
+                picks[h] = (float(tf[j]), float(ef[j]))
         if not picks:
             excl["no_future"] += 1
             continue
-        cov = dict(
-            a1c=_first_valid(g, ["hba1c_baseline_strict", "hba1c"]),
-            uacr0=_first_valid(g, ["uacr_baseline_strict", "uacr"]),
-            sbp=_first_valid(g, ["sbp_baseline_strict", "sbp"]))
-        for k, (lo, hi) in COV_RANGES.items():
-            cov[k] = float(np.clip(cov[k] if np.isfinite(cov[k]) else np.median([lo, hi]), lo, hi))
+        cov = {k: _baseline_covariate(g_early, *cols) for k, cols in COVARIATES.items()}
         out.append(dict(pid=str(pid), t=te, e=ee, future=picks, **cov))
     return out, excl
+
+
+def impute_covariates(train, test):
+    """Fill missing covariates with medians of the TRAINING patients' observed
+    values, then clip to the model's covariate ranges. Returns the medians and the
+    number of values imputed per covariate (train + test)."""
+    med, n_imp = {}, {}
+    for k, (lo, hi) in COV_RANGES.items():
+        vals = np.array([p[k] for p in train if np.isfinite(p[k])])
+        med[k] = float(np.median(vals)) if len(vals) else float(np.median([lo, hi]))
+        n_imp[k] = 0
+        for p in train + test:
+            if not np.isfinite(p[k]):
+                p[k] = med[k]
+                n_imp[k] += 1
+            p[k] = float(np.clip(p[k], lo, hi))
+    return med, n_imp
 
 
 def split_patients(patients, patients_csv=None, seed=0, test_frac=0.3):
@@ -169,21 +230,43 @@ def split_patients(patients, patients_csv=None, seed=0, test_frac=0.3):
 # ==============================================================================
 # Learned from the TRAINING patients
 # ==============================================================================
-def estimate_noise(train, max_gap=0.5):
+def estimate_noise(train, max_gap=0.5, n_sim=100_000, seed=0):
     """
     Student-t measurement-noise model from consecutive thinned values less than
     `max_gap` years apart in the training patients' observed windows. Over such
     short gaps true decline is ~1 mL/min, so the difference of two values is
-    essentially the difference of two noise terms; dividing by sqrt(2) gives the
-    per-measurement noise. Returns (scale, df, n_pairs).
+    essentially the difference of two independent noise terms.
+
+    The difference of two Student-t variables is NOT Student-t (audit P1.6), so
+    the parameters are fitted by matching the empirical quantiles of the
+    differences to those of simulated differences sigma*(t1 - t2), t_i ~ t(nu),
+    with common random numbers (fixed uniforms through the t quantile function),
+    which makes the objective smooth. Returns (scale, df, n_pairs).
     """
+    from scipy import optimize
     d = []
     for p in train:
         dt, de = np.diff(p["t"]), np.diff(p["e"])
         d.extend(de[dt <= max_gap])
-    d = np.asarray(d) / np.sqrt(2.0)
-    df, _, scale = stats.t.fit(d, floc=0.0)
-    return float(scale), float(np.clip(df, 2.5, 30.0)), int(len(d))
+    d = np.asarray(d, float)
+    levels = np.concatenate([[0.005, 0.01, 0.025], np.linspace(0.05, 0.95, 19),
+                             [0.975, 0.99, 0.995]])
+    emp = np.quantile(d, levels)
+    rng = np.random.default_rng(seed)
+    u1, u2 = rng.uniform(1e-6, 1 - 1e-6, (2, n_sim))
+    w = 1.0 / np.maximum(np.abs(emp), 1.0)            # relative fit across the range
+
+    def loss(x):
+        sigma, nu = np.exp(x[0]), 2.05 + np.exp(x[1])
+        sim = sigma * (stats.t.ppf(u1, nu) - stats.t.ppf(u2, nu))
+        return float(np.sum((w * (np.quantile(sim, levels) - emp)) ** 2))
+
+    # start from the moment-based guess under a Gaussian
+    x0 = [np.log(max(np.std(d) / np.sqrt(2.0), 1e-3)), np.log(5.0)]
+    res = optimize.minimize(loss, x0, method="Nelder-Mead",
+                            options=dict(xatol=1e-3, fatol=1e-6, maxiter=400))
+    scale, df = float(np.exp(res.x[0])), float(2.05 + np.exp(res.x[1]))
+    return scale, float(np.clip(df, 2.5, 30.0)), int(len(d))
 
 
 def _noise_sd_equivalent(scale, df):
@@ -459,6 +542,68 @@ def summarize(df, n_boot=1000, seed=0):
     return tables, ev, ci
 
 
+def _weights_hash(net):
+    import hashlib
+    h = hashlib.sha256()
+    for k, v in sorted(net.state_dict().items()):
+        h.update(k.encode()); h.update(v.detach().cpu().numpy().tobytes())
+    return h.hexdigest()[:12]
+
+
+def provenance(cohort, nets, seed):
+    """What is needed to trace every number in the report (audit P0.6/P1.11)."""
+    import subprocess
+    import sys
+    import platform
+    def git(*args):
+        try:
+            return subprocess.run(["git", *args], cwd=HERE, capture_output=True, text=True,
+                                  timeout=10).stdout.strip()
+        except Exception:
+            return ""
+    sha = git("rev-parse", "HEAD") or "unknown"
+    dirty = bool(git("status", "--porcelain", "--untracked-files=no"))
+    cohort_hash = hex(int(pd.util.hash_pandas_object(cohort, index=False).sum()) & (2**64 - 1))
+    import sklearn
+    import torch
+    return dict(commit=sha[:12] + (" (uncommitted changes)" if dirty else ""),
+                version=_project_version(), cohort_hash=cohort_hash,
+                sim_config_hash=npe.core.config_hash(), seed=seed,
+                weights={k: _weights_hash(v) for k, v in nets.items()},
+                python=platform.python_version(), numpy=np.__version__,
+                sklearn=sklearn.__version__, torch=torch.__version__)
+
+
+def _project_version():
+    try:
+        import re
+        txt = open(os.path.join(HERE, "..", "pyproject.toml"), encoding="utf8").read()
+        return re.search(r'^version\s*=\s*"([^"]+)"', txt, re.M).group(1)
+    except Exception:
+        return "unknown"
+
+
+def selection_table(cohort, patients):
+    """Included vs excluded patients at the index (aggregate; audit P1.5)."""
+    inc = {p["pid"] for p in patients}
+    first = cohort.sort_values("time_years").groupby("patient_id").first()
+    span = cohort.groupby("patient_id").time_years.max()
+    first["included"] = first.index.astype(str).isin(inc)
+    first["follow_up"] = span
+    rows = []
+    for flag, name in [(True, "Included"), (False, "Excluded")]:
+        d = first[first.included == flag]
+        r = dict(group=name, n=len(d),
+                 follow_up=float(d.follow_up.median()) if len(d) else np.nan,
+                 egfr=float(d.egfr.median()) if len(d) else np.nan)
+        if "age_at_index" in d:
+            r["age"] = float(d.age_at_index.mean())
+        if "sex" in d:
+            r["female"] = float((d.sex == "F").mean())
+        rows.append(r)
+    return rows
+
+
 def report(tables, ev, ci, meta):
     L = ["# Patient-level validation on MIMIC-IV\n"]
     L.append(f"Cohort: {meta['n_cohort']} patients in the loader output; eligible "
@@ -466,6 +611,21 @@ def report(tables, ev, ci, meta):
              f"{meta['n_train']} training and {meta['n_test']} test patients. eGFR thinned "
              f"to one median value per {WINDOW_DAYS} days; observed window = first "
              f"{EARLY_YEARS:g} years after the confirmed index.\n")
+    sel = meta.get("selection")
+    if sel:
+        L.append("## Cohort selection\n")
+        L.append(f"Exclusions in order of application: {meta['excl']}. Covariates come "
+                 f"from the observed window only; values missing there or imputed by the "
+                 f"loader were replaced by training-patient medians "
+                 f"({ {k: round(v, 2) for k, v in meta['cov_medians'].items()} }; "
+                 f"values imputed: {meta['n_imputed']}).\n")
+        L.append("| Group | Patients | Mean age at index | Female | Median first eGFR | Median follow-up (y) |")
+        L.append("|---|---|---|---|---|---|")
+        for r in sel:
+            age = f"{r['age']:.1f}" if "age" in r else "—"
+            fem = f"{100 * r['female']:.0f} %" if "female" in r else "—"
+            L.append(f"| {r['group']} | {r['n']} | {age} | {fem} | {r['egfr']:.1f} | {r['follow_up']:.1f} |")
+        L.append("")
     nz = meta["noise"]
     if nz.get("df") is not None:
         L.append(f"Measurement-noise model learned from the training patients "
@@ -511,6 +671,13 @@ def report(tables, ev, ci, meta):
         for k, c in enumerate(pr["components"]):
             L.append(f"| {k + 1} | {c['weight']:.2f} | {c['q_mean']:.2f} | {c['q_sd']:.2f} | "
                      f"{c['rate_median']:.2f}× | {c['log_rate_sd']:.2f} |")
+    pv = meta.get("provenance")
+    if pv:
+        L.append("\n## Provenance\n")
+        L.append(f"NephroQ {pv['version']}, commit {pv['commit']}; model configuration hash "
+                 f"{pv['sim_config_hash']}; cohort content hash {pv['cohort_hash']}; seed "
+                 f"{pv['seed']}; network weights {pv['weights']}; Python {pv['python']}, "
+                 f"numpy {pv['numpy']}, scikit-learn {pv['sklearn']}, torch {pv['torch']}.")
     return "\n".join(L) + "\n"
 
 
@@ -563,9 +730,10 @@ def run(cohort, patients_csv=None, noise_model="t", noise_sd=8.7, mlp=None, seed
     is_test, split = split_patients(patients, patients_csv, seed=seed)
     train = [p for p, z in zip(patients, is_test) if not z]
     test = [p for p, z in zip(patients, is_test) if z]
+    cov_medians, n_imputed = impute_covariates(train, test)
     if verbose:
         print(f"{len(patients)} eligible patients; split {split}: "
-              f"{len(train)} train / {len(test)} test")
+              f"{len(train)} train / {len(test)} test; imputed (train medians) {n_imputed}")
 
     if noise_model == "t":
         scale, df_, n_pairs = estimate_noise(train)
@@ -593,12 +761,15 @@ def run(cohort, patients_csv=None, noise_model="t", noise_sd=8.7, mlp=None, seed
     tables, ev, ci = summarize(df, n_boot=n_boot, seed=seed)
     meta = dict(n_cohort=int(cohort.patient_id.nunique()), n_eligible=len(patients),
                 excl=excl, split=split, n_train=len(train), n_test=len(test),
+                cov_medians=cov_medians, n_imputed=n_imputed,
                 noise=dict(scale=scale, df=df_, sd=_noise_sd_equivalent(scale, df_),
                            n_pairs=n_pairs),
                 prior=dict(K=prior.extra["K"], components=prior.summary(),
                            heldout={k: round(v, 3) for k, v in
                                     prior.extra["heldout_loglik_per_patient"].items()}),
-                ess=float(df.loc[df.method == "npe_eb", "ess"].mean()))
+                ess=float(df.loc[df.method == "npe_eb", "ess"].mean()),
+                selection=selection_table(cohort, patients),
+                provenance=provenance(cohort, nets, seed))
     return df, tables, ev, ci, meta
 
 
@@ -611,11 +782,15 @@ if __name__ == "__main__":
     ap.add_argument("--n-boot", type=int, default=1000)
     ap.add_argument("--out-dir", default=None,
                     help="output directory (default: $NEPHROQ_OUT_DIR, else results/)")
+    ap.add_argument("--quick", action="store_true",
+                    help="small networks and bootstrap, for CI smoke runs on synthetic data")
     a = ap.parse_args()
     RESULTS = outputs.results_dir(a.out_dir)
     print(f"Writing outputs to {RESULTS}")
     cohort = pd.read_csv(a.cohort, sep=None, engine="python", dtype={"patient_id": str})
-    df, tables, ev, ci, meta = run(cohort, a.patients, a.noise_model, a.noise_sd, n_boot=a.n_boot)
+    kw = dict(npe_kwargs=dict(n_train=6000, epochs=2, save=False), n_boot=100) if a.quick \
+        else dict(n_boot=a.n_boot)
+    df, tables, ev, ci, meta = run(cohort, a.patients, a.noise_model, a.noise_sd, **kw)
     df.to_csv(os.path.join(RESULTS, "mimic_patient_validation_rows.csv"), index=False)  # never share
     text = report(tables, ev, ci, meta)
     with open(os.path.join(RESULTS, "mimic_patient_validation.md"), "w", encoding="utf8") as f:

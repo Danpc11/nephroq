@@ -41,17 +41,25 @@ nephron loss is treated as irreversible. The observable is eGFR, a compressed fu
 ### 2.1 State variable and observable
 
 ```
-N(t) ∈ (0, 1]           surviving nephron mass fraction (latent)
+N(t) ∈ (0, 1]           effective functional capacity (latent index)
 eGFR(t) = G_max · N^α    observable
 ```
+
+`N` is an **effective functional-capacity index** derived from eGFR, not a count of
+nephrons: it is defined through the observation map above and nothing else in the model
+measures nephron number.
 
 with `G_max = 120` mL/min/1.73m² (filtration of an intact kidney) and `α = 0.80`. Because
 `α < 1`, eGFR is a *weak* power of `N`: filtration is buffered while reserve remains and
 falls off only as `N` gets small. The dialysis threshold `eGFR < 15` corresponds to
 `N < (15/120)^(1/0.8) ≈ 0.074`.
 
-The inverse maps are `N_of_egfr` and `egfr_of_N`; `N_of_egfr` saturates at `N = 1` for
-eGFR ≥ ~120.
+The inverse maps are `N_of_egfr` and `egfr_of_N`. **Domain.** `N_of_egfr` maps any eGFR
+above `G_max = 120` to `N = 1`: supranormal filtration (including early diabetic
+hyperfiltration) is *not* represented and such values are truncated. The model's domain is
+therefore eGFR ≤ 120; `model_core.egfr_domain_flags` reports values outside it, the
+personalizer warns when it receives them, and the MIMIC-IV validation excludes first values
+outside 20–110.
 
 ### 2.2 The hazard (the core of the model)
 
@@ -71,8 +79,17 @@ h = k0
   + w_A1c·(HbA1c − 6.5)+ + w_SBP·(SBP − 130)+/10      metabolic residual
 ```
 
-where `s = N_ref/N = 1/N` is the per-nephron overload (larger as `N` falls), and `(x)+`
-denotes `max(x, 0)`.
+where `s = 1/N` is a **per-unit load index** (larger as `N` falls), and `(x)+` denotes
+`max(x, 0)`.
+
+**Load convention (audit P0.1).** If filtration is `G = G_max N^α`, the filtration per unit
+of capacity is `G/N ∝ N^(α−1)`, not `1/N`. The two choices are the *same model*: writing the
+hazard with `s' = N^(α−1) = s^(1−α)` and constants `q' = q/(1−α)`, `S_SAT' = S_SAT^(1−α)`,
+`β' = β/(1−α)` reproduces every term exactly (`k_hf · s^q/(1+(s/S_SAT)^q)` and
+`(s/s_0)^β` are invariant; verified numerically to 1e-15 in `tests/test_model_dynamics.py`).
+No recalibration is needed, but the **numerical value of `q` depends on the convention**:
+`q = 1.52` with `s = 1/N` is `q' = 7.6` with the physical per-unit filtration load. This is
+one more reason not to read `q` as a biological constant.
 
 **The structural term is *saturating*, not an unbounded power law.** An earlier version
 used `k_hf · s^q`, which diverges as `N → 0` and drove untreated patients to dialysis far
@@ -82,10 +99,10 @@ too fast (it failed the in-silico trials). The current form
 Physiologically this is a ceiling on how much a single surviving nephron can
 hyperfiltrate; clinically, eGFR ~44 is where stage 3b decline is known to steepen.
 
-**`q` is the collapse exponent** — it controls how *sharp* the transition is, not where it
-sits (`S_SAT` sets the location). As `q` grows, the structural term goes from a gentle
-gradient toward a near-step. This is the model's most scientifically interesting parameter,
-and its value differs sharply between populations (see §4).
+**`q` is the feedback exponent**: the elasticity of the structural hazard to the load index
+before saturation (`S_SAT` sets where saturation begins). It does **not** by itself make the
+decline accelerate, and nothing in the model collapses: §2.6 derives exactly when the decline
+accelerates, and with the trial calibration (`q = 1.52`) it never does.
 
 **The albuminuric term is separate** (Round 16). It was previously buried inside the
 metabolic block as `w_UACR·log(1+UACR/30)`, which meant it was calibrated on cohorts that
@@ -126,13 +143,51 @@ the ODE solver cannot blow up while an optimizer explores an absurd corner of pa
 space, and it should never bind for a plausible patient. If it binds, the parameters are
 wrong, not the patient.
 
+### 2.6 Dynamics: when does the decline accelerate? (audit P0.3)
+
+For fixed covariates and `h = h(G)`, with `G = G_max N^α` and `N' = −N h`:
+
+```
+G'  = −α G h
+G'' =  α² G h (h + G ∂h/∂G) = α² G h² (1 + ε),        ε = ∂ ln h / ∂ ln G
+```
+
+(time-varying covariates add `−α G ∂h/∂t`). So the decline **accelerates** (`|G'|` grows)
+exactly where `ε < −1` and decelerates where `ε > −1`. With `∂ ln s/∂ ln G = −1/α`, only
+the structural and albuminuric terms contribute:
+
+```
+ε = −(1/α) · [ hf · q / (1 + (s/S_SAT)^q)  +  k_alb · β · (U/30)/(1 + U/30) ] / h
+```
+
+`model_core.hazard_elasticity` computes `ε`; `src/dynamics_regimes.py` maps it
+(`results/dynamics_regimes.png`). With HbA1c 8 %
+and SBP 140 mmHg:
+
+| UACR (mg/g) | Smallest `q` with any acceleration | Accelerating eGFR range at `q = 1.52` | at `q = 2.9` |
+|---|---|---|---|
+| 30 | 2.05 | none | 36–110 |
+| 300 | 2.30 | none | 37–101 |
+| 1500 | 2.45 | none | 38–89 |
+
+Consequences, stated so they are not over-read:
+
+- With the trial calibration the eGFR decline **decelerates at every eGFR**.
+- Acceleration needs `q` above ~2–2.5, and then only **above** eGFR ≈ 36–40; below the
+  saturation point the structural elasticity vanishes and the decline decelerates in every
+  case. There is **no terminal collapse, no bifurcation and no finite-time singularity**:
+  every term is bounded (saturation, logarithm, `HAZARD_CAP`).
+- Phrases such as "collapse exponent", "near-step" or "terminal collapse" used in earlier
+  versions of this document described the shape of `s^q` alone, not the dynamics of eGFR, and
+  are withdrawn.
+
 ### 2.5 The default (trial-anchored) parameter set
 
 `TRIAL_CALIBRATION_V2` in `model_core.py`, the calibration the app ships with:
 
 | Parameter | Value | Meaning |
 |---|---|---|
-| `q` | 1.52 | collapse exponent (trials) |
+| `q` | 1.52 | feedback exponent (trials) |
 | `k_hf` | 0.01029 | structural hazard scale |
 | `k_alb` | 0.01314 | albuminuric hazard scale |
 | `w_a1c` | 0.01051 | HbA1c insult weight |
@@ -174,16 +229,18 @@ chronic slope difference lands inside the published CI (2.26, 95% CI 1.88–2.64
 ## 4. Two populations, one hazard — the central empirical finding
 
 Calibrating independently on hospital records and on trial placebo arms revealed that they
-do not share a collapse exponent:
+do not share a feedback exponent:
 
 | Population | Median UACR | `q` | Shape of decline |
 |---|---|---|---|
 | Trial placebo arms (macroalbuminuric) | ~927 | 1.52 | early, albuminuria-driven progression |
-| MIMIC-IV (T2D, near-normoalbuminuric) | ~23 | **2.92** (k-fold CV 3%) | late, abrupt structural collapse below eGFR ~44 |
+| MIMIC-IV (T2D, near-normoalbuminuric) | ~23 | **2.92** (k-fold CV 3%) | structural; accelerates between eGFR ~36 and ~110, decelerates below (§2.6) |
 
 This is not a calibration artifact. `q ≈ 2.92` is identified (stable across CV folds, and it
-does **not** run to the bound when `--q-max` is widened to 8). A single-regime hazard cannot
-place its collapse "step" in two locations at once, which is why the Round 15 hybrid
+does **not** run to the bound when `--q-max` is widened to 8) *at the population level*;
+per patient it is weakly identified (§5.2, and the NPE contraction of 12–21 %), and its value
+depends on the load convention (§2.2). A single-regime hazard cannot place its steep region in
+two locations at once, which is why the Round 15 hybrid
 (anchoring the weights to the trials) sent `q` to its ceiling and *raised* the cost. The
 resolution is the two-term hazard of §2.2: at low UACR the structural term with `q ≈ 2.92`
 dominates (MIMIC); at high UACR the albuminuric term switches on (trials). Because MIMIC is

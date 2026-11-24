@@ -311,6 +311,7 @@ def train(n_train=200_000, epochs=40, batch=512, lr=1e-3, seed=0, save=True,
     net.eval()
     net.noise_sd = float(noise_sd)
     net.noise_df = None if noise_df is None else float(noise_df)
+    net.sim_config_hash = core.config_hash()
     net.prior = prior
     rep = TrainReport(n_train, ep + 1, best, time.perf_counter() - t0)
     if save:
@@ -319,6 +320,7 @@ def train(n_train=200_000, epochs=40, batch=512, lr=1e-3, seed=0, save=True,
         torch.save({"state": net.state_dict(), "report": rep.__dict__,
                     "noise_sd": float(noise_sd), "noise_df": net.noise_df,
                     "box": [PRIOR_LO.tolist(), PRIOR_HI.tolist()],
+                    "sim_config_hash": core.config_hash(),
                     "prior": None if prior is None else prior.to_dict()}, path)
     if verbose:
         print(f"Trained in {rep.seconds:.0f} s (best val NLL {best:.4f})")
@@ -334,11 +336,16 @@ def load(path=None, noise_sd=NOISE_SD, noise_df=None, tag=None):
     box = ck.get("box")
     if box is None or not (np.allclose(box[0], PRIOR_LO) and np.allclose(box[1], PRIOR_HI)):
         raise ValueError(f"{os.path.basename(path)} was trained on a different prior box; retrain")
+    if ck.get("sim_config_hash") != core.config_hash():
+        raise ValueError(f"{os.path.basename(path)} was trained on a different model "
+                         f"configuration (hash {ck.get('sim_config_hash')} != "
+                         f"{core.config_hash()}); retrain")
     net = build_network()
     net.load_state_dict(ck["state"])
     net.eval()
     net.noise_sd = float(ck.get("noise_sd", NOISE_SD))
     net.noise_df = ck.get("noise_df")
+    net.sim_config_hash = ck.get("sim_config_hash")
     net.prior = None
     if ck.get("prior") is not None:
         import population_prior

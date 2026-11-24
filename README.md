@@ -17,8 +17,10 @@ the time to a **modeled eGFR < 15 mL/min/1.73 m² threshold** — a kidney-funct
 threshold, **not** a prediction of when dialysis would actually start (real KRT
 initiation depends on symptoms, labs and clinical judgment).
 
-**Why "NephroQ":** `q` is the hyperfiltration feedback exponent — the parameter
-that sets how abrupt the terminal collapse of renal function is. It is a
+**Why "NephroQ":** `q` is the hyperfiltration feedback exponent — how strongly
+the structural hazard rises with the load on the remaining functional capacity
+before it saturates. It does not by itself make decline accelerate (with the
+trial calibration it never does; see *How the model works*). It is a
 **population-level structural parameter**: the repository's own experiments show
 `q` is close to unidentifiable from routine clinical data (see
 [Per-patient personalization](#per-patient-personalization-ai)). Individual
@@ -109,30 +111,34 @@ h(N) = k0
 
 Four ideas do the work:
 
-1. **Hyperfiltration feedback.** As nephrons are lost, the survivors are
-   overloaded and damaged faster — the source of the accelerating, non-linear
-   collapse. It **saturates** at a physiological ceiling (a surviving nephron
-   raises its single-nephron GFR ~3x, not without limit; the transition sits near
-   eGFR 44).
+1. **Hyperfiltration feedback.** As functional capacity is lost, the remaining
+   units are loaded more and the hazard rises — with exponent `q` — until it
+   **saturates** (a surviving nephron raises its single-nephron GFR ~3x, not
+   without limit; saturation begins near eGFR 44). Whether this makes eGFR
+   decline *accelerate* is a quantitative question: it does only where the
+   hazard's elasticity to eGFR is below −1, which needs `q` above ~2 and happens
+   only above eGFR ≈ 36–40 (`src/dynamics_regimes.py`; derivation in
+   `docs/MODEL_DOCUMENTATION.md` §2.6).
 2. **Two coexisting insults.** A structural (hyperfiltration) term and a separate
    albuminuric term, each with its own coefficient. The patient's own UACR decides
    which dominates: low UACR → structural, high UACR → albuminuric. This is what
    lets one parameter set describe both a near-normoalbuminuric primary-care
    population and the macroalbuminuric populations of the SGLT2i trials.
-3. **Compensation.** eGFR stays roughly stable while reserve remains, then falls
-   steeply near the end. This is why a single eGFR snapshot can look reassuring
-   while the mechanism is already running.
+3. **No terminal collapse.** Every hazard term is bounded, so the model has no
+   finite-time collapse or bifurcation; below the saturation point the decline
+   decelerates for every parameter value.
 4. **Endogenous albuminuria.** UACR is a *consequence* of glomerular
    hypertension, not an external driver. The model predicts its trajectory — and
    predicts that renoprotective therapy lowers it ~29% immediately (SGLT2i trials
    published **31–35%**).
 
-**The collapse exponent `q` is population-dependent, and that is a finding, not a
-nuisance.** Calibrated on progressing CKD it is steep and identified (`q ≈ 2.9`,
-k-fold CV 3%); on a broad diabetic cohort dominated by stable kidney function the
-single-regime fit degrades, because `q` describes terminal *acceleration* and is
-undefined for patients who are not progressing. The model's domain is progressing
-CKD — see `docs/CHANGELOG.md`, Rounds 16–17.
+**The feedback exponent `q` is population-dependent at the population level**
+(`q ≈ 2.9` on progressing CKD in MIMIC-IV, k-fold CV 3%, vs 1.52 in the trials),
+but it is weakly identified per patient, and its numerical value depends on how
+the load is defined (`1/N` here; the per-unit filtration `N^(α−1)` gives an
+exactly equivalent model with `q` five times larger). Read it as a shape
+parameter of the hazard, not as a biological constant — see
+`docs/MODEL_DOCUMENTATION.md` §2.2 and §2.6.
 
 Full mathematical specification: [`docs/MODEL_DOCUMENTATION.md`](docs/MODEL_DOCUMENTATION.md).
 
@@ -209,7 +215,7 @@ personalizer below fixes that.
 
 ### Full Bayesian personalization (research module)
 
-`src/npe_posterior.py` infers the patient's **full posterior** over the collapse
+`src/npe_posterior.py` infers the patient's **full posterior** over the feedback
 exponent `q`, the log injury rate and the true (noise-free) baseline eGFR, by
 **amortized neural posterior estimation**: a GRU reads the visit sequence
 directly (any number of visits, any spacing), and a conditional neural spline
@@ -268,9 +274,18 @@ confirmed index and nothing later, and held-out visits are scored at ~1, ~3 and
 split is **temporal** (the most recent `anchor_year_group`s are the test set)
 when `patients.csv.gz` is given.
 
+**Temporal integrity.** Each trajectory is cut at the forecast origin *before*
+anything is computed; the index is confirmed and every covariate is taken from
+the observed window only, and missing covariates are imputed with training
+medians. A test rewrites all data after the origin and checks that nothing
+before it changes. The report includes a cohort-selection table (included vs
+excluded) and a provenance block (commit, model-configuration hash, cohort hash,
+network-weight hashes, package versions).
+
 Only the training patients are used to learn four things, in order: a
-**Student-t measurement-noise model** (from short-interval eGFR differences; it
-absorbs acute spikes), a **stage-1 neural posterior** under the uniform prior
+**Student-t measurement-noise model** (fitted to short-interval eGFR differences
+by matching simulated differences of two Student-t errors; it absorbs acute
+spikes), a **stage-1 neural posterior** under the uniform prior
 box, a **population prior** over (`q`, log injury rate) by empirical Bayes over
 the stage-1 draws (`population_prior.py`), and a **stage-2 neural posterior
 retrained on simulations from that prior**. The mechanistic network is never
@@ -322,15 +337,19 @@ patients; 1 261 held-out visits; full report in
   ensemble +0.24 to +1.86), and removes the uniform prior's decline bias
   (−5.37 → −0.15 mL/min/1.73 m²). It remains behind gradient boosting trained on
   the same hospital (+0.39 to +1.60) and under-covers (79 %).
-- The **hybrid** matches gradient boosting in RMSE (−0.40 to +0.11) and is best
-  on MAE, CRPS, coverage and AUC, while every forecast still runs through the
-  mechanistic model.
-- The learned population prior has **two progression regimes**: 87 % of patients
-  with a median injury rate of 0.40× the trial-anchored population and 13 % at
-  4.23×. How the fast decline divides between a higher injury rate and a steeper
-  collapse exponent depends on the prior box and the noise model (with a 3×
-  ceiling and Gaussian noise the split appeared in `q`, 1.02 vs 2.93), so the
-  regimes are a robust finding while their attribution to `q` is not.
+- The **hybrid** is statistically indistinguishable from gradient boosting in
+  RMSE (−0.40 to +0.11) and numerically ahead on MAE, CRPS, coverage and AUC
+  (confidence intervals for those differences are still to be computed), while
+  every forecast still runs through the mechanistic model. No superiority is
+  claimed.
+- A **two-component population prior** fits held-out patients better than one:
+  87 % with a median injury rate of 0.40× the trial-anchored population and 13 %
+  at 4.23×. A better-fitting mixture is evidence of heterogeneity, not of two
+  discrete phenotypes; its stability (bootstrap, three components, alternative
+  noise models) is still to be tested. How the fast decline divides between a
+  higher injury rate and a larger feedback exponent depends on the prior box and
+  the noise model (with a 3× ceiling and Gaussian noise the split appeared in
+  `q`, 1.02 vs 2.93), so its attribution to `q` is not a finding.
 - The 5-year horizon has only 39 held-out visits; its numbers are indicative.
 
 ### Honest limits
@@ -596,7 +615,7 @@ evidence; all the weight is on DAPA-CKD:
 The run writes `results/insilico_trial_report.md`.
 
 ```bash
-python -m pytest tests -q      # 166 tests
+python -m pytest tests -q      # 183 tests
 ```
 
 ---
@@ -645,6 +664,8 @@ nephroq/
 │   ├── benchmark_posterior.py  # NPE vs exact posterior vs classical baselines
 │   ├── fast_sim.py             # vectorized copy of the hazard, for simulation-based inference
 │   ├── outputs.py              # where scripts write (--out-dir > $NEPHROQ_OUT_DIR > results/)
+│   ├── dynamics_regimes.py     # when eGFR decline accelerates (derivation + regime map)
+│   ├── make_synthetic_cohort.py # public synthetic cohort in the MIMIC loader format (CI)
 │   ├── population_prior.py     # empirical-Bayes population prior over the NPE draws
 │   ├── validate_mimic_patients.py # patient-level validation on MIMIC-IV (10 methods)
 │   ├── patient_state.py        # longitudinal PatientState / Visit (with provenance)
@@ -655,7 +676,7 @@ nephroq/
 │   ├── uncertainty.py          # five-source predictive-uncertainty decomposition
 │   ├── clinical_outputs.py     # KDIGO risk probabilities, category times, referral flag
 │   └── clinical_safety.py      # when NOT to trust the twin (safety verdicts)
-├── tests/                      # 166 tests
+├── tests/                      # 183 tests
 ├── docs/
 │   ├── MODEL_DOCUMENTATION.md  # mathematical specification
 │   ├── TRIAL_DATA_PROVENANCE.md# every trial value, its source, verification status
@@ -712,7 +733,7 @@ the uncertainty band now decomposes five sources into a genuine predictive inter
 
 NephroQ is at **TRL 4** — components validated in a controlled setting: the
 integrated system runs, is calibrated on MIMIC-IV, passes a falsifiable in-silico
-trial replication, and is covered by 166 tests. It is **not** TRL 5: that requires
+trial replication, and is covered by 183 tests. It is **not** TRL 5: that requires
 validation on real data from the target population, which is exactly what the
 pending CRIC individual-level data (and, later, an IMSS-like cohort) would provide.
 Every calibration ships with a `research use — not prospectively validated` label.

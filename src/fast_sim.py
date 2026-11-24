@@ -9,54 +9,59 @@ per patient. `model_core.predict_egfr_at_v2` integrates one trajectory per
 whole batch is integrated together with a fixed-step fourth-order Runge-Kutta
 scheme on log N, which is smooth and non-stiff for every plausible patient
 (the hazard is capped at HAZARD_CAP). Agreement with the LSODA reference is
-checked in tests/test_fast_sim.py.
+checked in tests/test_fast_sim.py, across calibrations and treatment.
 
-The hazard is the same as `model_core.renal_hazard_v2` with no treatment (u = 0):
-    h(N) = k0 + k_hf s^q / (1 + (s/s_sat)^q)
-              + w_a1c (A1c-6.5)+ + k_alb log(1 + UACR(N)/30) + w_sbp (SBP-130)+/10,
-with s = 1/N the single-nephron load and UACR(N) = UACR0 (N0/N)^beta the
-endogenous albuminuria. A patient's personal injury rate `scale` multiplies every
-injury coefficient (k_hf, w_a1c, k_alb, w_sbp) and leaves the baseline loss k0
-and the structure (q, s_sat, beta) untouched -- exactly as
+The hazard is `model_core.renal_hazard_v2`:
+    h(N) = k0 + (1 - eff_hf u) k_hf s^q / (1 + (s/s_sat)^q)
+              + (1 - eff_met u) [ w_a1c (A1c-6.5)+ + k_alb log(1 + UACR(N)/30)
+                                  + w_sbp (SBP-130)+/10 ],
+with s = 1/N the per-unit load index and UACR(N) = UACR0 (N0/N)^beta (1 - eff_alb u)
+the endogenous albuminuria. A patient's personal injury rate `scale` multiplies
+every injury coefficient (k_hf, w_a1c, k_alb, w_sbp) and leaves the baseline loss
+k0 and the structure (q, s_sat, beta) untouched -- exactly as
 `personalize.patient_params` does.
+
+CONFIGURATION (audit P0.5). The parameters come from an explicit dict (default:
+model_core.TRIAL_CALIBRATION_V2), never from hidden module state;
+`model_core.config_hash(params)` identifies it, and trained artifacts store that
+hash so an artifact built on another calibration is refused.
 """
 import numpy as np
 
 import model_core as core
 
-# Population (trial-anchored) coefficients that a personal `scale` multiplies.
-_P = core.TRIAL_CALIBRATION_V2
-BASE_K_HF = float(_P["k_hf"])
-BASE_W_A1C = float(_P["w_a1c"])
-BASE_K_ALB = float(core._k_alb_of(_P))
-BASE_W_SBP = float(_P["w_sbp"])
-K0 = float(_P.get("k0", core.K0_DEFAULT))
-S_SAT = float(_P.get("s_sat", core.S_SAT))
-BETA = float(_P.get("beta", core.BETA))
-
 DT_DEFAULT = 0.05          # years; RK4 step (max error vs LSODA ~5e-4 mL/min)
 
 
-def _hazard(lnN, q, scale, a1c_x, sbp_x, uacr0, lnN0):
+def _coeffs(params):
+    c = core.sim_config(params)
+    return c
+
+
+def _hazard(lnN, q, scale, a1c_x, sbp_x, uacr0, lnN0, c, u):
     """Total per-nephron hazard for arrays of patients/parameter sets."""
     N = np.exp(lnN)
     s = 1.0 / np.clip(N, 1e-3, None)
-    hf = BASE_K_HF * scale * s ** q / (1.0 + (s / S_SAT) ** q)
-    uacr = uacr0 * np.exp(BETA * (lnN0 - lnN))
-    insult = scale * (BASE_W_A1C * a1c_x + BASE_K_ALB * np.log1p(uacr / 30.0)
-                      + BASE_W_SBP * sbp_x)
-    return np.minimum(K0 + hf + insult, core.HAZARD_CAP)
+    hf = c["k_hf"] * scale * s ** q / (1.0 + (s / c["s_sat"]) ** q) * (1.0 - c["eff_hf"] * u)
+    uacr = uacr0 * np.exp(c["beta"] * (lnN0 - lnN)) * (1.0 - c["eff_alb"] * u)
+    insult = scale * (c["w_a1c"] * a1c_x + c["k_alb"] * np.log1p(uacr / 30.0)
+                      + c["w_sbp"] * sbp_x) * (1.0 - c["eff_met"] * u)
+    return np.minimum(c["k0"] + hf + insult, core.HAZARD_CAP)
 
 
-def simulate_egfr(q, scale, egfr0, a1c, uacr0, sbp, t_query, dt=DT_DEFAULT):
+def simulate_egfr(q, scale, egfr0, a1c, uacr0, sbp, t_query, dt=DT_DEFAULT,
+                  params=None, u=0.0):
     """
     eGFR at times `t_query` for a batch of B patients / parameter sets.
 
-    All inputs broadcast to shape (B,). `t_query` is either a 1-D array shared
-    by the whole batch, shape (T,), or a per-patient array, shape (B, T) (pad
-    unused entries with any time inside the horizon and ignore them).
-    Returns an array of shape (B, T); B = 1 when every parameter is a scalar.
+    All patient inputs broadcast to shape (B,). `t_query` is either a 1-D array
+    shared by the whole batch, shape (T,), or a per-patient array, shape (B, T).
+    `params` is the base calibration (default TRIAL_CALIBRATION_V2); its own `q`
+    is ignored in favour of the `q` argument. `u` in [0, 1] is the treatment
+    indicator. Returns an array of shape (B, T); B = 1 when every parameter is a
+    scalar.
     """
+    c = _coeffs(params)
     q, scale, egfr0, a1c, uacr0, sbp = np.broadcast_arrays(
         *(np.asarray(x, dtype=float) for x in (q, scale, egfr0, a1c, uacr0, sbp)))
     shape = q.shape
@@ -73,7 +78,7 @@ def simulate_egfr(q, scale, egfr0, a1c, uacr0, sbp, t_query, dt=DT_DEFAULT):
     lnN0 = np.log(core.N_of_egfr(egfr0))
     a1c_x = np.maximum(a1c - 6.5, 0.0)
     sbp_x = np.maximum(sbp - 130.0, 0.0) / 10.0
-    args = (q, scale, a1c_x, sbp_x, uacr0, lnN0)
+    args = (q, scale, a1c_x, sbp_x, uacr0, lnN0, c, float(u))
 
     lnN = lnN0.copy()
     traj = np.empty((n_steps + 1, B))

@@ -415,3 +415,100 @@ def predict_egfr_at_v2_batched(egfr0, a1c, uacr0, sbp, u, param_sets, t_query):
                          for p in param_sets])
     egfr = np.vectorize(lambda x: egfr_of_N(max(x, 1e-3)))(sol.y)   # (B, n_unique)
     return egfr[:, inverse]
+
+
+# ==============================================================================
+# Configuration identity (audit P0.5) and eGFR domain (audit P0.2)
+# ==============================================================================
+EQUATIONS_VERSION = "v2-two-term-saturating-hazard"
+_SIM_KEYS = ("q", "k_hf", "k0", "w_a1c", "k_alb", "w_sbp",
+             "eff_met", "eff_hf", "eff_alb", "s_sat", "beta")
+
+
+def sim_config(p=None):
+    """
+    The exact numbers a simulator needs, as a flat dict of floats: the hazard
+    parameters (with the albuminuric coefficient read the way the hazard reads
+    it), the structural constants, and the equations version. Two simulators
+    built from the same config integrate the same model.
+    """
+    p = TRIAL_CALIBRATION_V2 if p is None else p
+    cfg = {k: float(p.get(k, 0.0)) for k in _SIM_KEYS}
+    cfg["k_alb"] = float(_k_alb_of(p))
+    cfg["k0"] = float(p.get("k0", K0_DEFAULT))
+    cfg["s_sat"] = float(p.get("s_sat", S_SAT))
+    cfg["beta"] = float(p.get("beta", BETA))
+    cfg.update(G_MAX=G_MAX, ALPHA=ALPHA, HAZARD_CAP=HAZARD_CAP, N_FLOOR=N_FLOOR)
+    cfg["equations"] = EQUATIONS_VERSION
+    return cfg
+
+
+def config_hash(p=None):
+    """12-character hash of sim_config(p); stored with every trained artifact so
+    an artifact trained on a different model or calibration is refused."""
+    import hashlib
+    import json
+    cfg = sim_config(p)
+    blob = json.dumps({k: (round(v, 12) if isinstance(v, float) else v)
+                       for k, v in sorted(cfg.items())}, sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()[:12]
+
+
+EGFR_DOMAIN = (float(egfr_of_N(N_FLOOR)), G_MAX)
+
+
+def egfr_domain_flags(egfr):
+    """
+    eGFR values the state map cannot represent. N = (eGFR/G_MAX)^(1/ALPHA) is a
+    functional-capacity index on (0, 1]; an eGFR above G_MAX (supranormal or
+    hyperfiltering kidneys) is mapped to N = 1, i.e. TRUNCATED. This reports such
+    values instead of truncating them silently. Returns counts and extremes.
+    """
+    e = np.atleast_1d(np.asarray(egfr, dtype=float))
+    return dict(n_above=int(np.sum(e > EGFR_DOMAIN[1])),
+                n_below=int(np.sum(e < EGFR_DOMAIN[0])),
+                max=float(np.nanmax(e)) if e.size else np.nan,
+                min=float(np.nanmin(e)) if e.size else np.nan,
+                in_domain=bool(np.all((e >= EGFR_DOMAIN[0]) & (e <= EGFR_DOMAIN[1]))))
+
+
+# ==============================================================================
+# Dynamics (audit P0.3): when does eGFR decline accelerate?
+# ==============================================================================
+def hazard_elasticity(egfr, egfr0, a1c, uacr0, sbp, u=0.0, p=None):
+    """
+    Total hazard h and its elasticity with respect to eGFR, eps = d ln h / d ln G,
+    for fixed covariates (analytic, cap ignored).
+
+    With G = G_MAX N^ALPHA and dN/dt = -N h:
+        G'  = -ALPHA G h
+        G'' =  ALPHA^2 G h (h + G dh/dG) = ALPHA^2 G h^2 (1 + eps)
+    so the decline ACCELERATES (|G'| grows) exactly when eps < -1, and
+    decelerates when eps > -1. With s = 1/N, d ln s / d ln G = -1/ALPHA, and the
+    hazard terms contribute
+        hyperfiltration   d hf / d ln s  = hf * q / (1 + (s/S_SAT)^q)
+        albuminuric       d alb / d ln s = k_alb * beta * (U/30) / (1 + U/30)
+        k0, metabolic     0
+    so eps = -(1/ALPHA) * [hf q / (1 + (s/S_SAT)^q) + k_alb beta (U/30)/(1 + U/30)] / h.
+    Because every term is bounded (saturation and the logarithm), h is bounded and
+    there is no finite-time singularity: q sets how strongly the hazard rises with
+    per-unit load before saturation, not a collapse.
+    Returns (h, eps); vectorized over `egfr`.
+    """
+    p = TRIAL_CALIBRATION_V2 if p is None else p
+    G = np.asarray(egfr, dtype=float)
+    N = np.clip((G / G_MAX) ** (1.0 / ALPHA), 1e-3, 1.0)
+    N0 = float(np.clip((egfr0 / G_MAX) ** (1.0 / ALPHA), 1e-3, 1.0))
+    s, s0 = 1.0 / N, 1.0 / N0
+    q, ssat = p["q"], p.get("s_sat", S_SAT)
+    beta = p.get("beta", BETA)
+    hf = p["k_hf"] * s ** q / (1.0 + (s / ssat) ** q) * (1.0 - p["eff_hf"] * u)
+    U = uacr0 * (s / s0) ** beta * (1.0 - p["eff_alb"] * u)
+    k_alb = _k_alb_of(p)
+    met = (p["w_a1c"] * max(a1c - 6.5, 0.0) + p["w_sbp"] * max(sbp - 130.0, 0.0) / 10.0)
+    insult_mult = (1.0 - p["eff_met"] * u)
+    alb = k_alb * np.log1p(U / 30.0)
+    h = p.get("k0", K0_DEFAULT) + hf + (alb + met) * insult_mult
+    d_ln_s = hf * q / (1.0 + (s / ssat) ** q) + insult_mult * k_alb * beta * (U / 30.0) / (1.0 + U / 30.0)
+    eps = -(1.0 / ALPHA) * d_ln_s / h
+    return h, eps

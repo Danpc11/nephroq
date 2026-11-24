@@ -27,3 +27,41 @@ jobs:
           pip install -r requirements-npe.txt --extra-index-url https://download.pytorch.org/whl/cpu
       - name: Run tests
         run: python -m pytest tests -q
+
+  synthetic-pipeline:
+    # Audit P0.6: a clean clone runs the full patient-level pipeline end to end on
+    # a public synthetic cohort (no restricted data) and keeps the reports, with
+    # hashes, as a build artifact.
+    needs: pytest
+    runs-on: ubuntu-latest
+    env:
+      NEPHROQ_OUT_DIR: ${{ github.workspace }}/ci_outputs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-npe.txt --extra-index-url https://download.pytorch.org/whl/cpu
+      - name: Synthetic cohort
+        working-directory: src
+        run: |
+          mkdir -p $NEPHROQ_OUT_DIR /tmp/syn
+          python make_synthetic_cohort.py --out /tmp/syn/cohort.tsv --patients-out /tmp/syn/patients.csv.gz | tee $NEPHROQ_OUT_DIR/synthetic_cohort_sha256.txt
+      - name: Patient-level validation (quick, synthetic)
+        working-directory: src
+        run: python validate_mimic_patients.py --cohort /tmp/syn/cohort.tsv --patients /tmp/syn/patients.csv.gz --quick
+      - name: Dynamics regimes and in-silico trials
+        working-directory: src
+        run: |
+          python dynamics_regimes.py
+          python insilico_trial.py
+      - name: Hashes of every output
+        run: cd $NEPHROQ_OUT_DIR && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-pipeline-${{ github.sha }}
+          path: ci_outputs

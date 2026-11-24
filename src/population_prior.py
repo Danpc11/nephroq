@@ -49,9 +49,16 @@ class PopulationPrior:
     extra: dict = field(default_factory=dict)
 
     def component_logpdf(self, q, log_s):
-        """Per-component log densities (K, ...) over (q, log_s), weights included."""
-        u = np.clip((np.asarray(q, float) - Q_LO) / (Q_HI - Q_LO), 1e-9, 1 - 1e-9)
+        """Per-component log densities (K, ...) over (q, log_s), weights included.
+        Exactly -inf outside the support (the prior box); the support mask is
+        applied BEFORE any numerical clipping, so a point outside the box can
+        never receive a finite density (audit P1.4)."""
+        qa = np.asarray(q, float)
         ls = np.asarray(log_s, float)
+        inside = (qa >= Q_LO) & (qa <= Q_HI) & (ls >= S_LO) & (ls <= S_HI) & np.isfinite(qa) & np.isfinite(ls)
+        u = np.clip((np.where(inside, qa, Q_LO + 0.5 * (Q_HI - Q_LO)) - Q_LO) / (Q_HI - Q_LO),
+                    1e-12, 1 - 1e-12)
+        ls = np.where(inside, ls, 0.5 * (S_LO + S_HI))
         out = []
         for k in range(len(self.weights)):
             a, b = self.q_ab[k]
@@ -61,7 +68,7 @@ class PopulationPrior:
             z = (ls - mu) / sd
             mass = special.ndtr((S_HI - mu) / sd) - special.ndtr((S_LO - mu) / sd)
             lsn = -0.5 * z * z - np.log(sd * np.sqrt(2 * np.pi)) - np.log(max(mass, 1e-300))
-            out.append(np.log(self.weights[k]) + lq + lsn)
+            out.append(np.where(inside, np.log(self.weights[k]) + lq + lsn, -np.inf))
         return np.stack(out)
 
     def logpdf(self, q, log_s):

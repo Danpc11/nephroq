@@ -320,9 +320,16 @@ def personalize(t, egfr, a1c, uacr0, sbp, estimator=None):
     t = np.asarray(t, float)
     egfr = np.asarray(egfr, float)
     span = float(t[-1] - t[0]) if len(t) > 1 else 0.0
+    domain = core.egfr_domain_flags(egfr)
+    domain_warning = None
+    if not domain["in_domain"]:
+        domain_warning = (f"{domain['n_above']} eGFR value(s) above {core.G_MAX:g} are "
+                          f"represented as full functional capacity (N = 1); the model "
+                          f"does not describe supranormal filtration")
+        warnings.warn(domain_warning, RuntimeWarning, stacklevel=2)
 
     if len(t) < MIN_VISITS or span < MIN_SPAN_YEARS:
-        return dict(personalized=False,
+        return dict(domain_warning=domain_warning, personalized=False,
                     reason=f"needs >={MIN_VISITS} eGFR measurements spanning "
                            f">={MIN_SPAN_YEARS} years; using population parameters",
                     params=dict(core.TRIAL_CALIBRATION_V2), q=None, q_sd=None,
@@ -335,7 +342,7 @@ def personalize(t, egfr, a1c, uacr0, sbp, estimator=None):
             # Training or loading must NEVER break the app: fall back to the
             # population parameters and say so, rather than crashing or -- worse --
             # silently pretending to personalize.
-            return dict(personalized=False,
+            return dict(domain_warning=domain_warning, personalized=False,
                         reason="personalizer unavailable; using population parameters",
                         params=dict(core.TRIAL_CALIBRATION_V2), q=None, q_sd=None,
                         scale=None, scale_sd=None)
@@ -353,7 +360,7 @@ def personalize(t, egfr, a1c, uacr0, sbp, estimator=None):
     q_population = float(core.TRIAL_CALIBRATION_V2["q"])
     params = patient_params(q_population, scale)
 
-    return dict(personalized=True, reason="inferred from this patient's history",
+    return dict(domain_warning=domain_warning, personalized=True, reason="inferred from this patient's history",
                 params=params,
                 q=q_population, q_sd=q_sd, scale=scale, scale_sd=scale_sd,
                 q_estimated=q)

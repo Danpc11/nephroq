@@ -2,6 +2,57 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 27 — Phase A of the external audit: blocking items (v0.17.0)
+
+An external audit plan (24 Nov 2026) was adopted as the roadmap. This round closes its blocking
+items (P0) plus P1.4 and the first part of P1.6.
+
+- **P0.1 Load convention.** Writing the load as the physical per-unit filtration `N^(α−1)`
+  instead of `1/N` is an exact reparametrization (`q' = q/(1−α)`, `S_SAT' = S_SAT^(1−α)`,
+  `β' = β/(1−α)`; agreement 1e-15). No recalibration; documented, with the consequence that
+  the numerical value of `q` is convention-dependent. Test added.
+- **P0.2 Domain.** `N` is documented as an effective functional-capacity index, not a nephron
+  count. eGFR above `G_MAX` is truncated to `N = 1`; `model_core.egfr_domain_flags` reports it
+  and `personalize()` warns and returns `domain_warning`.
+- **P0.3 Dynamics.** Derived `G'' = α² G h² (1 + ε)`, `ε = ∂ln h/∂ln G`: decline accelerates
+  iff `ε < −1` (`model_core.hazard_elasticity`, `dynamics_regimes.py`). With the trial
+  calibration (`q = 1.52`) the decline **decelerates at every eGFR**; acceleration needs `q`
+  above 2.05–2.45 (UACR 30–1500) and occurs only above eGFR ≈ 36–40; below saturation it
+  always decelerates; every term is bounded, so there is no collapse, bifurcation or
+  finite-time singularity. "Collapse exponent", "near-step", "terminal collapse" and "falls
+  steeply near the end" are withdrawn from the README and model documentation. Tests check
+  `G''` against finite differences and the deceleration claim.
+- **P0.4 Temporal leakage (confirmed and fixed).** `validate_mimic_patients.py` thinned
+  before cutting at the forecast origin, so a 90-day bin straddling the origin could put
+  post-origin draws into the observed window (reproduced: changing only a post-origin draw
+  changed an observed value, 35 → 50). Trajectories are now cut first and thinned per side;
+  the index is re-confirmed with observed-window data only (the loader could confirm it with a
+  later value); covariates come from the window only, loader-imputed values (cohort-wide
+  medians, test patients included) are discarded, and missing values are imputed with
+  training medians. Tests rewrite all post-origin data and check invariance. MIMIC-IV results
+  must be re-run.
+- **P0.5 Simulator configuration.** `fast_sim.simulate_egfr` takes an explicit `params` dict
+  and a treatment `u`; `model_core.sim_config`/`config_hash` identify the model; NPE
+  checkpoints store the hash and `load()` refuses a mismatch. Equivalence with LSODA is tested
+  across three calibrations, with and without treatment.
+- **P1.4 Truncated densities.** `PopulationPrior` returns exactly −inf outside the prior box
+  (mask before clipping); a test integrates the density to 1.
+- **P1.6 (part) Noise fit.** The difference of two Student-t errors is not Student-t; scale
+  and degrees of freedom are now fitted by matching quantiles of simulated differences
+  (recovers 5.0/3.5 → 5.03/3.64 and 4.0/10 → 4.01/10.06). The explicit acute-deviation state
+  remains for Phase B.
+- **P1.5 (part) and P0.6/P1.11 (part).** The validation report now has a cohort-selection
+  table (included vs excluded) and a provenance block (commit, version, configuration hash,
+  cohort hash, weight hashes, package versions). `make_synthetic_cohort.py` writes a public
+  synthetic cohort in the loader format (byte-reproducible); a new CI job runs the full
+  pipeline on it (`--quick`), plus the dynamics map and in-silico trials, and uploads the
+  outputs with `SHA256SUMS`.
+- README claims tempered (audit P1.3, P1.7): the hybrid is "statistically indistinguishable"
+  from gradient boosting, and the two-component prior is "heterogeneity, not phenotypes",
+  pending stability tests.
+
+Suite: 183 tests (166 + 17 new).
+
 ## Round 26 — analysis outputs can live outside the clone (v0.16.2)
 
 On the cluster, running the benchmark and the MIMIC validation rewrote `results/*.md` and
