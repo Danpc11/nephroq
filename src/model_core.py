@@ -11,7 +11,7 @@ diverged silently:
   - calibrate_mimic.py used an explicit fixed-step RK4 integrator.
   - model_core.py (used by the app) used scipy's adaptive solve_ivp.
 Both encoded "the same" hazard equation, but produced trajectories differing
-by up to ~11 mL/min/1.73m² near the terminal collapse region -- exactly where
+by up to ~11 mL/min/1.73m² at low eGFR -- exactly where
 time-to-eGFR<15 decisions are made. See the README (Limitations) for the
 before/after numeric comparison that caught this.
 

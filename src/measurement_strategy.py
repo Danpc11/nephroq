@@ -3,7 +3,7 @@
 WHICH MEASUREMENTS SHOULD YOU ACTUALLY ORDER?  ·  NephroQ
 ================================================================================
 The per-patient personalization (personalize.py) infers two things from a
-patient's history: their INJURY RATE and the collapse exponent q. How well it can
+patient's history: their INJURY RATE and the feedback exponent q. How well it can
 do that depends on what you measured. This script answers, by simulation, what is
 worth ordering -- and what is not.
 

@@ -8,7 +8,7 @@ distinct role and occupies a distinct progression regime:
     Cohort          Role in NephroQ
     --------------- --------------------------------------------------------------
     MIMIC-IV        hospital EHR: AKI, irregular sampling, in-hospital dialysis;
-                    near-normoalbuminuric. Source of the STRUCTURAL collapse
+                    near-normoalbuminuric. Source of the STRUCTURAL feedback
                     exponent (q ~ 2.9) at low UACR.
     CRIC Phase I    renal progression in MORE ADVANCED CKD (eGFR ~40), moderate
                     albuminuria. A distinct, ambulatory progression regime.

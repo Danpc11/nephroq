@@ -226,14 +226,14 @@ STRINGS = {
               "C alone**. What matters most is the TIME SPAN of the history, not the number of "
               "measurements — the same 5 values spread over 6 years are worth far more than 12 "
               "crammed into 18 months. Note this improves the estimate of the patient's injury "
-              "RATE; the collapse exponent q stays weakly identifiable either way.",
+              "RATE; the feedback exponent q stays weakly identifiable either way.",
         "es": "El eGFR se calculó solo con creatinina. Si no hay cistatina C (lo habitual), **no "
               "la necesitas**: en experimentos de simulación, **repetir la creatinina en cada "
               "visita y rescatar resultados viejos del expediente supera a la cistatina C "
               "sola**. Lo que más importa es el LAPSO del historial, no el número de mediciones "
               "— 5 valores repartidos en 6 años valen mucho más que 12 apretados en 18 meses. "
               "Esto mejora la estimación de la TASA de daño del paciente; el exponente de "
-              "colapso q sigue siendo débilmente identificable en cualquier caso.",
+              "retroalimentación q sigue siendo débilmente identificable en cualquier caso.",
     },
 
     "expander_title": {
@@ -354,14 +354,14 @@ STRINGS = {
               "infers an individual injury rate of **{scale:.2f}×** the population average "
               "(90% interval {scale_lo:.2f}–{scale_hi:.2f}). The projection below uses this, "
               "not the population default.\n\n"
-              "*Experimental:* collapse exponent q = {q:.2f} (90% interval {q_lo:.2f}–"
+              "*Experimental:* feedback exponent q = {q:.2f} (90% interval {q_lo:.2f}–"
               "{q_hi:.2f}). q is close to unidentifiable from routine data — treat it as "
               "indicative, not as an estimate.",
         "es": "**Personalizado a este paciente.** A partir de su historial, el modelo infiere "
               "una tasa de daño individual de **{scale:.2f}×** el promedio poblacional "
               "(intervalo 90% {scale_lo:.2f}–{scale_hi:.2f}). La proyección de abajo usa este "
               "valor, no el poblacional.\n\n"
-              "*Experimental:* exponente de colapso q = {q:.2f} (intervalo 90% {q_lo:.2f}–"
+              "*Experimental:* exponente de retroalimentación q = {q:.2f} (intervalo 90% {q_lo:.2f}–"
               "{q_hi:.2f}). q es casi inidentificable con datos rutinarios — tómalo como "
               "indicativo, no como una estimación.",
     },
@@ -465,12 +465,12 @@ PRESETS = [
         "label": {"en": "🟣 Advanced (G3b–G4)", "es": "🟣 Avanzado (G3b–G4)"},
         "markers": dict(age=63, sex="M", creatinine=2.1, hba1c=8.8, uacr=600.0, sbp=155),
         "note": {
-            "en": "Already advanced. Illustrates the **terminal-collapse regime** where the "
-                  "feedback exponent q dominates and small differences in control translate into "
-                  "months, not years.",
-            "es": "Ya avanzado. Ilustra el **régimen de colapso terminal** donde el exponente de "
-                  "retroalimentación q domina y pequeñas diferencias de control se traducen en "
-                  "meses, no años.",
+            "en": "Already advanced. Illustrates **late-stage CKD**, where the remaining "
+                  "capacity is small and differences in control shift the time to eGFR 15 by "
+                  "months rather than years (the decline itself decelerates; it never collapses).",
+            "es": "Ya avanzado. Ilustra la **ERC avanzada**, donde la capacidad "
+                  "restante es pequeña y las diferencias de control mueven el tiempo a eGFR 15 "
+                  "meses y no años (la caída se desacelera; nunca colapsa).",
         },
     },
 ]

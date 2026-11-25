@@ -82,7 +82,7 @@ import model_core as core
 
 # ---- SINGLE canonical model implementation -- for why
 # this used to be a second, independent simulator that silently diverged from
-# the app's (model_core.py) by up to ~11 mL/min/1.73m2 near collapse.
+# the app's (model_core.py) by up to ~11 mL/min/1.73m2 at low eGFR.
 G_MAX, ALPHA, N_FLOOR, K0_FIX = core.G_MAX, core.ALPHA, core.N_FLOOR, core.K0_DEFAULT
 N_of_egfr = core.N_of_egfr
 egfr_of_N = core.egfr_of_N
@@ -291,7 +291,7 @@ def pack(th, free_idx=None):
 def profile_s_sat(patients, values=(2.0, 2.5, 3.0, 3.5, 4.5, 6.0), noise_sd=8.7,
                   n_jobs=1, max_patients=None, verbose=True):
     """
-    PROFILE LIKELIHOOD over S_SAT -- where is the collapse threshold?
+    PROFILE LIKELIHOOD over S_SAT -- where is the saturation threshold?
 
     q and S_SAT describe different things:
         q      = how SHARP the transition is
@@ -327,7 +327,7 @@ def profile_s_sat(patients, values=(2.0, 2.5, 3.0, 3.5, 4.5, 6.0), noise_sd=8.7,
         spread = max(d["cost"] for d in out) - min(d["cost"] for d in out)
         rel = spread / max(best["cost"], 1e-9)
         print(f"\n      >>> best S_SAT={best['s_sat']:.1f}  "
-              f"(collapse threshold at eGFR {best['egfr_breakpoint']:.1f})")
+              f"(saturation threshold at eGFR {best['egfr_breakpoint']:.1f})")
         if rel < 0.02:
             print("          But the profile is FLAT (cost varies <2% across the whole range):")
             print("          the data do NOT locate the breakpoint. Keep the trial-anchored")
@@ -1454,7 +1454,7 @@ def main():
                          "because it resamples the same patients. 5 is a reasonable value; 0 "
                          "disables it.")
     ap.add_argument("--q-max", type=float, default=3.0,
-                    help="Upper bound on the collapse exponent q. If a fit or a CV fold comes "
+                    help="Upper bound on the feedback exponent q. If a fit or a CV fold comes "
                          "back at exactly this value, the estimate is CENSORED by the bound, "
                          "not determined by the data -- widen it (e.g. --q-max 8) and refit. "
                          "If q then runs to the new ceiling too, the functional form itself is "

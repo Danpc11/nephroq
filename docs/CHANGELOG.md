@@ -2,6 +2,71 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 29 — code and method audit; Phase B diagnostics (v0.18.0)
+
+A full review of the publication pipeline after the leakage-free MIMIC-IV run.
+
+**Errors fixed**
+
+- **Long histories shifted the time origin** (`npe_posterior.posterior_samples`). Histories
+  longer than the network input kept the last 10 visits and re-zeroed time at the first
+  kept visit, while `predictive` reads times from the original first visit, so forecasts
+  for long histories were shifted by the dropped span and eGFR0 referred to the wrong
+  visit. Now the first visit and the most recent nine are kept (`reduce_history`); test
+  added. (MIMIC windows have at most nine thinned visits, so the reported results were not
+  affected; the app path was.)
+- **Training never saw the longest histories**: schedules had 2–9 visits while the network
+  accepts 10. Now 2–10.
+- **Body-fluid creatinine could enter the cohort** (`mimic_loader`). MIMIC labels ascites,
+  pleural and drain creatinine simply "Creatinine" and distinguishes them only in the
+  `fluid` column; items were chosen by label. Creatinine, HbA1c and cystatin C items are now
+  restricted to `fluid == Blood`, with body-fluid words excluded from labels as a fallback.
+  **The cohort must be rebuilt.**
+- **Unequal search spaces**: the least-squares comparator searched injury rates 0.25–3×
+  while the NPE searched 0.25–6×. `least_squares_scale_only` takes `bounds`; the validation
+  passes the NPE box.
+- **Random-slope pooling** weighted patients by `1/(se² + var(slopes))` instead of
+  `1/(se² + τ²)`; corrected.
+- **Noise fit**: the degrees of freedom were clipped to 2.5 after fitting, so the scale was
+  fitted for a different df than the one reported. The bound now lives inside the fit, and
+  the report says when df sits at the limit.
+- **Withdrawn terminology still shown to users**: the app (English and Spanish), the
+  personalizer, the NPE and prior modules and two figure scripts still called `q` a
+  "collapse exponent" and described a "terminal-collapse regime", contradicting §2.6. All
+  replaced ("feedback exponent"; late-stage example rewritten).
+
+**Method changes**
+
+- **Injury-rate box widened to 0.02–6×** (was 0.25–6×). The stable MIMIC component sat
+  against the 0.25× floor (Round 28); 0.02× is ageing-only decline (< 0.3 mL/min/1.73 m² per
+  year at eGFR 75). Networks retrain on first use; the posterior benchmark must be re-run.
+- **Between-visit deviation** (audit P1.6): held-out visits are modelled as latent eGFR +
+  measurement noise + N(0, v0 + v1·Δt), Δt = years since the last observation; (v0, v1) by
+  maximum likelihood on the training patients' held-out visits (the networks never read
+  them), with the Student-t noise as a scale mixture of normals. New method
+  "NPE, learned prior + between-visit deviation", now the mechanistic reference. Recovery
+  test included.
+- **Cross-fitted recalibration** of gradient boosting and hybrid intervals (5-fold
+  out-of-fold standardized residuals): their quantile models were scored on their own
+  training rows. Coverage test included.
+- **New comparators** (audit P1.7): last observed value (persistence, with the training
+  change by horizon as predictive distribution) and per-patient Theil–Sen slope.
+- **Bootstrap CIs for every metric** (audit P1.8): differences in RMSE, MAE, CRPS, 90 %
+  coverage and AUC against both references.
+- **Identifiability report** (audit P1.1): posterior contraction of `q` and log rate and the
+  `q`–rate correlation on the test patients, for both stages.
+- **Mixture stability** (audit P1.2): K chosen among 1, 2, 3; components ordered by injury
+  rate (identified) instead of `q`; patient-bootstrap refits with label alignment give
+  intervals for weights, mean `q` and median rate; the report warns when a component lies
+  within two SDs of a box edge.
+- **Selection flow** (audit P1.5): selection table by exclusion reason with the fraction of
+  recorded deaths (`dod`), to show informative censoring.
+- **Sensitivity runs**: `--noise-scale/--noise-df` fix the noise model; `--tag` names the
+  outputs; `--prior-boot` sets the stability refits.
+- `grid_posterior` accepts a Student-t likelihood (`noise_df`).
+
+Suite: 194 tests (183 + 11 new).
+
 ## Round 28 — MIMIC-IV re-run on the leakage-free protocol (v0.17.1)
 
 The patient-level validation was re-run with v0.17.0 (cut-then-thin, window-only index and

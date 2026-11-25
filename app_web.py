@@ -188,7 +188,7 @@ def _get_personalizer():
 # ---- PER-PATIENT PERSONALIZATION (amortized inference) ------------------------
 # The measurement history (if any) is converted to an eGFR series with the
 # patient's own age/sex, then a neural estimator -- trained purely on simulations
-# from the mechanistic model -- infers this patient's injury rate and collapse
+# from the mechanistic model -- infers this patient's injury rate and feedback
 # exponent. The forward projection is still the ODE: the network only solves the
 # inverse problem.
 PERSONAL = dict(personalized=False, params=dict(core.TRIAL_CALIBRATION_V2))

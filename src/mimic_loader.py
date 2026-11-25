@@ -83,13 +83,24 @@ def is_type2_icd9(code):
         return False
     return code[4] in ("0", "2")
 
-def find_itemids(d_labitems, keywords, exclude=()):
+NON_BLOOD_LABEL_WORDS = ["urine", "ascites", "pleural", "joint", "body fluid", "csf",
+                         "drain", "stool", "dialysate", "peritoneal", "fluid"]
+
+
+def find_itemids(d_labitems, keywords, exclude=(), fluid=None):
+    """Item ids whose label contains any keyword and none of `exclude`. When
+    `fluid` is given and d_labitems has a `fluid` column (MIMIC-IV v2+), only
+    items measured in that fluid are kept: MIMIC labels body-fluid creatinine
+    (ascites, pleural, drain, joint) simply "Creatinine", so the label alone
+    cannot tell a serum value from a drain-fluid one."""
     lab = d_labitems["label"].str.lower().fillna("")
     mask = np.zeros(len(d_labitems), dtype=bool)
     for kw in keywords:
-        mask |= lab.str.contains(kw, na=False)
+        mask |= lab.str.contains(kw, na=False, regex=False)
     for ex in exclude:
-        mask &= ~lab.str.contains(ex, na=False)
+        mask &= ~lab.str.contains(ex, na=False, regex=False)
+    if fluid is not None and "fluid" in d_labitems.columns:
+        mask &= d_labitems["fluid"].astype(str).str.lower().eq(fluid.lower()).to_numpy()
     return d_labitems.loc[mask, "itemid"].tolist()
 
 def _confirmed_index(times, egfrs, confirm_days=90, max_recovery=0.30,
@@ -266,9 +277,10 @@ def main(mimic_dir, out_path, min_span_days=180, min_points=4,
     dm_ids = load_diabetic_patient_ids(mimic_dir)
 
     id_creat = find_itemids(d_labitems, LABEL_KEYWORDS["creatinine"],
-                            exclude=["urine", "albumin", "ratio", "clearance"])
-    id_a1c   = find_itemids(d_labitems, LABEL_KEYWORDS["hba1c"])
-    id_cys   = find_itemids(d_labitems, LABEL_KEYWORDS["cystatin"])
+                            exclude=["albumin", "ratio", "clearance"] + NON_BLOOD_LABEL_WORDS,
+                            fluid="Blood")
+    id_a1c   = find_itemids(d_labitems, LABEL_KEYWORDS["hba1c"], fluid="Blood")
+    id_cys   = find_itemids(d_labitems, LABEL_KEYWORDS["cystatin"], fluid="Blood")
     id_uacr  = find_itemids(d_labitems, LABEL_KEYWORDS["uacr"])
     print(f"[2/5] itemids -> creatinine:{id_creat}  hba1c:{id_a1c}  cystatin:{id_cys}  uacr:{id_uacr}")
 

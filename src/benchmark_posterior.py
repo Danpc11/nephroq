@@ -240,7 +240,7 @@ def plot(df, ranks_npe, hits, path):
     plt.rcParams.update({"font.size": 7, "axes.spines.top": False, "axes.spines.right": False,
                          "figure.dpi": 150, "savefig.dpi": 300})
     fig, ax = plt.subplots(1, 4, figsize=(7.2, 1.9))
-    labels = {"q": "q (collapse exponent)", "log_scale": "log injury rate", "egfr0": "true baseline eGFR"}
+    labels = {"q": "q (feedback exponent)", "log_scale": "log injury rate", "egfr0": "true baseline eGFR"}
     for k, name in enumerate(npe.PARAM_NAMES):
         ax[k].hist(ranks_npe[:, k], bins=10, range=(0, N_RANK + 1), color="#0072B2", alpha=0.85)
         ax[k].axhline(len(df) / 10, color="k", lw=0.6, ls="--")

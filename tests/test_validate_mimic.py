@@ -45,6 +45,7 @@ def test_pipeline_runs_and_reports_only_aggregates(tmp_path):
     groups.to_csv(pfile, index=False)
     mlp = pz.train(n_train=600, save=False)
     df, tables, ev, ci, meta = vm.run(cohort, str(pfile), noise_model="t", mlp=mlp, n_boot=50,
+                                      prior_boot=2, train_draws=50,
                                       verbose=False,
                                       npe_kwargs=dict(n_train=3000, epochs=1, save=False))
     assert meta["split"].startswith("temporal")
@@ -52,7 +53,13 @@ def test_pipeline_runs_and_reports_only_aggregates(tmp_path):
     for m in vm.METHODS:
         assert np.isfinite(tables["all"][m]["rmse"])
     assert 0.0 <= tables["all"]["npe_pop"]["cov90"] <= 1.0
-    assert set(ci) == {"npe_pop", "gbm"}
+    assert set(ci) == {"npe_dev", "gbm"}
+    for ref in ci.values():
+        for d in ref.values():
+            assert {"rmse", "mae"} <= set(d)
+    assert set(ci["gbm"]["npe_dev"]) == set(vm.BOOT_METRICS)
+    assert meta["deviation"]["v0"] > 0 and meta["identifiability"]["stage2"]
+    assert meta["prior"]["stability"] is not None
     assert meta["noise"]["df"] is not None and meta["noise"]["scale"] > 0
     text = vm.report(tables, ev, ci, meta)
     assert "NPE" in text

@@ -10,7 +10,7 @@ trials. Two patients with an identical eGFR today got an identical future — ev
 if one had been falling steeply for three years and the other was flat.
 
 What actually differs between patients is *how fast their kidney is losing
-nephrons* and *how abruptly the terminal collapse comes* — i.e. their personal
+nephrons* and *how strongly the remaining nephrons' load feeds back on injury* — i.e. their personal
 hazard scale and their personal feedback exponent q.
 
 --------------------------------------------------------------------------------
@@ -89,7 +89,7 @@ HIDDEN_DEFAULT = (96, 48)
 N_MODELS_DEFAULT = 4
 
 # ---- priors over the two PERSONAL parameters ---------------------------------
-# q      : how abrupt the terminal collapse is (population value: 1.52)
+# q      : hyperfiltration feedback exponent (population value: 1.52)
 # scale  : this patient's overall injury rate, as a multiple of the population one
 Q_RANGE = (0.8, 2.6)
 SCALE_RANGE = (0.25, 3.0)      # log-uniform
@@ -391,16 +391,17 @@ def least_squares_baseline(t, egfr, a1c, uacr0, sbp):
     return q, scale
 
 
-def least_squares_scale_only(t, egfr, a1c, uacr0, sbp, q=None):
+def least_squares_scale_only(t, egfr, a1c, uacr0, sbp, q=None, bounds=None):
     """The FAIR classical rival of the deployed personalizer.
 
     It solves exactly the problem the app solves -- infer the patient's injury
     rate with q held at its population value -- by one-parameter least squares.
     The network has to beat THIS on accuracy, or justify itself on speed and on
-    the uncertainty it reports."""
+    the uncertainty it reports. `bounds` = (min, max) injury rate; pass the
+    range of the estimator it is compared with, so both search the same space."""
     from scipy.optimize import least_squares
     q = float(core.TRIAL_CALIBRATION_V2["q"] if q is None else q)
-    lo, hi = np.log(SCALE_RANGE[0]), np.log(SCALE_RANGE[1])
+    lo, hi = np.log(SCALE_RANGE if bounds is None else bounds)
 
     def resid(z):
         p = patient_params(q, float(np.exp(np.clip(z[0], lo, hi))))

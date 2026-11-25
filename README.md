@@ -257,6 +257,9 @@ Three results:
    its prior variance by only 12–21 %), but the forecast still needs its
    uncertainty.
 
+These numbers were obtained with the injury-rate box 0.25–6×; v0.18 widens it to
+0.02–6× and the benchmark is being re-run.
+
 Honest limits of this module: it is trained on simulations of *this* model, so
 it inherits every assumption of the model; the network contracts `q` somewhat
 more than the exact posterior (21 % vs 12 %) and the SBC test for the baseline
@@ -293,13 +296,31 @@ fitted to MIMIC trajectories; only the noise model and the population prior are
 estimated from them. On top, a **hybrid** adds a gradient-boosting correction
 learned on the residuals of the stage-2 forecast.
 
-Ten methods are compared on the same visits: population model, one-parameter
-least squares, the MLP ensemble, NPE under the uniform prior, NPE reweighted to
-the learned prior, NPE retrained on it, the hybrid, a per-patient OLS slope, an
-empirical-Bayes random-slope model and gradient boosting. Scores: RMSE, MAE,
-bias, interval coverage and CRPS by horizon, AUC and Brier for eGFR < 30, and
-patient-bootstrap CIs of every RMSE difference against the retrained NPE and
-against gradient boosting.
+Thirteen methods are compared on the same visits: population model, last
+observed value (persistence, with the training patients' change by horizon as
+its predictive distribution), per-patient OLS and Theil–Sen slopes, an
+empirical-Bayes random-slope model, one-parameter least squares (searching the
+same injury-rate range as the NPE prior), the MLP ensemble, NPE under the
+uniform prior, NPE reweighted to the learned prior, NPE retrained on it (with
+measurement noise only, and with a **between-visit deviation**), the hybrid and
+gradient boosting. The deviation term is the observation model's account of
+what short-interval pairs cannot see: over years the observed eGFR wanders
+(intercurrent illness, acute injury and recovery, muscle mass, treatment) in
+ways the monotone mechanistic state cannot follow, so a held-out visit is
+modelled as latent eGFR + measurement noise + a Gaussian deviation whose
+variance grows linearly with the time since the last observation; its two
+parameters are fitted by maximum likelihood on the training patients' held-out
+visits, which the networks never read. The intervals of gradient boosting and
+the hybrid are recalibrated with cross-fitted standardized residuals.
+
+Scores: RMSE, MAE, bias, interval coverage and CRPS by horizon, AUC and Brier
+for eGFR < 30, and patient-bootstrap CIs of the differences in RMSE, MAE, CRPS,
+90 % coverage and AUC against the mechanistic reference (NPE with deviation)
+and against gradient boosting. Diagnostics: posterior contraction and
+`q`–rate correlation on the test patients (identifiability), bootstrap stability
+of the learned mixture (K chosen among 1–3), and the selection flow by
+exclusion reason with the fraction of recorded deaths. Sensitivity runs fix the
+noise model (`--noise-scale`, `--noise-df`) and write tagged outputs (`--tag`).
 
 Run it where MIMIC lives (credentialed access required; see
 `docs/MIMIC_COMPLIANCE.md`). Both networks are trained and cached on first use:
@@ -316,7 +337,9 @@ on that machine) and the **aggregate** report `mimic_patient_validation.md` and
 `.png`, which are the only outputs that may be shared. On a compute node, set
 `NEPHROQ_OUT_DIR` (see *Running analyses on a compute node*).
 
-**Result** (MIMIC-IV 3.1; 8 663 training and 854 temporally held-out test
+**Result** (protocol of v0.17; v0.18 widens the injury-rate box and adds the
+comparators and diagnostics above, and is being re-run; MIMIC-IV 3.1; 8 663
+training and 854 temporally held-out test
 patients; 1 252 held-out visits; full report in
 [`results/mimic_patient_validation.md`](results/mimic_patient_validation.md)):
 
@@ -352,9 +375,10 @@ patients; 1 252 held-out visits; full report in
 - A **two-component population prior** fits held-out patients better than one
   (held-out log-likelihood 0.197 vs 0.102 per patient): 69 % with a median
   injury rate of 0.30× the trial-anchored population (SD of log rate 0.07) and
-  31 % at 2.89× (mean `q` 1.89). The slow component sits against the lower edge
-  of the prior box (0.25×), which suggests that the box truncates stable
-  patients and may contribute to the over-predicted decline. A better-fitting
+  31 % at 2.89× (mean `q` 1.89). The slow component sat against the lower edge
+  of that run's prior box (0.25×), so the box truncated stable patients and may
+  have contributed to the over-predicted decline; v0.18 extends the box to
+  0.02× (ageing-only decline). A better-fitting
   mixture is evidence of heterogeneity, not of two discrete phenotypes; its
   stability (bootstrap, three components, a wider box, alternative noise
   models) is still to be tested, and how fast decline divides between injury

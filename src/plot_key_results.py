@@ -2,7 +2,7 @@
 Figures for the two headline results, so the repo's strongest findings are
 visualised. Uses seaborn for a cleaner aesthetic.
 
-  1. Two regimes (Round 17, final MIMIC-pure fits): the collapse exponent q takes
+  1. Two regimes (Round 17, final MIMIC-pure fits): the feedback exponent q takes
      opposite regimes. Shown as the HAZARD-SHAPE curves themselves -- you see the
      regime change, not three bar heights -- with fit quality as context.
   2. In-silico trial replication as a forest plot: two calibration trials and the
@@ -37,7 +37,7 @@ def fig_two_regimes(path):
     """
     Left panel: the structural hazard term vs disease progression, for the three
     reproduced exponents. The SHAPE is the finding (q<1 decelerates, q~1.5 near-
-    linear, q>3 collapses). Right panel (separate, not an inset): a single q fits
+    linear, q>3 steepens). Right panel (separate, not an inset): a single q fits
     progressors (chi2/n 3.03, pass) but not the full mixed cohort (8.06, warning).
     Legends and the second panel sit OUTSIDE the curve area so nothing is occluded.
     """
@@ -83,7 +83,7 @@ def fig_two_regimes(path):
     axq.annotate("pass", (1, 3.03), (1.06, 3.4), fontsize=6, color=C_SUP)
     sns.despine(ax=axq)
 
-    fig.suptitle("One hazard, three regimes: the collapse exponent depends on "
+    fig.suptitle("One hazard, three regimes: the feedback exponent depends on "
                  "the population it is fit on", fontsize=9)
     fig.savefig(path, dpi=300); plt.close(fig)
 

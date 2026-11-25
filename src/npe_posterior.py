@@ -7,7 +7,7 @@ For one patient, the full Bayesian posterior over three latent quantities, given
 a handful of noisy eGFR values at irregular times plus baseline HbA1c, UACR and
 systolic pressure:
 
-    q          collapse exponent of the hyperfiltration feedback (structural;
+    q          exponent of the hyperfiltration feedback (structural;
                Round 17 found it differs between stable patients and
                progressors, so it is treated as uncertain, not fixed)
     log scale  the patient's personal injury rate, as a log multiple of the
@@ -53,16 +53,19 @@ MODEL_PATH = os.path.join(HERE, "..", "calibration", "npe_posterior.pt")
 
 # ---- prior -------------------------------------------------------------------
 PARAM_NAMES = ("q", "log_scale", "egfr0")
-PRIOR_LO = np.array([0.8, np.log(0.25), 20.0])
-# injury rate up to 6x population: on MIMIC-IV the learned progressor regime sat
-# at 2.7x with its spread squeezed against a 3x ceiling (Round 24)
+# injury rate from 0.02x (essentially ageing only: < 0.3 mL/min/1.73 m2 per year
+# at eGFR 75) to 6x the population rate. On MIMIC-IV the learned progressor
+# regime sat against a 3x ceiling (Round 24) and the stable regime against a
+# 0.25x floor (Round 28), so both edges were widened until neither binds.
+PRIOR_LO = np.array([0.8, np.log(0.02), 20.0])
 PRIOR_HI = np.array([3.5, np.log(6.0), 110.0])
 Q_POP = float(core.TRIAL_CALIBRATION_V2["q"])
 
 # ---- observation model ---------------------------------------------------------
 NOISE_SD = 6.0            # mL/min/1.73m2 per measurement
 MAX_VISITS = 10
-VISITS_RANGE = (2, 9)     # visits per history (inclusive)
+VISITS_RANGE = (2, MAX_VISITS)  # visits per history (inclusive); the network
+                                # is trained on every length it can be given
 SPAN_RANGE = (0.5, 8.0)   # years between first and last visit
 SEQ_FEATURES = 3
 STATIC_FEATURES = 5
@@ -371,14 +374,26 @@ def load_or_train(noise_sd=NOISE_SD, noise_df=None, prior=None, tag=None, save=T
 # ==============================================================================
 # Inference
 # ==============================================================================
+def reduce_history(t, egfr, max_visits=MAX_VISITS):
+    """Histories longer than the network's input keep the FIRST visit and the
+    most recent `max_visits - 1`. The first visit anchors the time origin and
+    eGFR0, so posterior draws and `predictive` keep meaning "years since the
+    first visit" whatever the history length."""
+    t = np.asarray(t, float)
+    e = np.asarray(egfr, float)
+    if len(t) <= max_visits:
+        return t, e
+    keep = np.r_[0, np.arange(len(t) - (max_visits - 1), len(t))]
+    return t[keep], e[keep]
+
+
 def posterior_samples(net, t, egfr, a1c, uacr0, sbp, n=500, seed=0):
     """Draws n posterior samples of (q, log_scale, eGFR0) for ONE patient."""
     torch, _ = _torch()
     t = np.asarray(t, float)
     e = np.asarray(egfr, float)
+    t, e = reduce_history(t, e)
     k = len(t)
-    if k > MAX_VISITS:              # keep the most recent visits
-        t, e, k = t[-MAX_VISITS:] - t[-MAX_VISITS], e[-MAX_VISITS:], MAX_VISITS
     times = np.full((1, MAX_VISITS), t[-1])
     times[0, :k] = t - t[0]
     vals = np.zeros((1, MAX_VISITS))
@@ -402,9 +417,10 @@ def predictive(theta, a1c, uacr0, sbp, t_future):
 # Exact reference: brute-force posterior on a grid
 # ==============================================================================
 def grid_posterior(t, egfr, a1c, uacr0, sbp, nq=36, ns=48, ne=33,
-                   noise_sd=NOISE_SD, t_future=None):
+                   noise_sd=NOISE_SD, t_future=None, noise_df=None):
     """
-    Exact posterior (up to grid spacing) under the NPE prior and likelihood.
+    Exact posterior (up to grid spacing) under the NPE prior and likelihood
+    (Gaussian, or Student-t with `noise_df` degrees of freedom).
 
     eGFR0 is gridded on +/- 4 measurement SDs around the first observation (the
     likelihood is negligible outside), clipped to the prior. Returns the grid
@@ -425,7 +441,11 @@ def grid_posterior(t, egfr, a1c, uacr0, sbp, nq=36, ns=48, ne=33,
     sim = fast_sim.simulate_egfr(pts[:, 0], np.exp(pts[:, 1]), pts[:, 2],
                                  a1c, uacr0, sbp, tq)
     pred = sim[:, :len(t)]
-    loglik = -0.5 * np.sum(((pred - e) / noise_sd) ** 2, axis=1)
+    r = (pred - e) / noise_sd
+    if noise_df is None:
+        loglik = -0.5 * np.sum(r ** 2, axis=1)
+    else:                       # Student-t likelihood, matching observation_noise
+        loglik = -0.5 * (noise_df + 1.0) * np.sum(np.log1p(r ** 2 / noise_df), axis=1)
     w = np.exp(loglik - loglik.max())
     w /= w.sum()
     fut = None if t_future is None else sim[:, len(t):]

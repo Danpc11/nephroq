@@ -3,9 +3,9 @@
 EMPIRICAL-BAYES POPULATION PRIOR FOR THE AMORTIZED POSTERIOR
 ================================================================================
 The neural posterior (npe_posterior.py) is trained under a deliberately broad,
-uniform prior. For a parameter the data barely constrain -- the collapse exponent
+uniform prior. For a parameter the data barely constrain -- the feedback exponent
 q -- the posterior then inherits that broad prior, and the forecast averages over
-collapse regimes the target population may rarely show. On MIMIC-IV this shows up
+feedback regimes the target population may rarely show. On MIMIC-IV this shows up
 as a forecast bias toward too-fast decline that grows with the horizon, exactly
 what Round 17 predicts (whole-cohort q ~ 0.9, far below the uniform prior's 2.15).
 
@@ -24,7 +24,7 @@ hierarchical model -- without retraining the network:
 
 The prior family is a mixture of K components, each the product of a Beta
 distribution for q on the prior box and a truncated normal for the log injury
-rate. K = 2 lets it represent the two regimes Round 17 found. The baseline eGFR
+rate, ordered by injury rate. K is chosen by held-out marginal likelihood. The baseline eGFR
 keeps its uniform prior (the data pin it down, so it does not matter).
 ================================================================================
 """
@@ -194,7 +194,9 @@ def fit(draws, K=2, seed=0, n_iter=300, tol=1e-6):
             q_ab.append(_beta_mle(np.sum(r * LU), np.sum(r * L1U), pr.q_ab[k]))
             s_ms.append(_truncnorm_mle(np.sum(r * S), np.sum(r * S2), pr.s_mu_sd[k]))
         pr = PopulationPrior(weights, np.array(q_ab), np.array(s_ms))
-    order = np.argsort(Q_LO + (Q_HI - Q_LO) * pr.q_ab[:, 0] / pr.q_ab.sum(1))
+    # components ordered by injury rate, the identified parameter (q is not
+    # identified from routine data, so ordering by q is unstable across refits)
+    order = np.argsort(pr.s_mu_sd[:, 0])
     return PopulationPrior(pr.weights[order], pr.q_ab[order], pr.s_mu_sd[order],
                            train_loglik=ll, n_train=N, extra=dict(iterations=it + 1))
 
@@ -216,3 +218,50 @@ def resample(draws, prior, n=None, rng=None):
     w, ess = reweight(draws, prior)
     idx = rng.choice(len(draws), size=n or len(draws), p=w)
     return draws[idx], ess
+
+
+def _align(rows, ref):
+    """Permutation of the bootstrap components that best matches the reference
+    components (standardized distance in log rate and mean q), so that
+    percentiles are taken over the same component in every refit even when two
+    components have similar rates (label switching)."""
+    from itertools import permutations
+    def key(r):
+        return np.array([np.log(r["rate_median"]) / 0.5, (r["q_mean"] - Q_LO) / (Q_HI - Q_LO) / 0.2])
+    best, best_d = None, np.inf
+    for perm in permutations(range(len(rows))):
+        d = sum(np.sum((key(rows[p]) - key(ref[k])) ** 2) for k, p in enumerate(perm))
+        if d < best_d:
+            best, best_d = perm, d
+    return [rows[p] for p in best]
+
+
+def bootstrap_stability(draws, K, n_boot=30, n_sub=None, seed=0, ref=None):
+    """
+    Stability of the fitted mixture (audit P1.2): refit the K-component prior on
+    patient bootstrap resamples (all of each patient's draws, or `n_sub` of them
+    for speed) and return, per component, the 2.5 / 50 / 97.5 percentiles of its
+    weight, mean q and median injury rate. Bootstrap components are matched to
+    the reference fit `ref` (default: the fit on all patients with the same
+    subsampling). A component whose weight interval reaches zero, or whose rate
+    interval overlaps its neighbour's, is not a stable feature of the population.
+    """
+    rng = np.random.default_rng(seed)
+    N = len(draws)
+
+    def sub(ix):
+        if n_sub is None:
+            return [draws[i] for i in ix]
+        return [draws[i][rng.choice(len(draws[i]), size=min(n_sub, len(draws[i])), replace=False)]
+                for i in ix]
+
+    ref_rows = (ref.summary() if ref is not None
+                else fit(sub(range(N)), K=K, seed=seed).summary())
+    keys = ("weight", "q_mean", "rate_median")
+    acc = {k: [] for k in keys}
+    for b in range(n_boot):
+        rows = _align(fit(sub(rng.integers(0, N, N)), K=K, seed=seed + b + 1).summary(), ref_rows)
+        for k in keys:
+            acc[k].append([r[k] for r in rows])
+    return {k: np.percentile(np.array(v), [2.5, 50, 97.5], axis=0).T.tolist()
+            for k, v in acc.items()}
