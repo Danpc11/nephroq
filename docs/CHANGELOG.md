@@ -2,6 +2,34 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 28 — MIMIC-IV re-run on the leakage-free protocol (v0.17.1)
+
+The patient-level validation was re-run with v0.17.0 (cut-then-thin, window-only index and
+covariates, training-median imputation, simulated-quantile noise fit). Cohort: 9 517 eligible
+(3 806 newly excluded because the index could not be confirmed inside the observed window),
+8 663 training / 854 test patients, 1 252 held-out visits. Results replace those of v0.16.1 in
+`results/mimic_patient_validation.md` and the README.
+
+- **Data-driven methods barely move**, so the leak itself was small: gradient boosting
+  14.39 → 14.42, hybrid 14.24 → 14.34, least squares 16.25 → 16.31, MLP 16.42 → 16.60.
+- **The mechanistic posterior moves substantially**: retrained NPE 15.34 → 16.64 (bias
+  −0.15 → −2.09; coverage 79 % → 67 %). It is now tied with least squares (−1.28 to +0.68) and
+  the MLP (−1.02 to +0.96) instead of ahead of them, and behind gradient boosting by +1.42 to
+  +3.03. The main driver is the noise estimate: the corrected fit gives scale 2.77 / df 2.5
+  (SD 6.19) instead of 5.26 / 3.3 (SD 8.38). The previous, inflated noise widened the
+  intervals (hiding under-coverage) and changed the learned prior. Every method whose
+  intervals depend on the noise model lost coverage (MLP 70 → 59 %, uniform NPE 80 → 64 %);
+  gradient boosting and the hybrid, whose intervals come from residuals, kept 86 %.
+- **Learned prior**: K = 2 (held-out log-likelihood 0.197 vs 0.102); 69 % at 0.30× (SD of log
+  rate 0.07, against the 0.25× edge of the box) and 31 % at 2.89× (q 1.89); importance
+  efficiency 15 % (was 7 %).
+- Consequences recorded as open items for Phase B: (i) short-interval noise does not cover
+  between-visit variation over years → explicit deviation term or interval calibration by
+  horizon; (ii) the lower edge of the injury-rate box is binding → widen it and re-test the
+  mixture; (iii) the attribution between leak fix, covariate source and noise estimator was
+  not separated → an ablation run with the noise fixed at the v0.16 values.
+- Version 0.17.1 (results and documentation only; no code change).
+
 ## Round 27 — Phase A of the external audit: blocking items (v0.17.0)
 
 An external audit plan (24 Nov 2026) was adopted as the roadmap. This round closes its blocking

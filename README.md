@@ -316,41 +316,50 @@ on that machine) and the **aggregate** report `mimic_patient_validation.md` and
 `.png`, which are the only outputs that may be shared. On a compute node, set
 `NEPHROQ_OUT_DIR` (see *Running analyses on a compute node*).
 
-**Result** (MIMIC-IV 3.1; 8 672 training and 858 temporally held-out test
-patients; 1 261 held-out visits; full report in
+**Result** (MIMIC-IV 3.1; 8 663 training and 854 temporally held-out test
+patients; 1 252 held-out visits; full report in
 [`results/mimic_patient_validation.md`](results/mimic_patient_validation.md)):
 
 | Method | RMSE | MAE | 90 % coverage | CRPS | AUC, eGFR < 30 |
 |---|---|---|---|---|---|
-| Population parameters | 18.21 | 13.59 | — | — | — |
-| MLP ensemble (current app) | 16.42 | 12.14 | 70 % | 9.18 | 0.887 |
-| Least squares, rate only | 16.25 | 11.84 | — | — | — |
-| NPE, uniform prior | 16.86 | 12.26 | 80 % | 8.79 | 0.869 |
-| **NPE, retrained on the learned prior** | 15.34 | 10.85 | 79 % | 8.16 | 0.858 |
-| **Hybrid (NPE + residual correction)** | **14.24** | **10.25** | **86 %** | **7.45** | **0.891** |
-| Mixed-model slope (empirical Bayes) | 20.57 | 14.18 | 73 % | 10.80 | 0.851 |
-| Gradient boosting (trained on MIMIC) | 14.39 | 10.39 | 85 % | 7.56 | 0.889 |
+| Population parameters | 18.34 | 13.55 | — | — | — |
+| MLP ensemble (current app) | 16.60 | 12.26 | 59 % | 9.65 | 0.888 |
+| Least squares, rate only | 16.31 | 11.85 | — | — | — |
+| NPE, uniform prior | 18.25 | 13.00 | 64 % | 9.78 | 0.844 |
+| **NPE, retrained on the learned prior** | 16.64 | 11.64 | 67 % | 9.00 | 0.846 |
+| **Hybrid (NPE + residual correction)** | **14.34** | 10.39 | **86 %** | **7.55** | 0.882 |
+| Mixed-model slope (empirical Bayes) | 20.55 | 14.20 | 73 % | 10.84 | 0.847 |
+| Gradient boosting (trained on MIMIC) | 14.42 | **10.38** | **86 %** | 7.56 | 0.881 |
 
-- The mechanistic posterior, which learns only a noise model and a 9-parameter
-  population prior from MIMIC, beats every classical per-patient method and the
-  current app (bootstrap ΔRMSE vs least squares +0.07 to +1.64; vs the MLP
-  ensemble +0.24 to +1.86), and removes the uniform prior's decline bias
-  (−5.37 → −0.15 mL/min/1.73 m²). It remains behind gradient boosting trained on
-  the same hospital (+0.39 to +1.60) and under-covers (79 %).
+- The **mechanistic posterior**, which learns only a noise model and a
+  9-parameter population prior from MIMIC, beats the population model, the
+  uniform-prior NPE, the per-patient OLS slope and the empirical-Bayes random
+  slope, and is statistically tied with one-parameter least squares (bootstrap
+  ΔRMSE −1.28 to +0.68) and with the MLP ensemble (−1.02 to +0.96). It stays
+  behind gradient boosting trained on the same hospital (+1.42 to +3.03).
+- Its forecasts **over-predict decline**, increasingly with horizon (bias −1.5
+  at 1 year, −3.3 at 3 years; the uniform prior gives −4.3 and −8.5), and its
+  90 % intervals **under-cover (67 %)**. The measurement-noise model (Student-t,
+  scale 2.77, 2.5 degrees of freedom, fitted on short-interval pairs) does not
+  account for the variation that accumulates between visits over years, so the
+  posterior predictive needs either an explicit between-visit deviation term or
+  a calibration of its intervals by horizon.
 - The **hybrid** is statistically indistinguishable from gradient boosting in
-  RMSE (−0.40 to +0.11) and numerically ahead on MAE, CRPS, coverage and AUC
-  (confidence intervals for those differences are still to be computed), while
-  every forecast still runs through the mechanistic model. No superiority is
-  claimed.
-- A **two-component population prior** fits held-out patients better than one:
-  87 % with a median injury rate of 0.40× the trial-anchored population and 13 %
-  at 4.23×. A better-fitting mixture is evidence of heterogeneity, not of two
-  discrete phenotypes; its stability (bootstrap, three components, alternative
-  noise models) is still to be tested. How the fast decline divides between a
-  higher injury rate and a larger feedback exponent depends on the prior box and
-  the noise model (with a 3× ceiling and Gaussian noise the split appeared in
-  `q`, 1.02 vs 2.93), so its attribution to `q` is not a finding.
-- The 5-year horizon has only 39 held-out visits; its numbers are indicative.
+  RMSE (−0.29 to +0.14) and equal on MAE, coverage, CRPS and AUC. On this
+  cohort the mechanistic stage adds no measurable accuracy to a well-tuned
+  data-driven model; its value is that every forecast is produced through an
+  interpretable, simulable model. No superiority is claimed.
+- A **two-component population prior** fits held-out patients better than one
+  (held-out log-likelihood 0.197 vs 0.102 per patient): 69 % with a median
+  injury rate of 0.30× the trial-anchored population (SD of log rate 0.07) and
+  31 % at 2.89× (mean `q` 1.89). The slow component sits against the lower edge
+  of the prior box (0.25×), which suggests that the box truncates stable
+  patients and may contribute to the over-predicted decline. A better-fitting
+  mixture is evidence of heterogeneity, not of two discrete phenotypes; its
+  stability (bootstrap, three components, a wider box, alternative noise
+  models) is still to be tested, and how fast decline divides between injury
+  rate and `q` is not identified.
+- The 5-year horizon has only 38 held-out visits; its numbers are indicative.
 
 ### Honest limits
 
