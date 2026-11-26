@@ -151,7 +151,7 @@ def assess(state, egfr0=None, personalization=None, calibration_tier="public",
 
 
 def provenance_block(calibration_tier="public", calibration_source=None,
-                     calibration_date=None, model_version="0.18.0") -> dict:
+                     calibration_date=None, model_version="0.18.1") -> dict:
     """The 'always show this' footer: which model, calibrated on what, when, and
     what its validated domain is. A clinical tool must never present a number
     without this."""

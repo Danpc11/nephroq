@@ -267,7 +267,10 @@ if __name__ == "__main__":
                     help="redraw the figure and report from the saved run")
     ap.add_argument("--out-dir", default=None,
                     help="output directory (default: $NEPHROQ_OUT_DIR, else results/)")
+    ap.add_argument("--threads", type=int, default=None,
+                    help="cores to use (default: $NEPHROQ_THREADS, else all available)")
     a = ap.parse_args()
+    print(f"Using at most {outputs.limit_threads(a.threads)} cores")
     RESULTS = outputs.results_dir(a.out_dir)
     print(f"Writing outputs to {RESULTS}")
     raw = os.path.join(RESULTS, "posterior_benchmark_raw.npz")

@@ -1114,7 +1114,10 @@ if __name__ == "__main__":
                     help="output directory (default: $NEPHROQ_OUT_DIR, else results/)")
     ap.add_argument("--quick", action="store_true",
                     help="small networks and bootstrap, for CI smoke runs on synthetic data")
+    ap.add_argument("--threads", type=int, default=None,
+                    help="cores to use (default: $NEPHROQ_THREADS, else all available)")
     a = ap.parse_args()
+    print(f"Using at most {outputs.limit_threads(a.threads)} cores")
     RESULTS = outputs.results_dir(a.out_dir)
     print(f"Writing outputs to {RESULTS}")
     cohort = pd.read_csv(a.cohort, sep=None, engine="python", dtype={"patient_id": str})

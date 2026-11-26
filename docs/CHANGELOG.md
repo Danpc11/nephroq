@@ -2,6 +2,16 @@
 
 Notable fixes and changes to NephroQ, driven by several rounds of detailed code review. For currently open limitations, see the **Limitations** section of the [README](../README.md).
 
+## Round 30 — core cap for shared compute nodes (v0.18.1)
+
+Network training set torch to every core of the machine (`os.cpu_count()`), ignoring
+`OMP_NUM_THREADS`, and scikit-learn's OpenMP pools likewise took all cores.
+`outputs.n_threads()` resolves the allowed cores (`--threads` > `NEPHROQ_THREADS` > the
+process's CPU affinity), and `outputs.limit_threads()` caps torch, BLAS and OpenMP at that
+number and exports it to child processes. `validate_mimic_patients.py` and
+`benchmark_posterior.py` take `--threads`; NPE training and `calibrate_mimic.py --n-jobs -1`
+use the same cap. Tests added.
+
 ## Round 29 — code and method audit; Phase B diagnostics (v0.18.0)
 
 A full review of the publication pipeline after the leakage-free MIMIC-IV run.

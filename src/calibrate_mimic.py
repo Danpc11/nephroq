@@ -1118,7 +1118,8 @@ def calibrate(patients, noise_sd=3.5, seed=0, max_patients=None, verbose=True, n
     if n_jobs_eff != 1:
         try:
             from joblib import Parallel, delayed
-            n_workers = os.cpu_count() if n_jobs_eff in (-1, None) else n_jobs_eff
+            import outputs
+            n_workers = outputs.n_threads() if n_jobs_eff in (-1, None) else n_jobs_eff
             n_workers = max(1, min(int(n_workers or 1), len(patients)))
             if n_workers > 1:
                 chunks = [patients[i::n_workers] for i in range(n_workers)]

@@ -267,7 +267,8 @@ def train(n_train=200_000, epochs=40, batch=512, lr=1e-3, seed=0, save=True,
     improvement) is honoured only after 80 % of the schedule."""
     torch, _ = _torch()
     torch.manual_seed(seed)
-    torch.set_num_threads(max(1, os.cpu_count() or 1))
+    import outputs
+    torch.set_num_threads(outputs.n_threads())        # respects --threads / NEPHROQ_THREADS
     t0 = time.perf_counter()
     if verbose:
         print(f"Simulating {n_train} virtual patients...")

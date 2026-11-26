@@ -671,6 +671,17 @@ effect of a run. Per-patient outputs from MIMIC-IV must stay on the node.
 
 ---
 
+To cap the cores an analysis may use (shared node), set `NEPHROQ_THREADS`, or
+pass `--threads` to `validate_mimic_patients.py` or `benchmark_posterior.py`.
+The cap applies to network training and inference (torch), to the BLAS
+libraries and to scikit-learn's gradient boosting (OpenMP), and is exported to
+child processes:
+
+```bash
+export NEPHROQ_THREADS=40 OMP_NUM_THREADS=40 MKL_NUM_THREADS=40 OPENBLAS_NUM_THREADS=40
+```
+
+
 ## Repository structure
 
 ```
